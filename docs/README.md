@@ -60,6 +60,7 @@
 | 24  | [MCP Integration](./24-mcp-integration.md)                       | Model Context Protocol tools and auth model       |
 | 25  | [Integration Fabric](./25-integration-fabric.md)                | Inbound webhook substrate for plugin integrations |
 | 26  | [Global Search](./26-global-search.md)                          | Cross-session message search and the provider model |
+| 28  | [Hostinger Deployment](./28-hostinger-deployment.md)            | Deploying to a Hostinger VPS with TLS (openwa.tachyel.com) |
 
 **Examples**
 

@@ -1,0 +1,38 @@
+# OpenWA - Caddy reverse proxy for Hostinger VPS deployment
+#
+# Terminates TLS for the public domain and proxies everything (REST API,
+# dashboard SPA, Socket.IO websockets) to the openwa-api container on the
+# shared openwa-network. Caddy obtains and renews Let's Encrypt certificates
+# automatically — no certbot or manual renewal needed.
+#
+# The domain and ACME e-mail come from the environment (.env), so this file
+# never needs editing per deployment:
+#   OPENWA_DOMAIN  - public hostname (default: openwa.tachyel.com)
+#   ACME_EMAIL     - e-mail Let's Encrypt uses for expiry notices (optional)
+
+{
+	email {$ACME_EMAIL:admin@tachyel.com}
+}
+
+{$OPENWA_DOMAIN:openwa.tachyel.com} {
+	# Everything is served by the single openwa-api container (API + dashboard
+	# on port 2785). Caddy proxies websocket upgrades (Socket.IO) automatically.
+	reverse_proxy openwa-api:2785
+
+	# Compress text responses (JSON API payloads, dashboard assets).
+	encode zstd gzip
+
+	# Long-lived connections for websockets / streaming endpoints.
+	header {
+		# TLS is enforced at this proxy; tell browsers to keep using it.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+
+	log {
+		output file /data/access.log {
+			roll_size 20mb
+			roll_keep 5
+		}
+	}
+}

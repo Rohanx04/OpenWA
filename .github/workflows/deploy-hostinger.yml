@@ -1,0 +1,51 @@
+# Deploy OpenWA to the Hostinger VPS (openwa.tachyel.com)
+#
+# Runs scripts/deploy-hostinger.sh on the VPS over SSH: pulls the pushed
+# commit, rebuilds the Docker image, and restarts the stack behind Caddy.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   HOSTINGER_SSH_HOST  - VPS public IP (or openwa.tachyel.com once DNS is set)
+#   HOSTINGER_SSH_USER  - SSH user (typically root on a Hostinger VPS)
+#   HOSTINGER_SSH_KEY   - private key whose public half is in the VPS
+#                         ~/.ssh/authorized_keys (hPanel → VPS → SSH keys)
+#   HOSTINGER_SSH_PORT  - optional, defaults to 22
+#
+# Trigger manually from the Actions tab (workflow_dispatch). To deploy
+# automatically on every push to main instead, uncomment the push trigger —
+# but only after the secrets above are configured, otherwise every push fails.
+
+name: Deploy to Hostinger
+
+on:
+  workflow_dispatch:
+  # push:
+  #   branches: [main]
+
+concurrency:
+  group: deploy-hostinger
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.HOSTINGER_SSH_HOST }}
+          username: ${{ secrets.HOSTINGER_SSH_USER }}
+          key: ${{ secrets.HOSTINGER_SSH_KEY }}
+          port: ${{ secrets.HOSTINGER_SSH_PORT || 22 }}
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
+            if [ ! -d /opt/openwa/.git ]; then
+              mkdir -p /opt/openwa
+              git clone https://github.com/${{ github.repository }}.git /opt/openwa
+            fi
+            cd /opt/openwa
+            git fetch origin ${{ github.ref_name }}
+            git checkout ${{ github.ref_name }}
+            git reset --hard origin/${{ github.ref_name }}
+            bash scripts/deploy-hostinger.sh

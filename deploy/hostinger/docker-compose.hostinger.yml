@@ -1,0 +1,58 @@
+# OpenWA - Hostinger VPS production overlay
+#
+# Adds a Caddy TLS reverse proxy in front of the stock stack so the API +
+# dashboard are served at https://openwa.tachyel.com with automatic
+# Let's Encrypt certificates. Use it TOGETHER with the base compose file,
+# from the repository root:
+#
+#   docker compose -f docker-compose.yml \
+#                  -f deploy/hostinger/docker-compose.hostinger.yml \
+#                  up -d --build
+#
+# (or just run scripts/deploy-hostinger.sh, which does this for you)
+#
+# The base file keeps the API published on 127.0.0.1:2785 only — the sole
+# public entrypoints are Caddy's ports 80/443 below. DNS for OPENWA_DOMAIN
+# must already point at this VPS before the first start, otherwise the
+# Let's Encrypt HTTP-01 challenge cannot complete.
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: openwa-caddy
+    restart: unless-stopped
+    # Joins the app network to reach openwa-api:2785 directly; nothing else
+    # needs to be exposed on the host.
+    networks:
+      - openwa-network
+    ports:
+      - '80:80'
+      - '443:443'
+      - '443:443/udp' # HTTP/3 (QUIC)
+    environment:
+      # Public hostname served by Caddy (see deploy/hostinger/Caddyfile).
+      - OPENWA_DOMAIN=${OPENWA_DOMAIN:-openwa.tachyel.com}
+      - ACME_EMAIL=${ACME_EMAIL:-admin@tachyel.com}
+    volumes:
+      - ./deploy/hostinger/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data # certificates + ACME account (must persist!)
+      - caddy-config:/config
+    security_opt:
+      - 'no-new-privileges:true'
+    depends_on:
+      - openwa-api
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '--spider', 'http://localhost:2019/metrics']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    labels:
+      - 'com.openwa.service=reverse-proxy'
+
+volumes:
+  caddy-data:
+    name: openwa_caddy-data
+    driver: local
+  caddy-config:
+    name: openwa_caddy-config
+    driver: local
