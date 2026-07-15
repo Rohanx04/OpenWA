@@ -244,6 +244,27 @@ export function isNoLidForUserError(err: unknown): boolean {
   return err instanceof Error && err.message.includes('No LID for user');
 }
 
+/**
+ * True when a send error is whatsapp-web.js's POST-DISPATCH serialization failure: the message was
+ * already handed to WhatsApp (and delivers), but wwjs then threw inside the browser while building the
+ * returned Message model — `window.WWebJS.getMessageModel(msg).serialize()` — because the live
+ * WhatsApp Web build's internal shape no longer matches this wwjs version's injected helpers. It
+ * surfaces as a Puppeteer `Evaluation failed: …` naming `serialize`/`getMessageModel` (or the classic
+ * `Cannot read properties of undefined (reading 'serialize')`). This is distinct from a PRE-dispatch
+ * failure (recipient/chat can't be resolved), which never reaches serialization — so matching this
+ * signature lets a genuinely-delivered message be reported as sent instead of a false failure, while a
+ * true "couldn't send" still surfaces as an error. ponytail: text-matched — there is no structured
+ * code from wwjs/Puppeteer; revisit if either changes its wording.
+ */
+export function isPostSendSerializeError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+  if (!msg) return false;
+  const isEvalFault = msg.includes('Evaluation failed') || msg.includes('Protocol error');
+  const namesSerializer =
+    msg.includes('getMessageModel') || msg.includes('serialize') || msg.includes("reading 'serialize'");
+  return isEvalFault && namesSerializer;
+}
+
 export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngine {
   private client: Client | null = null;
   private status: EngineStatus = EngineStatus.DISCONNECTED;
@@ -985,13 +1006,61 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     this.ensureReady();
     // wwebjs accepts neutral `<phone>@c.us` WIDs directly as mentionedJidList, so no de-normalization
     // is needed. Omit the options object entirely when none are given to keep today's send behavior.
-    const msg = await this.sendResolved(chatId, to =>
-      mentions?.length ? this.client!.sendMessage(to, text, { mentions }) : this.client!.sendMessage(to, text),
-    );
-    return {
-      id: msg.id._serialized,
-      timestamp: msg.timestamp,
-    };
+    let resolvedTo = chatId;
+    try {
+      const msg = await this.sendResolved(chatId, to => {
+        resolvedTo = to;
+        return mentions?.length ? this.client!.sendMessage(to, text, { mentions }) : this.client!.sendMessage(to, text);
+      });
+      return {
+        id: msg.id._serialized,
+        timestamp: msg.timestamp,
+      };
+    } catch (error) {
+      // Not a post-dispatch serialization fault → a genuine send failure; let it surface (→ FAILED / 502).
+      if (!isPostSendSerializeError(error)) {
+        throw error;
+      }
+      // wwjs already dispatched the message to WhatsApp (it delivers), then threw while serializing the
+      // result model because the live WhatsApp Web build's shape no longer matches this wwjs version.
+      // Reporting a DELIVERED message as failed is worse than losing its id: recover the id best-effort
+      // from the destination chat (as forwardMessage does), else return an explicit-unknown empty id —
+      // persistSentState then records SENT with waMessageId unset, so no ack mis-matches it. NEVER fail
+      // a message the engine already sent. See isPostSendSerializeError for why this can't hide a
+      // genuine "couldn't send" (those fail before serialization and don't match the signature).
+      this.logger.warn(
+        `Text send to ${chatId} was dispatched but wwjs could not serialize the result; treating as sent`,
+        error instanceof Error ? (error.stack ?? error.message) : String(error),
+      );
+      const recovered = await this.recoverLastOutgoing(resolvedTo);
+      return recovered ?? { id: '', timestamp: Math.floor(Date.now() / 1000) };
+    }
+  }
+
+  /**
+   * Best-effort recovery of the id/timestamp of the most recent message WE sent to `chatId`, by
+   * reading the destination chat's latest `fromMe` message. Used when a send reached WhatsApp but the
+   * synchronous result couldn't be serialized (see `isPostSendSerializeError`). Strictly best-effort:
+   * this read can hit the SAME serialization fault, so any failure returns null and the caller falls
+   * back to an empty id. Mirrors the id-recovery in `forwardMessage`.
+   */
+  private async recoverLastOutgoing(chatId: string): Promise<MessageResult | null> {
+    try {
+      const chat = await this.client!.getChatById(chatId);
+      const sentByMe = (await chat?.fetchMessages({ limit: 5, fromMe: true })) ?? [];
+      let latest: (typeof sentByMe)[number] | undefined;
+      for (const m of sentByMe) {
+        if (!latest || m.timestamp > latest.timestamp) {
+          latest = m;
+        }
+      }
+      return latest ? { id: latest.id._serialized, timestamp: latest.timestamp } : null;
+    } catch (error) {
+      this.logger.warn(`Could not recover sent-message id for ${chatId} (best-effort)`, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
   }
 
   async sendImageMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
