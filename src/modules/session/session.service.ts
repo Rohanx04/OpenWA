@@ -1592,12 +1592,61 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
       engineChats = await engine.getChats();
     } catch (err) {
       this.logger.error(
-        `getChats failed for session ${id}; surfacing as 502`,
+        `getChats failed for session ${id}; falling back to stored history`,
         err instanceof Error ? (err.stack ?? err.message) : String(err),
       );
+      // The live chat list couldn't be built — on whatsapp-web.js this is usually the engine's
+      // Puppeteer store drifting from the current WhatsApp Web build (the same fault class that made
+      // sends throw). Rather than leave the dashboard on an error page, derive a chat list from stored
+      // message history so the operator can still see and open their active chats. If nothing is
+      // stored yet, surface the diagnostic 502 instead of a misleading empty list.
+      const derived = await this.deriveChatsFromHistory(id, opts).catch(fallbackErr => {
+        this.logger.warn(
+          `getChats history fallback failed for ${id}`,
+          fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr),
+        );
+        return [] as ChatSummary[];
+      });
+      if (derived.length > 0) {
+        this.logger.warn(
+          `getChats: live engine failed for ${id}; served ${derived.length} chat(s) from stored history`,
+        );
+        return derived;
+      }
       throw toEngineClientError(err);
     }
     const chats = [...engineChats].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    return paginate(chats, opts.limit, opts.offset);
+  }
+
+  /**
+   * Fallback chat list built from persisted message history, for when the live engine can't serialize
+   * its own chats (whatsapp-web.js store drift). Bounded scan of the most recent messages, reduced to
+   * the latest one per chat — name/unread are best-effort (the id and last message are what the
+   * dashboard needs to render and open a chat). Ordered most-recent first and paginated to match the
+   * live path. Read-only; never throws into the caller (the caller treats a throw as "no history").
+   */
+  private async deriveChatsFromHistory(sessionId: string, opts: ListOptions = {}): Promise<ChatSummary[]> {
+    const HISTORY_SCAN_CAP = 2000;
+    const recent = await this.messageRepository.find({
+      where: { sessionId },
+      order: { createdAt: 'DESC' },
+      take: HISTORY_SCAN_CAP,
+    });
+    const byChat = new Map<string, ChatSummary>();
+    for (const m of recent) {
+      // createdAt DESC means the FIRST row seen for a chat is its most recent message.
+      if (!m.chatId || byChat.has(m.chatId)) continue;
+      byChat.set(m.chatId, {
+        id: m.chatId,
+        name: m.chatId,
+        isGroup: m.chatId.endsWith('@g.us'),
+        unreadCount: 0,
+        timestamp: m.timestamp ?? Math.floor(new Date(m.createdAt).getTime() / 1000),
+        lastMessage: m.body || undefined,
+      });
+    }
+    const chats = [...byChat.values()].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
     return paginate(chats, opts.limit, opts.offset);
   }
 

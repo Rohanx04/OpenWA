@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The dashboard chat list no longer dead-ends on an error when the engine can't serialize its chats.**
+  `GET /sessions/:id/chats` runs a live whatsapp-web.js Puppeteer evaluation that can throw (the same
+  WA-Web-build drift that made sends fail) — which previously left the dashboard on "Failed to load
+  chats". When the live call fails, the session now falls back to a chat list **derived from stored
+  message history** (a bounded scan reduced to the latest message per chat, most-recent first) so the
+  operator can still see and open their active chats; names/unread counts are best-effort in that mode.
+  If there is no stored history to fall back to, the diagnostic `502` is surfaced as before rather than a
+  misleading empty list. The underlying drift is still best resolved by re-linking the session or running
+  the Baileys engine.
+
 - **A text message that WhatsApp actually delivered is no longer reported as a failed send.** On the
   whatsapp-web.js engine, `client.sendMessage` hands the message to WhatsApp (it delivers) and *then*
   builds the returned Message model by serializing it in the browser. When the live WhatsApp Web build's

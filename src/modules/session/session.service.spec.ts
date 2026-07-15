@@ -2356,7 +2356,7 @@ describe('SessionService', () => {
       await expect(service.getChats('sess-uuid-1')).rejects.toThrow(BadRequestException);
     });
 
-    it('maps a raw engine getChats fault to 502 instead of a bare 500 (dashboard chats)', async () => {
+    it('maps a raw engine getChats fault to 502 when there is no stored history to fall back to', async () => {
       const session = createMockSession();
       (repository.findOne as jest.Mock).mockResolvedValue(session);
       (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
@@ -2367,10 +2367,39 @@ describe('SessionService', () => {
       mockEngine.getChats.mockRejectedValue(
         new Error('Evaluation failed: TypeError: Cannot read properties of undefined'),
       );
+      (messageRepository.find as jest.Mock).mockResolvedValue([]); // no history → surface the diagnostic 502
 
       const err = await service.getChats('sess-uuid-1').catch((e: unknown) => e);
       expect(err).toBeInstanceOf(HttpException);
       expect((err as HttpException).getStatus()).toBe(HttpStatus.BAD_GATEWAY);
+    });
+
+    it('falls back to chats derived from stored history when the live engine getChats fails', async () => {
+      const session = createMockSession();
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      await service.start('sess-uuid-1');
+
+      mockEngine.getChats.mockRejectedValue(new Error("Evaluation failed: reading 'serialize'"));
+      // Stored history: two chats, one group. createdAt DESC order = most-recent-first per chat.
+      (messageRepository.find as jest.Mock).mockResolvedValue([
+        { chatId: '628111@c.us', body: 'newest to alice', timestamp: 300, createdAt: new Date(300_000) },
+        { chatId: '120@g.us', body: 'group msg', timestamp: 250, createdAt: new Date(250_000) },
+        { chatId: '628111@c.us', body: 'older to alice', timestamp: 100, createdAt: new Date(100_000) },
+      ]);
+
+      const chats = await service.getChats('sess-uuid-1');
+      expect(chats).toEqual([
+        {
+          id: '628111@c.us',
+          name: '628111@c.us',
+          isGroup: false,
+          unreadCount: 0,
+          timestamp: 300,
+          lastMessage: 'newest to alice',
+        },
+        { id: '120@g.us', name: '120@g.us', isGroup: true, unreadCount: 0, timestamp: 250, lastMessage: 'group msg' },
+      ]);
     });
   });
 
