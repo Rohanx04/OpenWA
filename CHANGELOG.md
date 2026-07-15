@@ -15,6 +15,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A text message that WhatsApp actually delivered is no longer reported as a failed send.** On the
+  whatsapp-web.js engine, `client.sendMessage` hands the message to WhatsApp (it delivers) and *then*
+  builds the returned Message model by serializing it in the browser. When the live WhatsApp Web build's
+  internal shape no longer matches this wwjs version's injected helpers, that post-dispatch step throws a
+  Puppeteer `Evaluation failed: … reading 'serialize'` — so a **delivered** message surfaced to the
+  caller as a failed send (`HTTP 500`, then `502`), and an integration would mark the notification failed
+  even though the customer received it. `sendTextMessage` now recognises this post-dispatch
+  serialization fault (`isPostSendSerializeError`), recovers the sent message's id best-effort from the
+  destination chat (as `forwardMessage` already does) or falls back to an explicit-unknown empty id, and
+  reports the send as **sent** — never failing a message the engine already delivered. A genuine
+  *pre-dispatch* failure (the recipient/chat couldn't be resolved — e.g. a number not on WhatsApp) fails
+  before serialization, does not match the signature, and still surfaces as an error. Note: this is a
+  symptom of the engine's WhatsApp Web build drifting from the library; re-linking the session (which
+  refreshes the pinned build) or running the Baileys engine (`ENGINE_TYPE=baileys`, a WebSocket client
+  with no browser injection) avoids the fault class entirely, including for `getChats`.
+
 - **Send and chat-list failures now return a diagnostic `502` instead of a bare `500 Internal server
   error`.** When the WhatsApp engine threw a raw, non-HTTP fault while executing an operation —
   typically a whatsapp-web.js Puppeteer `Evaluation failed: Cannot read properties of undefined` from a

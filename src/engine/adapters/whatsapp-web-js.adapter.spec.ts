@@ -11,6 +11,7 @@ import {
   resolveAuthTimeoutMs,
   wwebjsAckToDeliveryStatus,
   extractWwebjsCall,
+  isPostSendSerializeError,
 } from './whatsapp-web-js.adapter';
 import { getEffectiveWebVersionInfo, resolveWebVersionPin, __resetWebVersionCache } from '../wa-web-version';
 import * as fs from 'fs';
@@ -364,6 +365,76 @@ describe('WhatsAppWebJsAdapter.sendPollMessage', () => {
     await expect(adapter.sendPollMessage('x@c.us', { name: 'Q', options: ['A', 'B'] })).rejects.toBeInstanceOf(
       EngineNotReadyError,
     );
+  });
+});
+
+describe('isPostSendSerializeError (delivered-but-unserializable send signature)', () => {
+  it('matches a Puppeteer evaluation fault that names the wwjs result serializer', () => {
+    expect(
+      isPostSendSerializeError(
+        new Error("Evaluation failed: TypeError: Cannot read properties of undefined (reading 'serialize')"),
+      ),
+    ).toBe(true);
+    expect(isPostSendSerializeError(new Error('Evaluation failed: getMessageModel is not a function'))).toBe(true);
+    expect(isPostSendSerializeError('Protocol error (Runtime.callFunctionOn): serialize failed')).toBe(true);
+  });
+
+  it('does NOT match a pre-dispatch failure (recipient/chat could not be resolved)', () => {
+    // These fail BEFORE the message is sent, so they must stay real failures.
+    expect(isPostSendSerializeError(new Error('No LID for user'))).toBe(false);
+    expect(
+      isPostSendSerializeError(
+        new Error("Evaluation failed: Cannot read properties of undefined (reading 'sendMessage')"),
+      ),
+    ).toBe(false);
+    expect(isPostSendSerializeError(new Error('Chat not found'))).toBe(false);
+    expect(isPostSendSerializeError(undefined)).toBe(false);
+  });
+});
+
+describe('WhatsAppWebJsAdapter.sendTextMessage (delivered-but-unserializable recovery)', () => {
+  const readyAdapter = (client: unknown): WhatsAppWebJsAdapter => {
+    const adapter = new WhatsAppWebJsAdapter({ sessionId: 's', sessionDataPath: './data/sessions', puppeteer: {} });
+    (adapter as unknown as { status: EngineStatus }).status = EngineStatus.READY;
+    (adapter as unknown as { client: unknown }).client = client;
+    return adapter;
+  };
+
+  it('returns the real id/timestamp on a normal send', async () => {
+    const sendMessage = jest.fn().mockResolvedValue({ id: { _serialized: 'MSG1' }, timestamp: 1700000000 });
+    const result = await readyAdapter({ sendMessage }).sendTextMessage('628@c.us', 'hi');
+    expect(result).toEqual({ id: 'MSG1', timestamp: 1700000000 });
+  });
+
+  it('recovers the sent id from the chat when wwjs dispatches but fails to serialize the result', async () => {
+    // sendMessage delivered the message, then threw serializing the model. The id is recovered from the
+    // destination chat's latest fromMe message (like forwardMessage) — a delivered message is never a failure.
+    const sendMessage = jest.fn().mockRejectedValue(new Error("Evaluation failed: reading 'serialize'"));
+    const destChat = {
+      fetchMessages: jest.fn().mockResolvedValue([
+        { id: { _serialized: 'OLD' }, timestamp: 100 },
+        { id: { _serialized: 'REAL' }, timestamp: 200 },
+      ]),
+    };
+    const client = { sendMessage, getChatById: jest.fn().mockResolvedValue(destChat) };
+
+    const result = await readyAdapter(client).sendTextMessage('628@c.us', 'hi');
+    expect(result).toEqual({ id: 'REAL', timestamp: 200 });
+  });
+
+  it('falls back to an empty id (still a success) when the id cannot be recovered', async () => {
+    const sendMessage = jest.fn().mockRejectedValue(new Error('Evaluation failed: getMessageModel'));
+    // Recovery read hits the same fault → best-effort returns null → empty id, not a thrown failure.
+    const client = { sendMessage, getChatById: jest.fn().mockRejectedValue(new Error('Evaluation failed: serialize')) };
+
+    const result = await readyAdapter(client).sendTextMessage('628@c.us', 'hi');
+    expect(result.id).toBe('');
+    expect(typeof result.timestamp).toBe('number');
+  });
+
+  it('still throws on a genuine (pre-dispatch) send failure', async () => {
+    const sendMessage = jest.fn().mockRejectedValue(new Error('Chat not found'));
+    await expect(readyAdapter({ sendMessage }).sendTextMessage('628@c.us', 'hi')).rejects.toThrow('Chat not found');
   });
 });
 
