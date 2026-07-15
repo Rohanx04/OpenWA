@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A transient drop no longer ends a WhatsApp session permanently — it self-heals.** Both reconnect
+  layers previously gave up terminally (→ `FAILED`, manual restart required) after **5 consecutive
+  failed reconnects**: with the default 5s base and exponential backoff that was only ~3 minutes of a
+  WhatsApp/network outage before the session was declared dead and would *not* recover on its own even
+  once connectivity returned — the common "session got disconnected after a few hours and stayed down"
+  symptom. Both the Baileys adapter's internal loop and the session-service orchestration (whatsapp-web.js)
+  now **retry indefinitely with capped exponential backoff**: the delay escalates for the first
+  `maxReconnectAttempts` drops, then plateaus (30s for Baileys, the configured ceiling for whatsapp-web.js)
+  and keeps retrying, so the session reconnects automatically whenever the link comes back. The attempt
+  counter still resets to `0` on every successful connect, and the reconnect-driven `connect()` that
+  rejects before a socket exists now reschedules instead of hanging. `maxReconnectAttempts: 0` still means
+  "auto-reconnect disabled" (left disconnected for a manual restart), and a genuine WhatsApp logout (device
+  unlinked, `loggedOut`/`auth_failure`) is still terminal — that correctly requires re-scanning the QR.
+
 - **Engine start timeouts now return a diagnostic 504 instead of a bare 500.** Two
   `POST /api/sessions/:id/start` failure modes previously escaped to NestJS's default handler as a
   meaningless `500 Internal Server Error`: (1) the **auth-timeout** — whatsapp-web.js throws the

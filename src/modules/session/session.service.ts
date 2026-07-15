@@ -1297,43 +1297,39 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
     const state = this.reconnectStates.get(id);
     if (!state) return;
 
-    if (state.attempts >= state.maxAttempts) {
-      this.logger.error(`Max reconnect attempts reached for session: ${session.name}`, undefined, {
+    // maxAttempts === 0 is the operator's explicit "disable auto-reconnect" opt-out — leave the
+    // session terminally FAILED for a manual restart. Every other value means "retry indefinitely
+    // with capped backoff": a transient drop (WhatsApp/network blip, a wedged page) must never end
+    // the session permanently — it self-heals whenever the connection returns. maxAttempts is now the
+    // number of backoff escalations before the delay plateaus, not a cap on the number of tries.
+    if (state.maxAttempts === 0) {
+      this.logger.error(`Auto-reconnect disabled for session: ${session.name}`, undefined, {
         sessionId: id,
-        attempts: state.attempts,
-        action: 'reconnect_failed',
+        action: 'reconnect_disabled',
       });
-      // Don't leave the session silently stuck DISCONNECTED — mark it terminally FAILED with a reason
-      // so findOne/findAll surface it via `lastError` and the dashboard shows it needs a restart.
-      // maxAttempts:0 means auto-reconnect is disabled, not that N attempts were tried and failed — say
-      // so instead of the misleading "failed after 0 attempts".
       this.sessionErrors.set(
         id,
-        state.maxAttempts === 0
-          ? 'Auto-reconnect is disabled (max attempts set to 0); the session was left disconnected — restart it manually.'
-          : `Reconnection failed after ${state.attempts} attempts — restart the session.`,
+        'Auto-reconnect is disabled (max attempts set to 0); the session was left disconnected — restart it manually.',
       );
       void this.updateStatus(id, SessionStatus.FAILED);
       return;
     }
 
-    // Exponential backoff: baseDelay * 2^attempts (with jitter), clamped finite + within
-    // setTimeout's safe range so the timer can't overflow and fire immediately.
-    const delay = clampReconnectDelay(
-      state.baseDelay * Math.pow(2, state.attempts) + Math.random() * 1000,
-      state.baseDelay,
-    );
+    // Exponential backoff: baseDelay * 2^attempts (with jitter), clamped finite + within setTimeout's
+    // safe range so the timer can't overflow and fire immediately. Cap the exponent at maxAttempts so
+    // the delay plateaus at a steady ceiling once escalation is done AND stays finite — an uncapped
+    // 2^attempts would overflow to Infinity, and clampReconnectDelay would then fall back to the tiny
+    // baseDelay, turning the plateau into a relaunch storm.
+    const exponent = Math.min(state.attempts, state.maxAttempts);
+    const delay = clampReconnectDelay(state.baseDelay * Math.pow(2, exponent) + Math.random() * 1000, state.baseDelay);
     state.attempts++;
 
-    this.logger.log(
-      `Scheduling reconnect attempt ${state.attempts}/${state.maxAttempts} in ${Math.round(delay / 1000)}s`,
-      {
-        sessionId: id,
-        attempt: state.attempts,
-        delayMs: delay,
-        action: 'reconnect_scheduled',
-      },
-    );
+    this.logger.log(`Scheduling reconnect attempt ${state.attempts} in ${Math.round(delay / 1000)}s`, {
+      sessionId: id,
+      attempt: state.attempts,
+      delayMs: delay,
+      action: 'reconnect_scheduled',
+    });
 
     // Clear any timer a prior scheduleReconnect left pending so two back-to-back disconnects
     // don't stack two timers (which would run executeReconnect twice and double-init the engine).

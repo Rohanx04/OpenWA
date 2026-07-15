@@ -372,30 +372,40 @@ export class BaileysAdapter implements IWhatsAppEngine {
       // Do NOT fire onDisconnected here; this is a transient drop, not a terminal disconnect.
       // connect() calls setStatus(INITIALIZING) which fires onStateChanged — that is the correct signal.
       this.logger.log('Baileys connection dropped; reconnecting', { statusCode });
-
-      // I4: capped exponential backoff with in-flight timer guard.
-      if (this.reconnectAttempts >= BaileysAdapter.MAX_RECONNECT_ATTEMPTS) {
-        this.setStatus(EngineStatus.FAILED);
-        this.callbacks.onError?.(`reconnect attempts exhausted (${this.reconnectAttempts})`);
-        return;
-      }
-      this.reconnectAttempts += 1;
-      const delay = Math.min(30_000, 1_000 * 2 ** (this.reconnectAttempts - 1));
-      // Guard: if a timer is already pending, don't stack another one.
-      if (this.reconnectTimer) {
-        return;
-      }
-      this.reconnectTimer = setTimeout(() => {
-        this.reconnectTimer = undefined;
-        if (this.intentionalClose) {
-          return; // stopped while waiting — abort
-        }
-        void this.connect().catch(err => {
-          this.setStatus(EngineStatus.FAILED);
-          this.callbacks.onError?.(err instanceof Error ? err.message : String(err));
-        });
-      }, delay);
+      this.scheduleReconnect();
     }
+  }
+
+  /**
+   * Schedule the next reconnect with capped exponential backoff. The adapter retries INDEFINITELY:
+   * a transient drop (restartRequired, a network/WhatsApp blip) must never end the session — it
+   * self-heals whenever the connection returns, and the counter resets to 0 on the next 'open'. The
+   * backoff escalates for the first MAX_RECONNECT_ATTEMPTS drops, then holds at the 30s ceiling. The
+   * exponent is capped so `2 ** attempts` stays finite as the counter grows unbounded during a long
+   * outage. An in-flight timer guard keeps two back-to-back closes from stacking two reconnects.
+   */
+  private scheduleReconnect(): void {
+    if (this.intentionalClose || this.reconnectTimer) {
+      return;
+    }
+    this.reconnectAttempts += 1;
+    const exponent = Math.min(this.reconnectAttempts - 1, BaileysAdapter.MAX_RECONNECT_ATTEMPTS);
+    const delay = Math.min(30_000, 1_000 * 2 ** exponent);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      if (this.intentionalClose) {
+        return; // stopped while waiting — abort
+      }
+      void this.connect().catch(err => {
+        // A connect() that rejects before a socket exists (e.g. an offline network on lib load / auth
+        // read) emits no connection.update, so nothing else would re-arm the loop. Reschedule here so
+        // the session keeps retrying instead of hanging — mirrors the transient-drop path above.
+        this.logger.warn('Baileys reconnect attempt failed; will retry', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        this.scheduleReconnect();
+      });
+    }, delay);
   }
 
   /** Render the raw Baileys QR ref to a PNG data URL, then publish it (mirrors the whatsapp-web.js engine). */
