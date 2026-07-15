@@ -1,4 +1,4 @@
-import { Injectable, BadRequestException, Optional } from '@nestjs/common';
+import { Injectable, BadRequestException, HttpException, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -13,6 +13,7 @@ import { TemplateService } from '../template/template.service';
 import { renderTemplate } from '../../common/utils/template-render';
 import { createLogger } from '../../common/services/logger.service';
 import { SsrfBlockedError, SSRF_BLOCKED_CLIENT_MESSAGE } from '../../common/security/ssrf-guard';
+import { toEngineClientError } from '../../common/errors/engine-operation.error';
 import { userPart } from '../../engine/identity/wa-id';
 import { resolveFeatureFlags } from '../../config/feature-flags';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
@@ -674,7 +675,18 @@ export class MessageService {
       this.logger.warn(`Outbound media fetch blocked by SSRF guard: ${error.message}`);
       return new BadRequestException(SSRF_BLOCKED_CLIENT_MESSAGE);
     }
-    return error;
+    // A domain error already carries the status the caller should see (EngineNotReadyError → 409,
+    // MessageNotFoundError → 404, …) — pass it through. Anything else is a raw engine/browser fault
+    // (whatsapp-web.js Puppeteer eval error, a dropped socket, a primitive-string throw); left alone it
+    // reaches NestJS as an opaque 500 "Internal server error" — exactly what a downstream integration
+    // reported. Log the real detail server-side and surface a diagnostic 502 to the caller.
+    if (!(error instanceof HttpException)) {
+      this.logger.error(
+        'Engine send failed with a non-HTTP error; surfacing as 502',
+        error instanceof Error ? (error.stack ?? error.message) : String(error),
+      );
+    }
+    return toEngineClientError(error);
   }
 
   private buildMediaInput(dto: SendMediaMessageDto): MediaInput {
