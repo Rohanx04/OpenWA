@@ -344,59 +344,67 @@ describe('BaileysAdapter lifecycle hardening — I4 reconnect backoff', () => {
     jest.useRealTimers();
   });
 
-  it('I4: after MAX_RECONNECT_ATTEMPTS recoverable closes → FAILED + onError, no more reconnects', async () => {
+  it('I4: recoverable closes never end the session — it self-heals, reconnecting past the old cap (no FAILED/onError)', async () => {
     const onError = jest.fn();
     const adapter = await initWithRealTimers({ onError });
 
     // Switch to fake timers AFTER initialize() has resolved.
     jest.useFakeTimers();
+    baileys().default.mockClear(); // count only the reconnect-driven socket creations
 
-    // Each close increments reconnectAttempts and schedules a timer.
-    // After the timer fires, connect() calls makeWASocket() which resets the emitter,
-    // so each reconnect cycle has exactly one listener — no accumulation across attempts.
-    // Strategy: fire close → run timers (reconnect executes, emitter reset) → fire close again → repeat.
-    for (let i = 0; i < 5 /* MAX_RECONNECT_ATTEMPTS */; i++) {
+    // Fire far more drops than the old MAX_RECONNECT_ATTEMPTS cap (5). Each close schedules a
+    // reconnect; after the timer fires, connect() re-creates the socket. A transient drop must never
+    // terminate the session — the loop keeps retrying so a long outage recovers when the link returns.
+    for (let i = 0; i < 12; i++) {
       fireRecoverableClose();
       await jest.runAllTimersAsync();
     }
 
-    // The (MAX+1)th close — reconnectAttempts is now MAX (5) → exhausted path:
-    // no reconnect scheduled, status → FAILED, onError fired exactly once.
-    fireRecoverableClose();
-    await jest.runAllTimersAsync();
-
-    expect(adapter.getStatus()).toBe(EngineStatus.FAILED);
-    expect(onError).toHaveBeenCalledTimes(1);
-    expect(onError).toHaveBeenCalledWith(expect.stringContaining('exhausted'));
+    // No terminal failure and no onError, even well past the 5-drop mark that used to give up.
+    expect(adapter.getStatus()).not.toBe(EngineStatus.FAILED);
+    expect(onError).not.toHaveBeenCalled();
+    // Reconnection is still happening: makeWASocket was re-invoked once per drop, past the old cap.
+    expect(baileys().default.mock.calls.length).toBe(12);
   });
 
-  it('I4: successful connection resets the reconnect counter (next drop can reconnect again)', async () => {
+  it('I4: a reconnect whose connect() rejects (no socket emitted) reschedules instead of hanging or FAILING', async () => {
     const onError = jest.fn();
     const adapter = await initWithRealTimers({ onError });
 
     jest.useFakeTimers();
+    baileys().default.mockClear();
+    // The next makeWASocket (reconnect #1) throws — connect() rejects before a socket exists, so no
+    // connection.update fires; only the catch's reschedule can keep the retry loop alive.
+    baileys().default.mockImplementationOnce(() => {
+      throw new Error('offline');
+    });
 
-    // Fire one recoverable drop and reconnect — increments counter to 1
-    fireRecoverableClose();
-    await jest.runAllTimersAsync();
+    fireRecoverableClose(); // schedules reconnect #1 (will throw)
+    await jest.runAllTimersAsync(); // #1 throws → reschedules #2, which succeeds
 
-    // Simulate a successful open — should reset the reconnect counter to 0
-    fakeSock.fire('connection.update', { connection: 'open' });
-    expect(adapter.getStatus()).toBe(EngineStatus.READY);
+    expect(adapter.getStatus()).not.toBe(EngineStatus.FAILED);
+    expect(onError).not.toHaveBeenCalled();
+    // makeWASocket was invoked again after the throwing attempt — the loop re-armed on connect failure.
+    expect(baileys().default.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
 
-    // Now exhaust MAX_RECONNECT_ATTEMPTS again — should work because counter was reset
-    for (let i = 0; i < 5 /* MAX_RECONNECT_ATTEMPTS */; i++) {
+  it('I4: successful connection resets the reconnect counter (next drop starts the backoff from the bottom)', async () => {
+    const adapter = await initWithRealTimers({});
+
+    jest.useFakeTimers();
+    const internals = adapter as unknown as { reconnectAttempts: number };
+
+    // A few recoverable drops climb the backoff counter.
+    for (let i = 0; i < 4; i++) {
       fireRecoverableClose();
       await jest.runAllTimersAsync();
     }
+    expect(internals.reconnectAttempts).toBeGreaterThan(0);
 
-    // (MAX+1)th drop after reset → FAILED again, onError fired exactly once
-    fireRecoverableClose();
-    await jest.runAllTimersAsync();
-
-    expect(adapter.getStatus()).toBe(EngineStatus.FAILED);
-    expect(onError).toHaveBeenCalledTimes(1);
-    expect(onError).toHaveBeenCalledWith(expect.stringContaining('exhausted'));
+    // A successful open clears it — the next transient drop restarts from the 1s backoff, not the plateau.
+    fakeSock.fire('connection.update', { connection: 'open' });
+    expect(adapter.getStatus()).toBe(EngineStatus.READY);
+    expect(internals.reconnectAttempts).toBe(0);
   });
 
   it('I4: a recoverable close after disconnect() (intentionalClose) does NOT schedule a reconnect', async () => {
