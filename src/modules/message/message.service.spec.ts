@@ -240,9 +240,9 @@ describe('MessageService', () => {
     it('does not leak the raw engine error text to the caller', async () => {
       mockEngine.sendTextMessage.mockRejectedValueOnce(new Error('internal-store-pointer 0xDEADBEEF'));
 
-      await expect(
-        service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'hi' }),
-      ).rejects.not.toThrow(/0xDEADBEEF/);
+      await expect(service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'hi' })).rejects.not.toThrow(
+        /0xDEADBEEF/,
+      );
     });
 
     it('preserves an engine HttpException status (e.g. EngineNotReadyError → 409), not re-wrapping it as 502', async () => {
