@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Send and chat-list failures now return a diagnostic `502` instead of a bare `500 Internal server
+  error`.** When the WhatsApp engine threw a raw, non-HTTP fault while executing an operation —
+  typically a whatsapp-web.js Puppeteer `Evaluation failed: Cannot read properties of undefined` from a
+  WA Web store that hasn't finished syncing in the minutes after a fresh link, a dropped socket, or a
+  primitive-string throw — it escaped to NestJS's default handler as an opaque `500 Internal Server
+  Error`. That is exactly the `OpenWA API HTTP 500: Internal server error` a downstream integration saw
+  when calling `POST /api/sessions/:id/messages/send-text`, and it also left the dashboard unable to
+  list chats via `GET /api/sessions/:id/chats`. Both paths now map an unexpected engine fault to a
+  `502 Bad Gateway` with a retryable, non-leaking diagnostic (`toEngineClientError`), so the caller gets
+  an actionable signal that the fault is in the upstream WhatsApp engine (retry shortly; restart the
+  session if it persists) rather than a meaningless 500. Domain errors that already carry an intended
+  status (`EngineNotReadyError` → 409, `MessageNotFoundError` → 404, the SSRF/plugin-block 400s) still
+  pass through unchanged, and the `message:failed` plugin hook still receives the raw server-side reason.
+
 - **A transient drop no longer ends a WhatsApp session permanently — it self-heals.** Both reconnect
   layers previously gave up terminally (→ `FAILED`, manual restart required) after **5 consecutive
   failed reconnects**: with the default 5s base and exponential backoff that was only ~3 minutes of a

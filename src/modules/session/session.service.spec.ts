@@ -2355,6 +2355,23 @@ describe('SessionService', () => {
 
       await expect(service.getChats('sess-uuid-1')).rejects.toThrow(BadRequestException);
     });
+
+    it('maps a raw engine getChats fault to 502 instead of a bare 500 (dashboard chats)', async () => {
+      const session = createMockSession();
+      (repository.findOne as jest.Mock).mockResolvedValue(session);
+      (repository.update as jest.Mock).mockResolvedValue({ affected: 1 });
+      await service.start('sess-uuid-1');
+
+      // whatsapp-web.js getChats() runs a Puppeteer evaluation that can throw while WA Web's store is
+      // still syncing after a fresh link — it must not leave the dashboard on an opaque 500.
+      mockEngine.getChats.mockRejectedValue(
+        new Error('Evaluation failed: TypeError: Cannot read properties of undefined'),
+      );
+
+      const err = await service.getChats('sess-uuid-1').catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(HttpException);
+      expect((err as HttpException).getStatus()).toBe(HttpStatus.BAD_GATEWAY);
+    });
   });
 
   describe('getGroups pagination', () => {

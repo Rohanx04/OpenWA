@@ -38,6 +38,7 @@ import {
   ReactionEvent,
 } from '../../engine/interfaces/whatsapp-engine.interface';
 import { createLogger } from '../../common/services/logger.service';
+import { toEngineClientError } from '../../common/errors/engine-operation.error';
 import { ShutdownService } from '../../common/services/shutdown.service';
 import { EventsGateway } from '../events/events.gateway';
 import { WebhookService } from '../webhook/webhook.service';
@@ -1583,7 +1584,20 @@ export class SessionService implements OnModuleDestroy, OnModuleInit, OnApplicat
 
     // Most-recent first, then bound the response window. Sorting before the cap means a capped
     // response is the N newest chats (what clients show first) rather than an arbitrary slice.
-    const chats = [...(await engine.getChats())].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    // whatsapp-web.js `getChats()` runs a Puppeteer evaluation that can throw a raw error (e.g.
+    // "Cannot read properties of undefined") while WA Web's store is still syncing after a fresh link
+    // — that must not surface as an opaque 500 that leaves the dashboard unable to show any chats.
+    let engineChats: Awaited<ReturnType<typeof engine.getChats>>;
+    try {
+      engineChats = await engine.getChats();
+    } catch (err) {
+      this.logger.error(
+        `getChats failed for session ${id}; surfacing as 502`,
+        err instanceof Error ? (err.stack ?? err.message) : String(err),
+      );
+      throw toEngineClientError(err);
+    }
+    const chats = [...engineChats].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
     return paginate(chats, opts.limit, opts.offset);
   }
 

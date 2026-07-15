@@ -1,7 +1,13 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { BadRequestException, NotFoundException, PayloadTooLargeException } from '@nestjs/common';
+import {
+  BadRequestException,
+  BadGatewayException,
+  ConflictException,
+  NotFoundException,
+  PayloadTooLargeException,
+} from '@nestjs/common';
 import { MessageService } from './message.service';
 import { Message, MessageDirection, MessageStatus } from './entities/message.entity';
 import { SessionService } from '../session/session.service';
@@ -215,6 +221,39 @@ describe('MessageService', () => {
         BadRequestException,
       );
     });
+
+    it('maps a raw engine send fault to 502 Bad Gateway instead of a bare 500', async () => {
+      // whatsapp-web.js throws a raw Puppeteer error (not an HttpException) when WA Web's store is not
+      // in sync — previously this escaped to NestJS as an opaque 500 "Internal server error" (what a
+      // downstream integration reported). It must now surface as a diagnostic 502.
+      mockEngine.sendTextMessage.mockRejectedValueOnce(
+        new Error('Evaluation failed: TypeError: Cannot read properties of undefined'),
+      );
+
+      await expect(service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'hi' })).rejects.toThrow(
+        BadGatewayException,
+      );
+      // The failed row is persisted and message:failed still fires.
+      expect(hookManager.execute).toHaveBeenCalledWith('message:failed', expect.anything(), expect.anything());
+    });
+
+    it('does not leak the raw engine error text to the caller', async () => {
+      mockEngine.sendTextMessage.mockRejectedValueOnce(new Error('internal-store-pointer 0xDEADBEEF'));
+
+      await expect(
+        service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'hi' }),
+      ).rejects.not.toThrow(/0xDEADBEEF/);
+    });
+
+    it('preserves an engine HttpException status (e.g. EngineNotReadyError → 409), not re-wrapping it as 502', async () => {
+      // A domain error already carries the status the caller should see; the 502 mapping is only for
+      // raw, non-HTTP faults.
+      mockEngine.sendTextMessage.mockRejectedValueOnce(new ConflictException('Session is not connected.'));
+
+      await expect(service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'hi' })).rejects.toThrow(
+        ConflictException,
+      );
+    });
   });
 
   // ── sendTemplate ──────────────────────────────────────────────────
@@ -349,9 +388,11 @@ describe('MessageService', () => {
 
     it('fires message:failed when a media send fails (previously only sendText did)', async () => {
       mockEngine.sendImageMessage.mockRejectedValueOnce(new Error('engine down'));
+      // Client-facing: a raw engine fault is mapped to a diagnostic 502, not surfaced as a bare 500.
       await expect(service.sendImage('sess-1', { chatId: '628@c.us', url: 'https://e.com/i.jpg' })).rejects.toThrow(
-        'engine down',
+        BadGatewayException,
       );
+      // The message:failed hook still receives the RAW reason (it is server-side, not client-facing).
       expect(hookManager.execute).toHaveBeenCalledWith(
         'message:failed',
         expect.objectContaining({ type: 'image', error: 'engine down' }),
