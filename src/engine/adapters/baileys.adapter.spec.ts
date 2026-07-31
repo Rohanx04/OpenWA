@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
+import { LoggerService } from '../../common/services/logger.service';
 
 jest.mock('../../common/media/load-remote-media', () => ({
   loadRemoteMediaBuffer: jest.fn(),
@@ -549,6 +550,27 @@ describe('BaileysAdapter lifecycle & status', () => {
     await adapter.initialize(noopCallbacks({}));
     fakeSock.fire('creds.update', {});
     expect(saveCreds).toHaveBeenCalled();
+  });
+
+  // A failed credential write is the one failure that silently costs the session its link: the
+  // live socket keeps working, so nothing looks wrong until a restart reloads stale creds and
+  // WhatsApp answers 401 — reported by operators as "it logged itself out" with nothing in the
+  // logs. The write stays fire-and-forget (Baileys serializes it), but the reason must be logged.
+  it('persists creds: logs a saveCreds failure instead of swallowing it', async () => {
+    const errorSpy = jest.spyOn(LoggerService.prototype, 'error').mockImplementation(() => {});
+    saveCreds.mockRejectedValueOnce(new Error('ENOSPC: no space left on device'));
+    const adapter = newAdapter();
+    await adapter.initialize(noopCallbacks({}));
+
+    fakeSock.fire('creds.update', {});
+    await Promise.resolve(); // let the rejection handler run
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to persist Baileys credentials'),
+      expect.stringContaining('ENOSPC'),
+      expect.objectContaining({ action: 'baileys_save_creds_failed' }),
+    );
+    errorSpy.mockRestore();
   });
 
   // C2 — resurrect-after-stop race

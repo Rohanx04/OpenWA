@@ -343,7 +343,25 @@ export class BaileysAdapter implements IWhatsAppEngine {
     });
     this.sock = sock;
 
-    sock.ev.on('creds.update', () => void saveCreds());
+    // saveCreds() persists the link credentials to disk. A rejection here (full or
+    // read-only volume, bad permissions on authDir) is the one failure that silently
+    // costs the session its link: the socket keeps working, so nothing looks wrong until
+    // a restart reloads stale creds and WhatsApp answers 401 — surfacing as "it logged
+    // itself out" with no trace of why. Baileys serializes the writes internally, so this
+    // stays fire-and-forget; it just no longer swallows the reason.
+    sock.ev.on('creds.update', () => {
+      void saveCreds().catch(err =>
+        this.logger.error(
+          'Failed to persist Baileys credentials — the session may need re-linking after a restart',
+          err instanceof Error ? (err.stack ?? err.message) : String(err),
+          {
+            sessionId: this.config.sessionId,
+            authPath: this.authPath,
+            action: 'baileys_save_creds_failed',
+          },
+        ),
+      );
+    });
     sock.ev.on('connection.update', update => this.handleConnectionUpdate(update));
     sock.ev.on('messages.upsert', event => this.handleMessagesUpsert(event));
     sock.ev.on('messages.update', updates => this.handleMessagesUpdate(updates));
