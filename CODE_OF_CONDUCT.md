@@ -27,7 +27,7 @@ including the detailed standards, enforcement guidelines, and scope — is publi
 ## Enforcement
 
 Concerns about a community member's conduct may be reported privately to the project
-maintainer at **yudhi@rmyndharis.com**. All reports will be reviewed and investigated
+maintainer at **support@tachyel.com**. All reports will be reviewed and investigated
 promptly and fairly, and the reporter's privacy will be respected.
 
 ## Attribution

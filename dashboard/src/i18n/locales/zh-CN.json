@@ -185,7 +185,7 @@
     "connectionError": "无法连接到服务器。请重试。",
     "help": "需要帮助？",
     "viewDocs": "查看文档",
-    "footer": "由 Yudhi Armyndharis 和 OpenWA 社区用 ❤️ 打造",
+    "footer": "由 TachyEl Technologies Private Limited 和 OpenWA 社区用 ❤️ 打造",
     "version": "v{{version}} · {{date}}"
   },
   "dashboard": {

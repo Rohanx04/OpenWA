@@ -22,7 +22,7 @@ Report it privately through either channel:
 
 - **GitHub Security Advisories** (preferred) — open a private report at
   <https://github.com/rmyndharis/OpenWA/security/advisories/new>
-- **Email** — yudhi@rmyndharis.com
+- **Email** — support@tachyel.com
 
 Please include, where possible:
 

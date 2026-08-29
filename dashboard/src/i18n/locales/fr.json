@@ -185,7 +185,7 @@
     "connectionError": "Impossible de se connecter au serveur. Veuillez réessayer.",
     "help": "Besoin d'aide ?",
     "viewDocs": "Voir la documentation",
-    "footer": "Fait avec ❤️ par Yudhi Armyndharis et la communauté OpenWA",
+    "footer": "Fait avec ❤️ par TachyEl Technologies Private Limited et la communauté OpenWA",
     "version": "v{{version}} · {{date}}"
   },
   "dashboard": {

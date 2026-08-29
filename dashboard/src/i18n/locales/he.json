@@ -192,7 +192,7 @@
     "connectionError": "לא ניתן להתחבר לשרת. יש לנסות שוב.",
     "help": "צריך עזרה?",
     "viewDocs": "לצפייה בתיעוד",
-    "footer": "נבנה באהבה על ידי Yudhi Armyndharis וקהילת OpenWA",
+    "footer": "נבנה באהבה על ידי TachyEl Technologies Private Limited וקהילת OpenWA",
     "version": "v{{version}} · {{date}}"
   },
   "dashboard": {

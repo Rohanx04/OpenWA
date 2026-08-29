@@ -185,7 +185,7 @@
     "connectionError": "Unable to connect to server. Please try again.",
     "help": "Need help?",
     "viewDocs": "View Documentation",
-    "footer": "Made with ❤️ by Yudhi Armyndharis and the OpenWA Community",
+    "footer": "Made with ❤️ by TachyEl Technologies Private Limited and the OpenWA Community",
     "version": "v{{version}} · {{date}}"
   },
   "dashboard": {
