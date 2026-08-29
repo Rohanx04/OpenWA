@@ -132,7 +132,7 @@ export function createSwaggerConfig(): Omit<OpenAPIObject, 'paths'> {
       // Apply the scheme globally so Swagger UI sends the key with every request
       // (mirrors the global ApiKeyGuard). Without this, "Authorize" is cosmetic.
       .addSecurityRequirements(API_KEY_SECURITY_SCHEME)
-      .setContact('OpenWA', 'https://github.com/rmyndharis/OpenWA', 'yudhi@rmyndharis.com')
+      .setContact('OpenWA', 'https://github.com/rmyndharis/OpenWA', 'support@tachyel.com')
       .addTag('sessions', 'WhatsApp session management')
       .addTag('messages', 'Send and manage messages')
       .addTag('webhooks', 'Webhook configuration')

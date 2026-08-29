@@ -103,8 +103,8 @@ jobs:
             exit 1
           fi
 
-          git config user.name "rmyndharis"
-          git config user.email "yudhi@rmyndharis.com"
+          git config user.name "TachyEl Technologies"
+          git config user.email "support@tachyel.com"
           # Same split the mirror workflow performs, taken at THIS tag: subtree split is deterministic,
           # so the commit this produces is the one mirror `main` already carries for the same tree.
           SPLIT_SHA="$(git subtree split --prefix=sdk/php HEAD)"

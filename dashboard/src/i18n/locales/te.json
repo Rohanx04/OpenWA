@@ -185,7 +185,7 @@
     "connectionError": "సర్వర్‌కు కనెక్ట్ కాలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.",
     "help": "సహాయం కావాలా?",
     "viewDocs": "డాక్యుమెంటేషన్ చూడండి",
-    "footer": "Yudhi Armyndharis మరియు OpenWA కమ్యూనిటీ ద్వారా ❤️ తో తయారు చేయబడింది",
+    "footer": "TachyEl Technologies Private Limited మరియు OpenWA కమ్యూనిటీ ద్వారా ❤️ తో తయారు చేయబడింది",
     "version": "v{{version}} · {{date}}"
   },
   "dashboard": {

@@ -828,7 +828,7 @@ contacts:
 
   security_lead:
     name: 'Security Lead'
-    email: 'yudhi@rmyndharis.com' # see SECURITY.md — GitHub Security Advisories preferred
+    email: 'support@tachyel.com' # see SECURITY.md — GitHub Security Advisories preferred
 
   escalation:
     - level: 1

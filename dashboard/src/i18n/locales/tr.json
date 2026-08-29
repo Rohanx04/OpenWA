@@ -185,7 +185,7 @@
     "connectionError": "Sunucuya bağlanılamadı. Lütfen tekrar deneyin.",
     "help": "Yardıma mı ihtiyacınız var?",
     "viewDocs": "Dokümantasyonu Görüntüle",
-    "footer": "Yudhi Armyndharis ve OpenWA Topluluğu tarafından ❤️ ile yapılmıştır",
+    "footer": "TachyEl Technologies Private Limited ve OpenWA Topluluğu tarafından ❤️ ile yapılmıştır",
     "version": "v{{version}} · {{date}}"
   },
   "dashboard": {

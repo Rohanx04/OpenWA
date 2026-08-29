@@ -64,8 +64,8 @@ jobs:
             echo "::notice::PHP_SDK_SPLIT_TOKEN is not set — skipping. Create rmyndharis/openwa-php and add the secret to enable the mirror."
             exit 0
           fi
-          git config user.name "rmyndharis"
-          git config user.email "yudhi@rmyndharis.com"
+          git config user.name "TachyEl Technologies"
+          git config user.email "support@tachyel.com"
           SPLIT_SHA="$(git subtree split --prefix=sdk/php HEAD)"
           echo "Split SHA: $SPLIT_SHA"
           git push --force \

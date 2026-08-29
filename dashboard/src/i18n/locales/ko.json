@@ -185,7 +185,7 @@
     "connectionError": "서버에 연결할 수 없습니다. 다시 시도해 주세요.",
     "help": "도움이 필요하신가요?",
     "viewDocs": "문서 보기",
-    "footer": "Yudhi Armyndharis와 OpenWA 커뮤니티가 ❤️로 만들었습니다",
+    "footer": "TachyEl Technologies Private Limited와 OpenWA 커뮤니티가 ❤️로 만들었습니다",
     "version": "v{{version}} · {{date}}"
   },
   "dashboard": {

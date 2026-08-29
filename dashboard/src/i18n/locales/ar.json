@@ -196,7 +196,7 @@
     "connectionError": "تعذّر الاتصال بالخادم. يرجى المحاولة مرة أخرى.",
     "help": "هل تحتاج مساعدة؟",
     "viewDocs": "عرض التوثيق",
-    "footer": "صُنع بـ ❤️ بواسطة Yudhi Armyndharis ومجتمع OpenWA",
+    "footer": "صُنع بـ ❤️ بواسطة TachyEl Technologies Private Limited ومجتمع OpenWA",
     "version": "v{{version}} · {{date}}"
   },
   "dashboard": {
