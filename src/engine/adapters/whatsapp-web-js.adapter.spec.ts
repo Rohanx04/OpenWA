@@ -5624,15 +5624,92 @@ describe('WhatsAppWebJsAdapter page transport error detection (wedged page fast-
     },
   );
 
-  it('detects a transport error from a getter too (getContacts)', async () => {
+  it('converts a transport error from a getter into a 503 (getContacts)', async () => {
     const getContacts = jest.fn().mockRejectedValue(new Error('Protocol error: Target closed'));
     const { adapter, onDisconnected } = readyAdapter({ getContacts });
 
-    await expect(adapter.getContacts()).rejects.toThrow('Protocol error: Target closed');
-
-    expect(onDisconnected).toHaveBeenCalledTimes(1);
+    await expect(adapter.getContacts()).rejects.toBeInstanceOf(EngineTransportError);
     expect(onDisconnected).toHaveBeenCalledWith('Page transport error during getContacts');
-    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+  });
+
+  // #1476: a raw wwebjs contact carries its wid under `_serialized` or, on a renamed WA Web build,
+  // under `$1` (see readWid). Both shapes must map to the same library-agnostic Contact.
+  it('maps both the `_serialized` and the renamed `$1` id shapes in getContacts', async () => {
+    const raw = [
+      {
+        id: { _serialized: '111@c.us' },
+        name: 'Alice',
+        pushname: 'Ally',
+        number: '111',
+        isMyContact: true,
+        isBlocked: false,
+      },
+      { id: { $1: '222@c.us' }, name: 'Bob', pushname: 'Bobby', number: '222', isMyContact: false, isBlocked: true },
+    ];
+    const getContacts = jest.fn().mockResolvedValue(raw);
+    const { adapter } = readyAdapter({ getContacts });
+
+    await expect(adapter.getContacts()).resolves.toEqual([
+      { id: '111@c.us', name: 'Alice', pushName: 'Ally', number: '111', isMyContact: true, isBlocked: false },
+      { id: '222@c.us', name: 'Bob', pushName: 'Bobby', number: '222', isMyContact: false, isBlocked: true },
+    ]);
+  });
+
+  // #1476: an entry with no readable wid under either name (a shape wwebjs itself sometimes returns)
+  // must not reject the whole address book — it is dropped and counted instead.
+  it('skips a contact with no readable id and counts it in the warn log, keeping the rest', async () => {
+    const good1 = { id: { _serialized: '111@c.us' }, name: 'Alice', number: '111' };
+    const unreadable = { id: {}, name: 'Ghost', number: '000' };
+    const good2 = { id: { $1: '222@c.us' }, name: 'Bob', number: '222' };
+    const getContacts = jest.fn().mockResolvedValue([good1, unreadable, good2]);
+    const { adapter } = readyAdapter({ getContacts });
+    const logger = (adapter as unknown as { logger: { warn: (m: string) => void } }).logger;
+    const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+    const contacts = await adapter.getContacts();
+
+    expect(contacts.map(c => c.id)).toEqual(['111@c.us', '222@c.us']);
+    expect(warnSpy).toHaveBeenCalledWith('Skipped 1 contact(s) without a serialized id');
+  });
+
+  // A rejection that carries no transport-death signature is an ordinary failure, not a dead page —
+  // it must reach the caller unchanged and leave the session READY, unlike the 503 case above.
+  it('propagates a non-transport rejection from getContacts untouched and leaves the session READY', async () => {
+    const getContacts = jest.fn().mockRejectedValue(new Error('Evaluation failed: TypeError: x is not a function'));
+    const { adapter, onDisconnected } = readyAdapter({ getContacts });
+
+    await expect(adapter.getContacts()).rejects.toThrow('Evaluation failed: TypeError: x is not a function');
+
+    expect(onDisconnected).not.toHaveBeenCalled();
+    expect(adapter.getStatus()).toBe(EngineStatus.READY);
+  });
+
+  it('getContactById maps the renamed `$1` id shape too', async () => {
+    const getContactById = jest.fn().mockResolvedValue({
+      id: { $1: '333@c.us' },
+      name: 'Cara',
+      pushname: 'C',
+      number: '333',
+      isMyContact: true,
+      isBlocked: false,
+    });
+    const { adapter } = readyAdapter({ getContactById });
+
+    await expect(adapter.getContactById('333@c.us')).resolves.toEqual({
+      id: '333@c.us',
+      name: 'Cara',
+      pushName: 'C',
+      number: '333',
+      isMyContact: true,
+      isBlocked: false,
+    });
+  });
+
+  it('getContactById returns null for an entry with no readable id', async () => {
+    const getContactById = jest.fn().mockResolvedValue({ id: {}, name: 'Ghost', number: '000' });
+    const { adapter } = readyAdapter({ getContactById });
+
+    await expect(adapter.getContactById('000@c.us')).resolves.toBeNull();
   });
 
   // joinGroupViaInviteCode answers 503 for a transport failure (a refused invite is no longer

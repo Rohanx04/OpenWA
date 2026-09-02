@@ -14,6 +14,7 @@ import { resolveAuthTimeoutMs, resolveEngineInitTimeoutMs } from '../engine-init
 import { killOrphanedChromiumProcesses, removeStaleSingletonFiles } from './chromium-profile-hygiene';
 import { isSupportedProxyUrl, buildProxyLaunchConfig } from './wwebjs-proxy';
 import { BACKPORT_MISSING_MESSAGE, isBackportMissing } from './wwebjs-backport-check';
+import { unappliedPatches, unappliedPatchesMessage } from './engine-patch-status';
 import { type WhatsAppWebJsConfig } from './whatsapp-web-js.adapter';
 
 /**
@@ -168,6 +169,12 @@ export class WwebjsLifecycle {
     // (#889) — say so here instead, while the operator is still looking at the startup logs.
     if (isBackportMissing()) {
       this.host.logger.error(BACKPORT_MISSING_MESSAGE);
+    }
+
+    // The other seven whatsapp-web.js patchers fail the same way and were equally silent about it.
+    const unapplied = unappliedPatches('wwebjs');
+    if (unapplied.length) {
+      this.host.logger.error(unappliedPatchesMessage('wwebjs', unapplied));
     }
 
     try {
