@@ -81,12 +81,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `STORAGE_TYPE=s3` missing `S3_ACCESS_KEY_ID` or `S3_SECRET_ACCESS_KEY` now warns at startup and names
   the one that is unset, instead of silently writing every file to local disk and leaving the bucket
   empty. Thanks @onepay-ye.
+- Six whatsapp-web.js contact operations answer the `503` their routes document when the browser page
+  dies mid-request, instead of a bare `500` that tells a client not to retry: blocked contacts, number
+  lookup, addressbook save and delete, and block and unblock. The list and single-contact reads in the
+  same file already made that split ([#1476](https://github.com/rmyndharis/OpenWA/issues/1476)).
+  Thanks @onepay-ye.
+- Fifteen more whatsapp-web.js operations answer `503` rather than `500` when the browser page dies
+  mid-request: the group list and membership queue, the four label reads and writes, and nine message
+  operations (history, reactions, react, edit, delete, star, pin, unpin and poll votes). Twelve of them
+  had no error handling on that path at all, so a dead page was also never reported to the liveness
+  check. Ten of these routes now declare `503` in the API contract; the message send routes keep
+  answering `500` deliberately, because `503` is replay-safe in the SDK clients and a replayed send
+  would duplicate the message.
+- The seven routes that answer the media byte cap's `413` now declare it: the five media sends,
+  `send-bulk` and the group picture. Only the media conversions, the status sends and the profile
+  picture declared it before, and `docs/06` described the same rejection as a `400` on two of them, so
+  a client written against the contract handled a status the gateway never sends. Behaviour is
+  unchanged. Thanks @onepay-ye for the report.
+- `.env.example` no longer describes an oversized base64 send as a `400` (it is `413`), and its S3
+  block no longer implies `MINIO_BUILTIN=true` fills in the credentials. Only saving storage from the
+  dashboard writes them, so a hand-edited file gets the bundled MinIO container and no keys, and media
+  is written to local disk while the bucket stays empty. Thanks @onepay-ye for the report.
 
 ### Dependencies
 
 - `browserslist` 4.28.2 to 4.28.8 in both dependency trees, closing two high-severity advisories
   (unbounded cache growth, and a crash on untrusted custom stats). Dev-only and transitive in each,
   so nothing that ships changes.
+- `fast-uri` 3.1.5 to 3.1.7 via an override, closing four high-severity advisories: two host-confusion
+  paths (skipped IDN canonicalisation, percent-encoded scheme normalisation) and two SSRF paths
+  (malformed IPv6 normalisation, repeated hostname percent-decoding). It arrives under `ajv`, whose
+  range already allows the patched version, and reaches the runtime tree through
+  `@modelcontextprotocol/sdk`, so this one does ship.
 
 ## [0.23.3] - 2026-08-24
 
