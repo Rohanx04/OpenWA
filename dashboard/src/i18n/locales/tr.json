@@ -247,6 +247,7 @@
   "sessions": {
     "title": "Oturumlar",
     "subtitle": "WhatsApp oturumlarınızı ve QR kodu bağlantılarınızı yönetin",
+    "feedDisconnected": "Canlı güncellemeler kesildi",
     "newSession": "Yeni Oturum",
     "searchPlaceholder": "Oturumlarda ara...",
     "filter": {
@@ -433,6 +434,7 @@
         "body": "Mesaj içeriği",
         "type": "Mesaj türü",
         "isGroup": "Grup sohbeti mi",
+        "kind": "Chat kind",
         "fromMe": "Benim tarafımdan gönderildi",
         "hasMedia": "Medya içeriyor",
         "mentions": "Bahsetmeler"
@@ -657,6 +659,7 @@
     "removeFile": "Dosyayı kaldır",
     "fileReadError": "Dosya okunamadı",
     "fileTooLarge": "Dosya çok büyük (maks 18 MB)",
+    "recipientsFileTooLarge": "Alıcı dosyası çok büyük (maks 2 MB)",
     "caption": "Açıklama",
     "filename": "Dosya Adı",
     "captionPlaceholder": "Açıklama girin...",

@@ -31,6 +31,7 @@
                 "session_disconnected",
                 "session_restricted",
                 "session_restriction_lifted",
+                "session_rebind_rejected",
                 "message_sent",
                 "message_failed",
                 "send_pacing_blocked",
@@ -6326,9 +6327,6 @@
           },
           "409": {
             "description": "The session is not connected — an engine exists for it but is not `ready`: disconnected, reconnecting, or still initializing, so the request never reached WhatsApp. Wait for `ready` and retry. A session that was never started answers `400` instead, and the session lifecycle routes answer `409` for a conflicting state rather than this. One window answers this while the session still reads `ready`: WhatsApp Web periodically reloads its own page and the engine re-injects into it — for those few seconds the answer is a `409` naming the reload; retry shortly."
-          },
-          "503": {
-            "description": "WhatsApp did not answer within the request budget. The link may or may not have been created — the gateway stopped waiting for a reply that never came."
           }
         },
         "summary": "Generate a shareable WhatsApp call link",
@@ -6636,7 +6634,7 @@
                 "schema": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/components/schemas/LabelChatDto"
+                    "$ref": "#/components/schemas/ChatSummaryDto"
                   }
                 }
               }
@@ -9591,7 +9589,7 @@
   "info": {
     "title": "OpenWA API",
     "description": "Open Source WhatsApp API Gateway - Free, Self-Hosted HTTP API\n\n**Gateway-wide responses.** Two statuses are returned by middleware before routing, so any operation can emit them:\n\n- `415 Unsupported Media Type` — the request body carries a `Content-Encoding` other than `identity`. The aggregate in-flight body cap counts wire bytes, so a compressed body would be admitted on its compressed size and then inflated past the memory it is meant to bound. Send the body uncompressed.\n- `503 Service Unavailable` with `Retry-After` — the gateway already has too much request body data in flight. The body is not read; retry after the given delay.",
-    "version": "0.23.3",
+    "version": "0.23.5",
     "contact": {
       "name": "OpenWA",
       "url": "https://github.com/rmyndharis/OpenWA",
@@ -10201,7 +10199,7 @@
           },
           "lastError": {
             "type": "string",
-            "description": "Human-readable reason carried while the status is FAILED (a terminal engine failure) or ACTION_REQUIRED (the engine is running but something needs a human). Cleared on any other status.",
+            "description": "Human-readable reason carried while the status is FAILED (a terminal engine failure), ACTION_REQUIRED (the engine is running but something needs a human), or INITIALIZING while the engine is retrying a dropped connection on its own. Cleared on any other status.",
             "example": "Failed to launch the browser process: spawn /usr/bin/chromium ENOENT",
             "nullable": true
           },
@@ -10460,6 +10458,26 @@
           "lastMessage": {
             "type": "string",
             "example": "hi"
+          },
+          "archived": {
+            "type": "boolean",
+            "description": "Archived state, as set via POST /sessions/{sessionId}/chats/archive.",
+            "example": false
+          },
+          "pinned": {
+            "type": "boolean",
+            "description": "Pinned state, as set via POST /sessions/{sessionId}/chats/pin.",
+            "example": false
+          },
+          "muted": {
+            "type": "boolean",
+            "description": "Whether the chat is muted right now, as set via POST /sessions/{sessionId}/chats/mute. The verdict rather than the expiry: whatsapp-web.js derives it itself from Chat.isMuted, and Baileys carries a muteEndTime that this gateway compares against now. muteExpiration carries the instant itself.",
+            "example": false
+          },
+          "muteExpiration": {
+            "type": "number",
+            "description": "Epoch MILLISECONDS at which the mute ends, present only when muted is true; 0 means muted indefinitely. Milliseconds is the same unit as POST /sessions/{sessionId}/chats/mute muteUntil, so a finite value can be written straight back. The 0 an indefinite mute reports is the exception: muteUntil requires a real future instant, so re-apply an indefinite mute with a far-future timestamp rather than 0.",
+            "example": 1786003600000
           }
         },
         "required": [
@@ -10468,7 +10486,10 @@
           "isGroup",
           "kind",
           "unreadCount",
-          "timestamp"
+          "timestamp",
+          "archived",
+          "pinned",
+          "muted"
         ]
       },
       "MarkChatReadDto": {
@@ -12066,6 +12087,49 @@
           "longitude"
         ]
       },
+      "ChatHistoryOrderDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "description": "Id of the cart the customer placed from the business catalog.",
+            "example": "1000000000000001"
+          },
+          "token": {
+            "type": "string",
+            "description": "Opaque single-order credential that accompanies `orderId`. Pass through unchanged; do not log it."
+          }
+        },
+        "required": [
+          "orderId"
+        ]
+      },
+      "ChatHistoryProductDto": {
+        "type": "object",
+        "properties": {
+          "productId": {
+            "type": "string",
+            "description": "Id of the shared catalog product.",
+            "example": "2000000000000002"
+          },
+          "title": {
+            "type": "string",
+            "example": "Sample product"
+          },
+          "description": {
+            "type": "string",
+            "example": "A sample product description."
+          },
+          "businessOwnerJid": {
+            "type": "string",
+            "description": "JID of the catalog's owner.",
+            "example": "628123456789@c.us"
+          }
+        },
+        "required": [
+          "productId"
+        ]
+      },
       "ChatHistoryMessageDto": {
         "type": "object",
         "properties": {
@@ -12104,6 +12168,8 @@
               "poll",
               "call",
               "revoked",
+              "order",
+              "product",
               "masked",
               "unknown"
             ],
@@ -12202,6 +12268,22 @@
           },
           "location": {
             "$ref": "#/components/schemas/ChatHistoryLocationDto"
+          },
+          "order": {
+            "description": "Set for `order` messages.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatHistoryOrderDto"
+              }
+            ]
+          },
+          "product": {
+            "description": "Set for `product` messages.",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChatHistoryProductDto"
+              }
+            ]
           }
         },
         "required": [
@@ -13855,6 +13937,12 @@
               "type": "object"
             }
           },
+          "chatStates": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
           "pluginInstances": {
             "type": "array",
             "items": {
@@ -13912,6 +14000,7 @@
           "templates",
           "baileysStoredMessages",
           "lidMappings",
+          "chatStates",
           "pluginInstances",
           "conversationMappings",
           "ingressEvents",
@@ -13952,6 +14041,10 @@
           "lidMappings": {
             "type": "number",
             "example": 64
+          },
+          "chatStates": {
+            "type": "number",
+            "example": 40
           },
           "pluginInstances": {
             "type": "number",
@@ -13994,6 +14087,7 @@
           "templates",
           "baileysStoredMessages",
           "lidMappings",
+          "chatStates",
           "pluginInstances",
           "conversationMappings",
           "ingressEvents",
@@ -14099,6 +14193,9 @@
                 "type": "array"
               },
               "lidMappings": {
+                "type": "array"
+              },
+              "chatStates": {
                 "type": "array"
               },
               "pluginInstances": {
@@ -15171,54 +15268,6 @@
           "id",
           "name",
           "hexColor"
-        ]
-      },
-      "LabelChatDto": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "description": "Chat id in the engine's native format.",
-            "example": "628123456789@c.us"
-          },
-          "name": {
-            "type": "string",
-            "description": "Chat title — contact name or group subject.",
-            "example": "Ada Lovelace"
-          },
-          "isGroup": {
-            "type": "boolean",
-            "description": "Retained for back-compat; `kind` is the full discriminator.",
-            "example": false
-          },
-          "kind": {
-            "type": "string",
-            "description": "User-facing chat kind.",
-            "example": "individual"
-          },
-          "unreadCount": {
-            "type": "number",
-            "description": "Unread messages in this chat.",
-            "example": 0
-          },
-          "timestamp": {
-            "type": "number",
-            "description": "Unix SECONDS of the most recent activity.",
-            "example": 1786000000
-          },
-          "lastMessage": {
-            "type": "string",
-            "description": "Preview of the last message, when there is one.",
-            "example": "See you then"
-          }
-        },
-        "required": [
-          "id",
-          "name",
-          "isGroup",
-          "kind",
-          "unreadCount",
-          "timestamp"
         ]
       },
       "UpsertLabelDto": {

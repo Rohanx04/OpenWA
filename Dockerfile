@@ -39,7 +39,10 @@ COPY scripts/postinstall.js ./scripts/
 # variable, so docker-compose.yml's `NODE_ENV=${NODE_ENV:-production}` leaks NODE_ENV=production
 # into this stage and a bare `npm ci` would skip @nestjs/cli → `sh: 1: nest: not found` (exit 127).
 # (docker-compose.dev.yml hardcodes NODE_ENV=development, which is why the dev build never hit this.)
-RUN npm ci --include=dev
+# This stage only builds dist/ and the dashboard SPA and never launches a browser; the production
+# stage downloads Chrome explicitly. Skip the Puppeteer postinstall download so @puppeteer/browsers 3
+# does not try to extract a zip here, where no archiver is installed.
+RUN PUPPETEER_SKIP_DOWNLOAD=true npm ci --include=dev
 
 # Copy source code
 COPY . .
@@ -87,7 +90,12 @@ ARG TARGETARCH
 # cost with --no-install-recommends: ~210 MB, and no new fixable CRITICAL/HIGH findings under the
 # release image scan. It is the Debian package rather than a bundled static build precisely so that
 # codec CVEs arrive through the same security stream as everything else here.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+# `apt-get upgrade` runs first because the base is pinned by digest: the Debian packages it ships
+# (libpcre2, libc, openssl and the rest) keep that snapshot's versions, and `apt-get install` upgrades
+# only the packages it names. A bookworm-security fix published after the snapshot reaches them here,
+# and the release workflow rebuilds this layer without cache so the fix is actually picked up.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     $([ "$TARGETARCH" = arm64 ] && echo "chromium chromium-sandbox") \
     fonts-liberation \
     libappindicator3-1 \
@@ -110,6 +118,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gosu \
     patch \
     curl \
+    unzip \
     procps \
     sqlite3 \
     ffmpeg \

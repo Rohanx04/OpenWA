@@ -20,8 +20,9 @@ class FakeSock extends EventEmitter {
   };
   public emitter = new EventEmitter();
   public user: { id: string; name?: string } | undefined;
-  // Baileys' WebSocketClient; the lifecycle reads isOpen after an await to detect a drop in between.
-  public ws = { isOpen: true };
+  // Baileys' WebSocketClient; the lifecycle reads isOpen after an await to detect a drop in between,
+  // and listens on it for an upgrade response that never became a WebSocket.
+  public ws = Object.assign(new EventEmitter(), { isOpen: true, isConnecting: false });
   public requestPairingCode = jest.fn().mockResolvedValue('ABCD-EFGH');
   public end = jest.fn();
   public logout = jest.fn().mockResolvedValue(undefined);
@@ -82,6 +83,7 @@ class FakeSock extends EventEmitter {
   }
   resetEmitter(): void {
     this.emitter.removeAllListeners();
+    this.ws.removeAllListeners();
   }
 }
 
@@ -561,6 +563,54 @@ describe('BaileysAdapter lifecycle & status', () => {
       await new Promise(r => setImmediate(r)); // let the async connect() body reach makeWASocket
       expect(makeWASocket).toHaveBeenCalledTimes(1);
       expect(onDisconnected).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('on a recoverable close: reports the scheduled attempt through onReconnecting', async () => {
+    // The only signal a consumer gets for an engine-internal retry loop: onDisconnected is
+    // deliberately silent here and the status sits at INITIALIZING for the whole episode, so without
+    // this callback an operator cannot tell a one-second blip from an hour-long outage.
+    const onReconnecting = jest.fn();
+    const onDisconnected = jest.fn();
+    const adapter = newAdapter();
+    await adapter.initialize(noopCallbacks({ onReconnecting, onDisconnected }));
+
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    try {
+      fakeSock.fire('connection.update', {
+        connection: 'close',
+        lastDisconnect: { error: { output: { statusCode: 515 } } },
+      });
+      expect(onDisconnected).not.toHaveBeenCalled();
+      expect(onReconnecting).toHaveBeenCalledTimes(1);
+      const [attempt, nextDelayMs] = onReconnecting.mock.calls[0] as [number, number];
+      expect(attempt).toBe(1);
+      // First attempt: the 1 s base plus up to 1 s of jitter.
+      expect(nextDelayMs).toBeGreaterThanOrEqual(1_000);
+      expect(nextDelayMs).toBeLessThan(2_000);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('a duplicate close while a reconnect is already pending does not inflate the attempt count', async () => {
+    // Baileys can emit more than one close per drop. The attempt number rides `lastError` and the
+    // reconnect_loop alert cadence, so double-counting would report a loop that is not happening.
+    const onReconnecting = jest.fn();
+    const adapter = newAdapter();
+    await adapter.initialize(noopCallbacks({ onReconnecting }));
+
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    try {
+      const close = {
+        connection: 'close',
+        lastDisconnect: { error: { output: { statusCode: 515 } } },
+      };
+      fakeSock.fire('connection.update', close);
+      fakeSock.fire('connection.update', close);
+      expect(onReconnecting).toHaveBeenCalledTimes(1);
     } finally {
       jest.useRealTimers();
     }
@@ -1147,6 +1197,123 @@ describe('BaileysAdapter reconnect socket teardown (no leak)', () => {
     // Exactly one legitimate reconnect — the synthetic close from end() must land on zero listeners.
     expect(baileys().default).toHaveBeenCalledTimes(1);
     expect(adapter.getStatus()).not.toBe(EngineStatus.FAILED);
+  });
+});
+
+// Baileys re-emits ws's 'unexpected-response', which stops ws from aborting the handshake itself: an
+// upgrade answered with a non-101 status leaves the real socket CONNECTING with no open, error or close.
+describe('BaileysAdapter connection attempt stuck at the WebSocket upgrade', () => {
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+  const baileys = () => jest.requireMock('@whiskeysockets/baileys') as { default: jest.Mock };
+
+  // The lifecycle's backstop for a socket still connecting, set above Baileys' 20 s connectTimeoutMs.
+  const CONNECTING_DEADLINE_MS = 60_000;
+
+  // initialize() needs real timers (loadLib is a dynamic import), so the socket under test is the one
+  // a reconnect attempt creates under fake timers: its listener and backstop timer are controllable.
+  const startReconnectAttempt = async (over: Partial<EngineEventCallbacks> = {}): Promise<BaileysAdapter> => {
+    fakeSock.user = undefined;
+    fakeSock.resetEmitter();
+    jest.clearAllMocks();
+    const adapter = newAdapter();
+    await adapter.initialize(noopCallbacks(over));
+    jest.useFakeTimers();
+    jest.spyOn(Math, 'random').mockReturnValue(0);
+    fakeSock.fire('connection.update', {
+      connection: 'close',
+      lastDisconnect: { error: { output: { statusCode: 515 } } },
+    });
+    baileys().default.mockClear();
+    fakeSock.ws.isOpen = false;
+    fakeSock.ws.isConnecting = true;
+    await jest.advanceTimersByTimeAsync(1_000); // attempt 1 creates the socket that never opens
+    expect(baileys().default).toHaveBeenCalledTimes(1);
+    fakeSock.end.mockClear(); // drop the previous socket's teardown end()
+    return adapter;
+  };
+
+  afterEach(() => {
+    fakeSock.ws.isOpen = true;
+    fakeSock.ws.isConnecting = false;
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
+
+  // 503 is what WhatsApp's edge or a session proxy answers; 401/403/440 must not reach the terminal
+  // close branches of the same codes, which would fail the session or wipe its credentials.
+  it.each([503, 401, 403, 440])(
+    'ends a socket whose upgrade got HTTP %i with a plain Error, and its close schedules the next attempt',
+    async statusCode => {
+      const rmSpy = jest.spyOn(fs.promises, 'rm').mockResolvedValue(undefined);
+      const onReconnecting = jest.fn();
+      const onError = jest.fn();
+      const onDisconnected = jest.fn();
+      const adapter = await startReconnectAttempt({ onReconnecting, onError, onDisconnected });
+      onReconnecting.mockClear();
+      // Real Baileys end() closes the WebSocket, then emits the close carrying the error it was given.
+      fakeSock.end.mockImplementationOnce((error: unknown) => {
+        fakeSock.fire('connection.update', { connection: 'close', lastDisconnect: { error } });
+      });
+
+      fakeSock.ws.emit('unexpected-response', {}, { statusCode });
+
+      expect(fakeSock.end).toHaveBeenCalledTimes(1);
+      const [error] = fakeSock.end.mock.calls[0] as [unknown];
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBeInstanceOf(Boom);
+      expect((error as Error).message).toContain(`HTTP ${statusCode}`);
+
+      expect(onReconnecting).toHaveBeenCalledWith(2, 2_000);
+      expect(adapter.getStatus()).toBe(EngineStatus.INITIALIZING);
+      expect(onError).not.toHaveBeenCalled();
+      expect(onDisconnected).not.toHaveBeenCalled();
+      expect(rmSpy).not.toHaveBeenCalled();
+      // The close also retired the backstop: only the reconnect timer is left.
+      expect(jest.getTimerCount()).toBe(1);
+
+      await jest.advanceTimersByTimeAsync(2_000);
+      expect(baileys().default).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it('ends a socket still connecting at the deadline exactly once', async () => {
+    await startReconnectAttempt();
+
+    await jest.advanceTimersByTimeAsync(CONNECTING_DEADLINE_MS - 1);
+    expect(fakeSock.end).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(1);
+    expect(fakeSock.end).toHaveBeenCalledTimes(1);
+    expect(fakeSock.end).toHaveBeenCalledWith(expect.any(Error));
+
+    await jest.advanceTimersByTimeAsync(CONNECTING_DEADLINE_MS * 2);
+    expect(fakeSock.end).toHaveBeenCalledTimes(1);
+  });
+
+  // A socket showing a QR has an open WebSocket but never emits connection 'open'.
+  it('leaves a socket whose WebSocket opened before the deadline alone', async () => {
+    await startReconnectAttempt();
+    fakeSock.ws.isConnecting = false;
+    fakeSock.ws.isOpen = true;
+
+    await jest.advanceTimersByTimeAsync(CONNECTING_DEADLINE_MS);
+    expect(fakeSock.end).not.toHaveBeenCalled();
+  });
+
+  it('clears the deadline once the connection opens', async () => {
+    await startReconnectAttempt();
+    expect(jest.getTimerCount()).toBe(1);
+    fakeSock.ws.isConnecting = false;
+    fakeSock.ws.isOpen = true;
+    fakeSock.fire('connection.update', { connection: 'open' });
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it.each(['disconnect', 'destroy', 'forceDestroy', 'logout'] as const)('clears the deadline on %s()', async method => {
+    const adapter = await startReconnectAttempt();
+    expect(jest.getTimerCount()).toBe(1);
+    // logout() without a linked identity still shuts the socket down locally, then rejects.
+    await adapter[method]().catch(() => undefined);
+    expect(jest.getTimerCount()).toBe(0);
   });
 });
 
@@ -2532,6 +2699,95 @@ describe('BaileysAdapter inbound fan-out', () => {
     expect(event.senderId).toBe('628111@c.us'); // canonicalized to the neutral dialect
   });
 
+  it('senderKeyDistributionMessage: emits nothing and stores nothing (protocol noise the history path drops, #1568)', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+    const baileys = jest.requireMock('@whiskeysockets/baileys') as { getContentType: jest.Mock };
+    // Real baileys 7.x getContentType EXCLUDES senderKeyDistributionMessage by name and only matches
+    // keys named `conversation` or containing `Message`, so an SKDM-only message resolves to
+    // undefined, never to 'senderKeyDistributionMessage'. The mock must return the realistic value
+    // or the test pins a code path production cannot reach.
+    baileys.getContentType.mockReturnValue(undefined);
+
+    const onMessage = jest.fn();
+    const adapter = newAdapter();
+    await adapter.initialize({ onMessage });
+    fakeSock.fire('messages.upsert', {
+      type: 'notify',
+      messages: [
+        {
+          key: {
+            remoteJid: '120363@g.us',
+            fromMe: false,
+            id: 'SKDM1',
+            participant: '628222@s.whatsapp.net',
+          },
+          message: {
+            senderKeyDistributionMessage: { axolotlSenderKeyDistributionMessage: 'R1NFMTIx...' },
+          },
+          messageTimestamp: 1700000025,
+        },
+      ],
+    });
+    await new Promise(r => setImmediate(r));
+    // A sender-key distribution is Signal protocol traffic every group participant emits on first
+    // write or key rotation; it carries no user content. The history mapper already returns null
+    // for it, so the live path must not deliver a bodyless `unknown` message.received either.
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(fakeStore.put).not.toHaveBeenCalled();
+  });
+
+  it('learns the lid pair carried on a dropped sender-key distribution before dropping it (#1568)', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
+    const baileys = jest.requireMock('@whiskeysockets/baileys') as { getContentType: jest.Mock };
+    // Call order matches message order: the SKDM resolves to undefined (dropped), the following
+    // real message to 'conversation'.
+    baileys.getContentType.mockReturnValueOnce(undefined).mockReturnValueOnce('conversation');
+
+    const onMessage = jest.fn();
+    const adapter = newAdapter();
+    await adapter.initialize({ onMessage });
+    // An SKDM is the first stanza a fresh @lid group sender emits; its key carries the only
+    // lid->phone pair. recordKeyLidMappings runs BEFORE the contentless drop, so the pair must be
+    // learned even though the message itself never reaches consumers.
+    fakeSock.fire('messages.upsert', {
+      type: 'notify',
+      messages: [
+        {
+          key: {
+            remoteJid: '120363@g.us',
+            fromMe: false,
+            id: 'SKDM_LID',
+            participant: '111@lid',
+            participantAlt: '628111@s.whatsapp.net',
+          },
+          message: { senderKeyDistributionMessage: { axolotlSenderKeyDistributionMessage: 'eA==' } },
+          messageTimestamp: 1700000030,
+        },
+      ],
+    });
+    await new Promise(r => setImmediate(r));
+    expect(onMessage).not.toHaveBeenCalled(); // dropped, not delivered
+
+    // The sender's real message follows, keyed by the bare lid with no Alt of its own; the pair
+    // learned from the dropped SKDM's key must resolve its author to the phone.
+    fakeSock.fire('messages.upsert', {
+      type: 'notify',
+      messages: [
+        {
+          key: { remoteJid: '120363@g.us', fromMe: false, id: 'REAL_LID', participant: '111@lid' },
+          message: { conversation: 'first real message' },
+          messageTimestamp: 1700000031,
+        },
+      ],
+    });
+    await new Promise(r => setImmediate(r));
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
+    const msg = onMessage.mock.calls[0][0] as { author?: string; body: string };
+    expect(msg.author).toBe('628111@c.us');
+    expect(msg.body).toBe('first real message');
+  });
+
   it('media download failure: logs the error and emits the omitted marker (no throw)', async () => {
     // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
     const baileys = jest.requireMock('@whiskeysockets/baileys') as {
@@ -2561,7 +2817,7 @@ describe('BaileysAdapter inbound fan-out', () => {
       });
       await new Promise(r => setImmediate(r));
       // The message is still emitted, and it still says it carried an image. sizeBytes is the DECLARED
-      // size: nothing was downloaded, so reporting the cap (as the streaming abort does) would lie.
+      // size: nothing was downloaded, so reporting the cap would lie.
       expect(onMessage).toHaveBeenCalledTimes(1);
       // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
       const msg = onMessage.mock.calls[0][0] as { media?: unknown; body?: string };
@@ -4262,6 +4518,9 @@ describe('BaileysAdapter contact + chat reads', () => {
       unreadCount: 1,
       timestamp: 1700000010,
       lastMessage: 'hi',
+      archived: false,
+      pinned: false,
+      muted: false,
     });
   });
 

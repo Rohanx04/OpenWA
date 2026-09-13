@@ -218,6 +218,8 @@ export interface MessageResponse {
 
 // Mirrors the backend engine ChatKind (dashboard cannot import wa-id.ts).
 export type ChatKind = 'individual' | 'group' | 'channel' | 'status' | 'broadcast' | 'unknown';
+// Mirrors CHAT_KINDS in the backend webhook filter registry (src/modules/webhook/filters/filter-types.ts).
+export const CHAT_KINDS: readonly ChatKind[] = ['individual', 'group', 'channel', 'status', 'broadcast', 'unknown'];
 
 // Chat summary returned by GET /sessions/:id/chats (mirrors the backend ChatSummary).
 export interface Chat {
@@ -228,6 +230,10 @@ export interface Chat {
   unreadCount: number;
   timestamp: number;
   lastMessage?: string;
+  archived: boolean;
+  pinned: boolean;
+  muted: boolean;
+  muteExpiration?: number;
 }
 
 // Engine-neutral message types (mirrors the backend's IWhatsAppEngine MessageType). The backend
@@ -246,6 +252,8 @@ export const MESSAGE_TYPES = [
   'poll',
   'call',
   'revoked',
+  'order',
+  'product',
   'masked',
   'unknown',
 ] as const;
@@ -346,6 +354,10 @@ export interface EngineHistoryMessage {
   };
   quotedMessage?: { id: string; body: string };
   location?: { latitude: number; longitude: number; description?: string; address?: string; url?: string };
+  /** Present on `order` messages only: the placed cart, plus the single-order token for its items. */
+  order?: { orderId: string; token?: string };
+  /** Present on `product` messages only: the catalog product shared into the chat. */
+  product?: { productId: string; title?: string; description?: string; businessOwnerJid?: string };
 }
 
 // Mirrors the backend engine Channel / ChannelMessage (GET /sessions/:id/channels[/:id/messages]).

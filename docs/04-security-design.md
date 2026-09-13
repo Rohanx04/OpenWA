@@ -384,6 +384,13 @@ Each webhook still receives its own copy of the event data — a `webhook:before
 `payload.data` in place and must not bleed into sibling deliveries — but the copy is taken after
 media shedding, so it is small. The HMAC signature is computed over the exact shed bytes sent.
 
+The two media bounds compound. `WEBHOOK_MAX_PAYLOAD_BYTES` is measured on the serialized JSON body
+and applies after `WEBHOOK_MEDIA_INLINE_MAX_BYTES`; base64 inflates media by a third, so at the
+defaults media above roughly 768 KiB reaches webhooks as the omitted marker. Raise both together,
+with the payload limit at least 4/3 of the inline limit plus room for the envelope. The WebSocket
+gateway applies only the inline limit. Media the engine downloaded stays retrievable from
+`GET /api/sessions/:sessionId/messages/:chatId/:messageId/media` (`404` when nothing was stored).
+
 ## 4.9 Security Headers
 
 ### Helmet Configuration
@@ -671,10 +678,11 @@ updates:
       # TypeScript 7 is the native port: typescript-eslint and ts-jest cannot load it (#727/#729).
       - dependency-name: 'typescript'
         versions: ['>=7.0.0']
-      # better-sqlite3 v13: every released TypeORM caps its peer at ^12, and the linux-arm64
-      # prebuild needs glibc 2.38 (the node:22-slim base has 2.36).
+      # better-sqlite3 v14: v13 is the shipped line (^13.0.3, TypeORM's optional ^12 peer pinned
+      # to the root version via overrides, prebuild proven on both architectures by the release
+      # boot smoke). The next major stays frozen until re-evaluated.
       - dependency-name: 'better-sqlite3'
-        versions: ['>=13.0.0']
+        versions: ['>=14.0.0']
 ```
 
 Majors are **not** ignored — they arrive as their own grouped PR, separate from the minor/patch
