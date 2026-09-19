@@ -1,17 +1,4 @@
-import { Injectable, BadRequestException, HttpException, NotFoundException, Optional } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
-import { EngineRegistry } from '../../engine/engine-registry.service';
-
-import { HookManager, applySendingGate } from '../../core/hooks';
-import { SendPacingService } from './send-pacing.service';
-import { createLogger } from '../../common/services/logger.service';
-import { parseWaId, userPart } from '../../engine/identity/wa-id';
-import { SsrfBlockedError, SSRF_BLOCKED_CLIENT_MESSAGE } from '../../common/security/ssrf-guard';
-import { toEngineClientError } from '../../common/errors/engine-operation.error';
-import { resolveFeatureFlags } from '../../config/feature-flags';
-
+import { Injectable, BadRequestException, NotFoundException, Optional } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
 import { EngineRegistry } from '../../engine/engine-registry.service';
@@ -23,16 +10,7 @@ import { Message, MessageDirection } from './entities/message.entity';
 import { HookManager, applySendingGate } from '../../core/hooks';
 import { SendPacingService } from './send-pacing.service';
 import { createLogger } from '../../common/services/logger.service';
-  private getEngine(sessionId: string) {
-    const engine = this.sessionService.getEngine(sessionId);
-    if (!engine) {
-      return this.engines.require(
-        sessionId,
-        () => new BadRequestException(`Session '${sessionId}' is not active. Start the session first.`),
-      );
-    }
-    return engine;
-  }
+import { parseWaId } from '../../engine/identity/wa-id';
 
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { ChatMediaArchiveService } from '../chat-media/chat-media-archive.service';
@@ -631,33 +609,9 @@ export class MessageService implements PluginMessagePort {
   }
 
   private getEngine(sessionId: string) {
-  private async simulateTypingIfEnabled(engine: IWhatsAppEngine, chatId: string, text: string): Promise<void> {
-    const { simulateTyping, simulateTypingMaxMs } = resolveFeatureFlags(this.configService);
-    if (!simulateTyping) return;
-    try {
-      await engine.sendChatState(chatId, 'typing');
-      const maxMs = simulateTypingMaxMs;
-      const planned = Math.min(maxMs, 500 + text.length * 45);
-      const jittered = Math.round(planned * (0.85 + Math.random() * 0.3));
-      await new Promise(resolve => setTimeout(resolve, jittered));
-    } catch (error) {
-      this.logger.warn(`simulateTyping skipped: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-
-  private toClientFacingError(error: unknown): unknown {
-    if (error instanceof SsrfBlockedError) {
-      this.logger.warn(`Outbound media fetch blocked by SSRF guard: ${error.message}`);
-      return new BadRequestException(SSRF_BLOCKED_CLIENT_MESSAGE);
-    }
-    if (!(error instanceof HttpException)) {
-      this.logger.error(
-        'Engine send failed with a non-HTTP error; surfacing as 502',
-        error instanceof Error ? (error.stack ?? error.message) : String(error),
-      );
-    }
-    return toEngineClientError(error);
-  }
-
+    return this.engines.require(
+      sessionId,
+      () => new BadRequestException(`Session '${sessionId}' is not active. Start the session first.`),
+    );
   }
 }

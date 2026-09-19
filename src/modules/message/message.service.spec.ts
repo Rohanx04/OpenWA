@@ -1,24 +1,13 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
-import {
-  BadGatewayException,
-  BadRequestException,
-  ConflictException,
-  NotFoundException,
-  PayloadTooLargeException,
-} from '@nestjs/common';
+import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { MessageService, spendInlineMediaBudget } from './message.service';
 import { MessageSendService } from './message-send.service';
-import { Message, MessageDirection, MessageStatus } from './entities/message.entity';
-import { SessionService } from '../session/session.service';
+import { Message, MessageDirection } from './entities/message.entity';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { MessageProjector } from '../session/message-projector.service';
 import type { IWhatsAppEngine } from '../../engine/interfaces/whatsapp-engine.interface';
-import { HookManager } from '../../core/hooks';
-import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
-import { SendPacingService } from './send-pacing.service';
-
 import { HookManager } from '../../core/hooks';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { SendPacingService } from './send-pacing.service';
@@ -108,47 +97,6 @@ describe('MessageService', () => {
 
   // ── outbound send delegation ──────────────────────────────────────
 
-  describe('auto-typing before send (SIMULATE_TYPING, on by default)', () => {
-    it('sends a typing presence before the message by default', async () => {
-      delete process.env.SIMULATE_TYPING;
-      process.env.SIMULATE_TYPING_MAX_MS = '1';
-
-      await service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'Hello' });
-
-      expect(mockEngine.sendChatState).toHaveBeenCalledWith('628123456789@c.us', 'typing');
-      expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('628123456789@c.us', 'Hello');
-    });
-
-    it('does not send typing presence when SIMULATE_TYPING=false', async () => {
-      process.env.SIMULATE_TYPING = 'false';
-      await service.sendText('sess-1', { chatId: '628123456789@c.us', text: 'Hello' });
-      expect(mockEngine.sendChatState).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('sendText', () => {
-    it('should send text message and return messageId + timestamp', async () => {
-      const result = await service.sendText('sess-1', {
-        chatId: '628123456789@c.us',
-        text: 'Hello',
-      });
-
-      expect(result.messageId).toBe('wa-msg-1');
-      expect(result.timestamp).toBe(1706868000);
-      expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('628123456789@c.us', 'Hello');
-    });
-
-    it('threads mentions through to the engine (#530)', async () => {
-      const input = { chatId: '120@g.us', text: 'hi @62811', mentions: ['62811@c.us'] };
-      (hookManager.execute as jest.Mock).mockResolvedValueOnce({
-        continue: true,
-        data: { sessionId: 'sess-1', input, type: 'text' },
-      });
-      await service.sendText('sess-1', input);
-      expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('120@g.us', 'hi @62811', ['62811@c.us']);
-    });
-  });
-
   describe('outbound send delegation', () => {
     it('passes a send request straight through to MessageSendService and returns its answer', async () => {
       const sendText = jest.fn().mockResolvedValue({ messageId: 'wa-msg-1', timestamp: 1706868000 });
@@ -163,40 +111,15 @@ describe('MessageService', () => {
       );
 
       const result = await facade.sendText('sess-1', { chatId: 'test@c.us', text: 'hi' });
-      expect(result).toEqual({ messageId: 'wa-msg-1', timestamp: 1706868000 });
-    });
-  });
-
-      );
-
-      const result = await facade.sendText('sess-1', { chatId: 'test@c.us', text: 'hi' });
 
       expect(sendText).toHaveBeenCalledWith('sess-1', { chatId: 'test@c.us', text: 'hi' });
       expect(result).toEqual({ messageId: 'wa-msg-1', timestamp: 1706868000 });
     });
 
-    it('should leave unmatched placeholders literal', async () => {
-      (templateService.resolve as jest.Mock).mockResolvedValue(mockTemplate({ body: 'Hi {{customer}} {{unknown}}' }));
-
-      await service.sendTemplate('sess-1', {
-        chatId: 'test@c.us',
-        templateId: 'tpl-1',
-        vars: { customer: 'Alice' },
-      });
-
-      expect(mockEngine.sendTextMessage).toHaveBeenCalledWith('test@c.us', 'Hi Alice {{unknown}}');
-    });
-
-    it('should propagate NotFoundException when the template cannot be resolved', async () => {
-      (templateService.resolve as jest.Mock).mockRejectedValue(new NotFoundException('Template not found'));
-
-      await expect(service.sendTemplate('sess-1', { chatId: 'test@c.us', templateName: 'missing' })).rejects.toThrow(
-        NotFoundException,
-      );
-      expect(mockEngine.sendTextMessage).not.toHaveBeenCalled();
-    });
-
     it('passes a reply straight through with its tag list intact', async () => {
+      // This forwarder is the entry point the controller and the agent tool both call. Its parameter
+      // was an inline three-field literal while the controller already handed it a fourth, so the
+      // body reached the sender only because structural typing does not strip excess properties.
       const reply = jest.fn().mockResolvedValue({ messageId: 'wa-msg-2', timestamp: 1706868001 });
       const facade = new MessageService(
         repository as Repository<Message>,
@@ -206,14 +129,6 @@ describe('MessageService', () => {
         lidMappingStore as unknown as LidMappingStoreService,
         inertPacing(),
         { reply } as unknown as MessageSendService,
-      );
-
-      const body = { chatId: 'g@g.us', quotedMessageId: 'Q1', text: 'hi @62811', mentions: ['62811@c.us'] };
-      const result = await facade.reply('sess-1', body as any);
-      expect(result).toEqual({ messageId: 'wa-msg-2', timestamp: 1706868001 });
-    });
-  });
-
       );
 
       const body = { chatId: 'g@g.us', quotedMessageId: 'Q1', text: 'hi @62811', mentions: ['62811@c.us'] };

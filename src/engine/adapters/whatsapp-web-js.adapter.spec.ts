@@ -13,18 +13,11 @@ import {
   resolveAuthTimeoutMs,
   wwebjsAckToDeliveryStatus,
   extractWwebjsCall,
-  resolveAuthTimeoutMs,
-  wwebjsAckToDeliveryStatus,
-  extractWwebjsCall,
   isPostSendSerializeError,
   READY_RECONCILE_TIMEOUT_MS,
   READY_RECONCILE_BRIDGE_RELOAD_GRACE_MS,
   NAVIGATION_REINJECT_GRACE_MS,
   NAVIGATION_EPISODE_CAP_MS,
-} from './whatsapp-web-js.adapter';
-import { getEffectiveWebVersionInfo, resolveWebVersionPin, __resetWebVersionCache } from '../wa-web-version';
-import * as fs from 'fs';
-
 } from './whatsapp-web-js.adapter';
 import { getEffectiveWebVersionInfo, resolveWebVersionPin, __resetWebVersionCache } from '../wa-web-version';
 import * as fs from 'fs';
