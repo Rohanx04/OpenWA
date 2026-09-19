@@ -28,6 +28,27 @@ export interface WwebjsEngineHost {
 }
 
 /**
+ * True when a send error is whatsapp-web.js's POST-DISPATCH serialization failure: the message was
+ * already handed to WhatsApp (and delivers), but wwjs then threw inside the browser while building the
+ * returned Message model — `window.WWebJS.getMessageModel(msg).serialize()` — because the live
+ * WhatsApp Web build's internal shape no longer matches this wwjs version's injected helpers. It
+ * surfaces as a Puppeteer `Evaluation failed: …` naming `serialize`/`getMessageModel` (or the classic
+ * `Cannot read properties of undefined (reading 'serialize')`). This is distinct from a PRE-dispatch
+ * failure (recipient/chat can't be resolved), which never reaches serialization — so matching this
+ * signature lets a genuinely-delivered message be reported as sent instead of a false failure, while a
+ * true "couldn't send" still surfaces as an error. ponytail: text-matched — there is no structured
+ * code from wwjs/Puppeteer; revisit if either changes its wording.
+ */
+export function isPostSendSerializeError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+  if (!msg) return false;
+  const isEvalFault = msg.includes('Evaluation failed') || msg.includes('Protocol error');
+  const namesSerializer =
+    msg.includes('getMessageModel') || msg.includes('serialize') || msg.includes("reading 'serialize'");
+  return isEvalFault && namesSerializer;
+}
+
+/**
  * Run a client operation, classifying a dead page/transport as the documented 503 plus an early
  * death signal instead of an opaque 500 under a status that still says READY - the split every
  * chats read already makes (#1081). Other errors propagate unchanged.

@@ -210,18 +210,7 @@ export class BaileysAdapter implements IWhatsAppEngine {
 
   async initialize(callbacks: EngineEventCallbacks): Promise<void> {
     this.callbacks = callbacks;
-  async initialize(callbacks: EngineEventCallbacks): Promise<void> {
-    this.callbacks = callbacks;
-    this.intentionalClose = false;
-    try {
-      await this.connect();
-    } catch (err) {
-      this.setStatus(EngineStatus.FAILED);
-      this.callbacks.onError?.(err instanceof Error ? err.message : String(err));
-      throw err;
-    }
-  }
-
+    return this.lifecycle.initialize();
   }
 
   disconnect(): Promise<void> {

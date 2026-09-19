@@ -125,27 +125,7 @@ export {
   NAVIGATION_EPISODE_CAP_MS,
 } from './wwebjs-lifecycle';
 export { READY_RECONCILE_TIMEOUT_MS, READY_RECONCILE_BRIDGE_RELOAD_GRACE_MS } from './wwebjs-reconcile';
-
-/**
- * True when a send error is whatsapp-web.js's POST-DISPATCH serialization failure: the message was
- * already handed to WhatsApp (and delivers), but wwjs then threw inside the browser while building the
- * returned Message model — `window.WWebJS.getMessageModel(msg).serialize()` — because the live
- * WhatsApp Web build's internal shape no longer matches this wwjs version's injected helpers. It
- * surfaces as a Puppeteer `Evaluation failed: …` naming `serialize`/`getMessageModel` (or the classic
- * `Cannot read properties of undefined (reading 'serialize')`). This is distinct from a PRE-dispatch
- * failure (recipient/chat can't be resolved), which never reaches serialization — so matching this
- * signature lets a genuinely-delivered message be reported as sent instead of a false failure, while a
- * true "couldn't send" still surfaces as an error. ponytail: text-matched — there is no structured
- * code from wwjs/Puppeteer; revisit if either changes its wording.
- */
-export function isPostSendSerializeError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
-  if (!msg) return false;
-  const isEvalFault = msg.includes('Evaluation failed') || msg.includes('Protocol error');
-  const namesSerializer =
-    msg.includes('getMessageModel') || msg.includes('serialize') || msg.includes("reading 'serialize'");
-  return isEvalFault && namesSerializer;
-}
+export { isPostSendSerializeError } from './wwebjs-host';
 
 export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngine {
   private readonly logger = createLogger('WhatsAppWebJsAdapter');
@@ -496,40 +476,17 @@ export class WhatsAppWebJsAdapter extends EventEmitter implements IWhatsAppEngin
     client.on('call', call => this.calls.handleIncomingCall(call));
   }
 
-  async sendTextMessage(chatId: string, text: string, mentions?: string[]): Promise<MessageResult> {
-    this.ensureReady();
-    let resolvedTo = chatId;
-    try {
-      const msg = await this.sendResolved(chatId, to => {
-        resolvedTo = to;
-        return mentions?.length ? this.client!.sendMessage(to, text, { mentions }) : this.client!.sendMessage(to, text);
-      });
-      return {
-        id: msg.id._serialized,
-        timestamp: msg.timestamp,
-      };
-    } catch (error) {
-      if (!isPostSendSerializeError(error)) {
-        throw error;
-      }
-      this.logger.warn(
-        `Text send to ${chatId} was dispatched but wwjs could not serialize the result; treating as sent`,
-        error instanceof Error ? (error.stack ?? error.message) : String(error),
-      );
-      const recovered = await this.recoverLastOutgoing(resolvedTo);
-      return recovered ?? { id: '', timestamp: Math.floor(Date.now() / 1000) };
-    }
-  }
-
   /**
    * whatsapp-web.js exposes no way to observe another party's presence: WAWebPresenceChatAction
    * offers only sendPresenceAvailable/sendPresenceUnavailable, which publish the ACCOUNT's own
    * presence, and the library surfaces no presence event at all.
+   *
+   * Declared here inline rather than in a delegate on purpose. The parity gate reads method bodies
+   * off the prototype, so a throw hidden behind a delegate call is invisible to it and the
+   * `not-available` matrix row would go unverified; inline, the gate checks it.
    */
   createChannel(name: string, description?: string): Promise<Channel> {
     return this.channels.createChannel(name, description);
-  }
-
   }
 
   deleteChannel(channelId: string): Promise<void> {

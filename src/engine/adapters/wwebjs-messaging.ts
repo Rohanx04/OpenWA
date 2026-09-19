@@ -22,7 +22,7 @@ import { buildIncomingMessageBase } from './message-mapper';
 import { buildVCard } from './vcard';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { RecipientUnreachableError } from '../../common/errors/recipient-unreachable.error';
-import { type WwebjsEngineHost, withPage } from './wwebjs-host';
+import { type WwebjsEngineHost, withPage, isPostSendSerializeError } from './wwebjs-host';
 
 /**
  * Map a whatsapp-web.js MessageAck integer to the neutral DeliveryStatus.
@@ -375,15 +375,56 @@ export class WwebjsMessaging {
     if (mentions?.length) sendOptions.mentions = mentions;
     if (options?.linkPreview === false) sendOptions.linkPreview = false;
 
-    const msg = await this.sendResolved(
-      chatId,
-      to =>
-        Object.keys(sendOptions).length
-          ? this.client().sendMessage(to, text, sendOptions)
-          : this.client().sendMessage(to, text),
-      options?.quotedMessageId,
-    );
-    return toMessageResult(msg);
+    let resolvedTo = chatId;
+    try {
+      const msg = await this.sendResolved(
+        chatId,
+        to => {
+          resolvedTo = to;
+          return Object.keys(sendOptions).length
+            ? this.client().sendMessage(to, text, sendOptions)
+            : this.client().sendMessage(to, text);
+        },
+        options?.quotedMessageId,
+      );
+      return toMessageResult(msg);
+    } catch (error) {
+      if (!isPostSendSerializeError(error)) {
+        throw error;
+      }
+      this.host.logger.warn(
+        `Text send to ${chatId} was dispatched but wwjs could not serialize the result; treating as sent`,
+        error instanceof Error ? (error.stack ?? error.message) : String(error),
+      );
+      const recovered = await this.recoverLastOutgoing(resolvedTo);
+      return recovered ?? { id: '', timestamp: Math.floor(Date.now() / 1000) };
+    }
+  }
+
+  /**
+   * Best-effort recovery of the id/timestamp of the most recent message WE sent to `chatId`, by
+   * reading the destination chat's latest `fromMe` message. Used when a send reached WhatsApp but the
+   * synchronous result couldn't be serialized (see `isPostSendSerializeError`). Strictly best-effort:
+   * this read can hit the SAME serialization fault, so any failure returns null and the caller falls
+   * back to an empty id. Mirrors the id-recovery in `forwardMessage`.
+   */
+  private async recoverLastOutgoing(chatId: string): Promise<MessageResult | null> {
+    try {
+      const chat = await this.client().getChatById(chatId);
+      const sentByMe = (await chat?.fetchMessages({ limit: 5, fromMe: true })) ?? [];
+      let latest: (typeof sentByMe)[number] | undefined;
+      for (const m of sentByMe) {
+        if (!latest || m.timestamp > latest.timestamp) {
+          latest = m;
+        }
+      }
+      return latest ? toMessageResult(latest) : null;
+    } catch (error) {
+      this.host.logger.warn(`Could not recover sent-message id for ${chatId} (best-effort)`, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
   }
 
   async sendImageMessage(chatId: string, media: MediaInput): Promise<MessageResult> {
