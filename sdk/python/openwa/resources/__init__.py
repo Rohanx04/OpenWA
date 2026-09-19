@@ -6,6 +6,7 @@ API path group. They are constructed by :class:`openwa.client.OpenWAClient`.
 
 from __future__ import annotations
 
+from .calls import CallsResource
 from .catalog import CatalogResource
 from .channels import ChannelsResource
 from .chats import ChatsResource
@@ -13,7 +14,9 @@ from .contacts import ContactsResource
 from .groups import GroupsResource
 from .health import HealthResource
 from .labels import LabelsResource
+from .media import MediaResource
 from .messages import MessagesResource
+from .profile import ProfileResource
 from .search import SearchResource
 from .sessions import SessionsResource
 from .status import StatusResource
@@ -21,6 +24,7 @@ from .templates import TemplatesResource
 from .webhooks import WebhooksResource
 
 __all__ = [
+    "CallsResource",
     "CatalogResource",
     "ChannelsResource",
     "ChatsResource",
@@ -28,7 +32,9 @@ __all__ = [
     "GroupsResource",
     "HealthResource",
     "LabelsResource",
+    "MediaResource",
     "MessagesResource",
+    "ProfileResource",
     "SearchResource",
     "SessionsResource",
     "StatusResource",

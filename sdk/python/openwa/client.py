@@ -32,6 +32,8 @@ import httpx
 
 from ._http import HttpExecutor, HttpMethod
 from .resources import (
+    CallsResource,
+    MediaResource,
     CatalogResource,
     ChannelsResource,
     ChatsResource,
@@ -40,6 +42,7 @@ from .resources import (
     HealthResource,
     LabelsResource,
     MessagesResource,
+    ProfileResource,
     SearchResource,
     SessionsResource,
     StatusResource,
@@ -148,6 +151,18 @@ class OpenWAClient:
     @property
     def search(self) -> SearchResource:
         return SearchResource(self._http)
+
+    @property
+    def profile(self) -> ProfileResource:
+        return ProfileResource(self._http)
+
+    @property
+    def calls(self) -> CallsResource:
+        return CallsResource(self._http)
+
+    @property
+    def media(self) -> MediaResource:
+        return MediaResource(self._http)
 
     # ── Auth ─────────────────────────────────────────────────────────
 

@@ -1,5 +1,6 @@
-import { IngressService, extractConversationId } from './ingress.service';
+import { IngressService, extractConversationId, redactSensitiveHeaders } from './ingress.service';
 import { EngineStatus } from '../../engine/interfaces/whatsapp-engine.interface';
+import { createHmac } from 'node:crypto';
 
 function deps(overrides: Record<string, unknown> = {}) {
   return {
@@ -29,6 +30,45 @@ function deps(overrides: Record<string, unknown> = {}) {
   };
 }
 
+describe('redactSensitiveHeaders (persisted ingress payloads)', () => {
+  it('redacts credential and signature headers, keeps the rest verbatim', () => {
+    const out = redactSensitiveHeaders({
+      authorization: 'Bearer eyJhbGciOi',
+      'x-hub-signature-256': 'sha256=abc',
+      cookie: 'session=secret',
+      'x-delivery': 'd1',
+      'content-type': 'application/json',
+    });
+    expect(out.authorization).toBe('[redacted]');
+    expect(out['x-hub-signature-256']).toBe('[redacted]');
+    expect(out.cookie).toBe('[redacted]');
+    expect(out['x-delivery']).toBe('d1');
+    expect(out['content-type']).toBe('application/json');
+  });
+
+  it('the persisted payload carries redacted headers (wiring, not just the helper)', async () => {
+    const recordOrSkip = jest.fn().mockResolvedValue(true);
+    const d = deps();
+    d.events.recordOrSkip = recordOrSkip;
+    const svc = new IngressService(d);
+    await svc.handle({
+      pluginId: 'chatwoot',
+      instanceId: 'acct1',
+      route: 'chatwoot',
+      method: 'POST',
+      headers: { 'x-delivery': 'd1', authorization: 'Bearer tok' },
+      query: {},
+      rawBody: '{}',
+    });
+    // jest's mock.calls typing erodes through the deps() override — one explicit cast at the
+    // boundary beats a chain of eslint suppressions.
+    const calls = recordOrSkip.mock.calls as unknown as [[{ payload: { headers: Record<string, string> } }]];
+    const recorded = calls[0][0];
+    expect(recorded.payload.headers.authorization).toBe('[redacted]');
+    expect(recorded.payload.headers['x-delivery']).toBe('d1');
+  });
+});
+
 describe('IngressService.handle', () => {
   const req = {
     pluginId: 'chatwoot',
@@ -45,8 +85,52 @@ describe('IngressService.handle', () => {
     const svc = new IngressService(d);
     const res = await svc.handle(req);
     expect(d.events.recordOrSkip).toHaveBeenCalled();
-    expect(d.enqueue).toHaveBeenCalledWith(expect.objectContaining({ deliveryId: 'd1' }), 'd1');
+    expect(d.enqueue).toHaveBeenCalledWith(expect.objectContaining({ deliveryId: 'd1', method: 'POST' }), 'd1');
     expect(res.status).toBe(202);
+  });
+
+  it('uses the signed webhook-id as the default Standard Webhooks dedup key', async () => {
+    const rawKey = Buffer.from('0123456789abcdef0123456789abcdef', 'hex');
+    const secret = `v1,whsec_${rawKey.toString('base64')}`;
+    const body = '{}';
+    const timestamp = '1000';
+    const webhookId = 'msg_signed_1';
+    const signature = 'v1,' + createHmac('sha256', rawKey).update(`${webhookId}.${timestamp}.${body}`).digest('base64');
+    const d = deps({
+      instances: {
+        resolve: jest.fn().mockResolvedValue({
+          id: 'chatwoot:acct1',
+          pluginId: 'chatwoot',
+          instanceId: 'acct1',
+          secret,
+          enabled: true,
+          sessionScope: 'sess-1',
+          verifyToken: null,
+        }),
+      },
+      manifestRoute: jest.fn().mockReturnValue({
+        route: 'chatwoot',
+        mode: 'async',
+        verify: 'core',
+        maxBodyBytes: 1024,
+        signature: { scheme: 'standard-webhooks' },
+      }),
+      now: () => 1_000_000,
+    });
+
+    const res = await new IngressService(d).handle({
+      ...req,
+      rawBody: body,
+      headers: {
+        'webhook-id': webhookId,
+        'webhook-timestamp': timestamp,
+        'webhook-signature': signature,
+      },
+    });
+
+    expect(res.status).toBe(202);
+    expect(d.events.recordOrSkip).toHaveBeenCalledWith(expect.objectContaining({ providerDeliveryId: webhookId }));
+    expect(d.enqueue).toHaveBeenCalledWith(expect.objectContaining({ deliveryId: webhookId }), webhookId);
   });
 
   it('short-circuits a duplicate delivery with 200 and no enqueue', async () => {
@@ -72,6 +156,133 @@ describe('IngressService.handle', () => {
     const res = await svc.handle(req);
     expect(res.status).toBe(413);
     expect(d.events.recordOrSkip).not.toHaveBeenCalled();
+  });
+
+  // `Buffer.byteLength(rawBody) > route.maxBodyBytes` is always false when the manifest omits the
+  // field, so a route declaring no cap silently enforced none — the 413 the published contract
+  // promises was inert, and every accepted delivery is persisted with the body stored twice. A
+  // manifest that forgets one field must not turn a route into an unbounded write amplifier.
+  it.each([
+    ['omitted', undefined],
+    ['non-numeric', 'lots' as unknown as number],
+    ['negative', -1],
+  ])('falls back to a real cap when maxBodyBytes is %s', async (_label, maxBodyBytes) => {
+    const d = deps({
+      manifestRoute: jest.fn().mockReturnValue({
+        route: 'chatwoot',
+        mode: 'async',
+        verify: 'core',
+        maxBodyBytes,
+        signature: { scheme: 'none' },
+        dedupHeader: 'x-delivery',
+      }),
+    });
+    const svc = new IngressService(d);
+    const huge = { ...req, rawBody: 'x'.repeat(64 * 1024 * 1024) };
+    const res = await svc.handle(huge);
+
+    expect(res.status).toBe(413);
+    expect(d.events.recordOrSkip).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The guard replaced `bodyLen > route.maxBodyBytes` with a typed check, and `>` COERCES: a manifest
+   * is third-party JSON with no runtime validation, so a quoted number (`"1024"`) enforced a real cap
+   * before and silently lost it to the much larger process-wide fallback after. The value is usable —
+   * the point of the guard was to catch values that are not.
+   */
+  it('honours a numeric string cap rather than falling back past it', async () => {
+    const d = deps({
+      manifestRoute: jest.fn().mockReturnValue({
+        route: 'chatwoot',
+        mode: 'async',
+        verify: 'core',
+        maxBodyBytes: '1024' as unknown as number,
+        signature: { scheme: 'none' },
+        dedupHeader: 'x-delivery',
+      }),
+    });
+    const res = await new IngressService(d).handle({ ...req, rawBody: 'x'.repeat(2048) });
+
+    expect(res.status).toBe(413);
+    expect(d.events.recordOrSkip).not.toHaveBeenCalled();
+  });
+
+  // Negative twin: the coercion must not swallow the cap it declares.
+  it('accepts a body inside a numeric string cap', async () => {
+    const d = deps({
+      manifestRoute: jest.fn().mockReturnValue({
+        route: 'chatwoot',
+        mode: 'async',
+        verify: 'core',
+        maxBodyBytes: '1024' as unknown as number,
+        signature: { scheme: 'none' },
+        dedupHeader: 'x-delivery',
+      }),
+    });
+    const res = await new IngressService(d).handle({ ...req, rawBody: 'x'.repeat(100) });
+
+    expect(res.status).not.toBe(413);
+  });
+
+  /**
+   * Zero is a cap, not a missing value: it admits only an empty body, which is what a verification
+   * callback sends. Treating it as "unusable" handed such a route the process-wide limit instead —
+   * a change in the permissive direction, on the one route shape that asked to accept nothing.
+   * A SMALL body is what discriminates: any body is over a cap of 0, but well under the fallback.
+   */
+  it('treats a zero cap as strict rather than missing', async () => {
+    const d = deps({
+      manifestRoute: jest.fn().mockReturnValue({
+        route: 'chatwoot',
+        mode: 'async',
+        verify: 'core',
+        maxBodyBytes: 0,
+        signature: { scheme: 'none' },
+        dedupHeader: 'x-delivery',
+      }),
+    });
+    const res = await new IngressService(d).handle({ ...req, rawBody: 'x' });
+
+    expect(res.status).toBe(413);
+    expect(d.events.recordOrSkip).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The `negative` case above uses a huge body, which is over BOTH a -1 cap and the fallback — so it
+   * cannot tell "fell back" from "used -1 as the cap". An empty body separates them: it is over -1
+   * and inside any real cap. Without this, dropping the `>= 0` guard changes nothing observable.
+   */
+  it('does not use a negative cap as the limit', async () => {
+    const d = deps({
+      manifestRoute: jest.fn().mockReturnValue({
+        route: 'chatwoot',
+        mode: 'async',
+        verify: 'core',
+        maxBodyBytes: -1,
+        signature: { scheme: 'none' },
+        dedupHeader: 'x-delivery',
+      }),
+    });
+    const res = await new IngressService(d).handle({ ...req, rawBody: '' });
+
+    expect(res.status).not.toBe(413);
+  });
+
+  it('still admits the empty body a zero cap exists to allow', async () => {
+    const d = deps({
+      manifestRoute: jest.fn().mockReturnValue({
+        route: 'chatwoot',
+        mode: 'async',
+        verify: 'core',
+        maxBodyBytes: 0,
+        signature: { scheme: 'none' },
+        dedupHeader: 'x-delivery',
+      }),
+    });
+    const res = await new IngressService(d).handle({ ...req, rawBody: '' });
+
+    expect(res.status).not.toBe(413);
   });
 
   it('rejects a bad signature with 401 before any dedup or enqueue', async () => {

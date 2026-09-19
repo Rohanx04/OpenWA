@@ -1,6 +1,7 @@
-import { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { localizePlugin } from '../utils/localizePlugin';
+import { configUiSafeConfig, missingRequiredConfig, sparseSessionOverride } from '../utils/pluginConfigRules';
 import { coerceFieldInput, emptyForField } from '../utils/pluginConfigForm';
 import { useQueryClient } from '@tanstack/react-query';
 import {
@@ -17,20 +18,23 @@ import {
   Server,
   Shield,
   Zap,
-  X,
   Upload,
   Trash2,
   Globe,
   Download,
   Plus,
   Search,
+  ArrowUpCircle,
 } from 'lucide-react';
 import { pluginsApi } from '../services/api';
 import type { Plugin, CatalogPlugin, PluginConfigField } from '../services/api';
+import { injectConfigUiCsp } from '../utils/pluginFrameSecurity';
 import { useDocumentTitle } from '../hooks/useDocumentTitle';
+import { useTheme } from '../hooks/useTheme';
 import { usePluginsQuery, useSessionsQuery, queryKeys } from '../hooks/queries';
 import { PageHeader } from '../components/PageHeader';
-import { useToast } from '../components/Toast';
+import { Modal } from '../components/Modal';
+import { useToast } from '../hooks/useToast';
 import { PluginInstances } from '../components/PluginInstances';
 import './Plugins.css';
 
@@ -43,40 +47,6 @@ const pluginTypeIcons: Record<PluginType, typeof Puzzle> = {
   auth: Shield,
   extension: Zap,
 };
-
-/**
- * Build a sparse per-session config override from a full edited config: include only non-secret keys
- * whose value differs from the Global base (so untouched keys keep inheriting Global), plus every
- * TOP-LEVEL secret key (the backend restores an untouched `***` to the stored per-session value, or
- * drops it → the host's deep-merge then re-inherits it from Global). A key absent from the base whose
- * value is just the empty default is skipped, so an untouched optional field never creates a spurious
- * override. With no schema, the input is returned as-is.
- *
- * Inheritance of untouched secrets holds for top-level secret keys and secrets nested in an OBJECT
- * (deep-merged). It does NOT hold for a `secret` column inside an array-of-rows: arrays are replaced
- * wholesale at resolve time, so a first-time per-session override that edits any cell of such an array
- * loses the untouched rows' secrets (they redact to `***`, the dashboard can't resend the real value).
- * No bundled plugin ships that shape; a plugin needing per-session array secrets should re-enter them.
- */
-function sparseSessionOverride(full: Record<string, unknown>, plugin: Plugin): Record<string, unknown> {
-  const props = plugin.configSchema?.properties;
-  if (!props) return full;
-  const out: Record<string, unknown> = {};
-  for (const [key, field] of Object.entries(props)) {
-    if (!(key in full)) continue;
-    const val = full[key];
-    if (field.secret) {
-      out[key] = val;
-      continue;
-    }
-    if (JSON.stringify(val) === JSON.stringify(plugin.config[key])) continue; // unchanged → inherit Global
-    if (plugin.config[key] === undefined && JSON.stringify(val) === JSON.stringify(emptyForField(field))) {
-      continue; // untouched optional field with no Global value → don't pin a spurious empty override
-    }
-    out[key] = val;
-  }
-  return out;
-}
 
 /**
  * Renders one config field from a plugin's schema and reports edits via `onChange`. Recurses for
@@ -95,23 +65,37 @@ function ConfigField({
   onChange: (next: unknown) => void;
 }) {
   const { t } = useTranslation();
+  // Per-instance id: ConfigField renders once per schema property (and recurses), so a hardcoded
+  // id would collide on any schema with two boolean fields - the second label would toggle the
+  // first checkbox. useId is stable across re-renders and unique per instance.
+  const fieldId = React.useId();
   const desc = field.description ? <small>{field.description}</small> : null;
+  // Bound to the control it names. The boolean branch below builds its own pair because its caption
+  // and its checkbox sit in different containers.
   const labelEl = (
-    <label>
+    <label htmlFor={fieldId}>
       {label}
       {field.required && <span className="required-mark"> *</span>}
     </label>
+  );
+  // An array renders one control PER ROW, so there is no single input for a label to point at; a
+  // `<label>` here would be an orphan that names nothing. It is a caption, so it is marked up as one.
+  const captionEl = (
+    <span className="config-array-label">
+      {label}
+      {field.required && <span className="required-mark"> *</span>}
+    </span>
   );
 
   if (field.type === 'boolean') {
     return (
       <div className="form-group toggle-group">
         <div className="toggle-info">
-          <label>{label}</label>
+          <label htmlFor={fieldId}>{label}</label>
           {desc}
         </div>
         <label className="toggle-switch">
-          <input type="checkbox" checked={Boolean(value)} onChange={e => onChange(e.target.checked)} />
+          <input id={fieldId} type="checkbox" checked={Boolean(value)} onChange={e => onChange(e.target.checked)} />
           <span className="toggle-slider"></span>
         </label>
       </div>
@@ -124,6 +108,7 @@ function ConfigField({
       <div className="form-group">
         {labelEl}
         <select
+          id={fieldId}
           value={String(value ?? '')}
           // Restore the option's original type (e.g. a number/boolean enum), not the raw string value.
           onChange={e => onChange(options.find(o => String(o) === e.target.value) ?? e.target.value)}
@@ -167,14 +152,14 @@ function ConfigField({
       // that would stringify the array to "[object Object]"/"" and corrupt it).
       return (
         <div className="config-array">
-          {labelEl}
+          {captionEl}
           {desc}
         </div>
       );
     }
     return (
       <div className="config-array">
-        {labelEl}
+        {captionEl}
         {desc}
         {rows.map((row, i) => (
           <div className="config-array-row" key={i}>
@@ -209,6 +194,7 @@ function ConfigField({
       <div className="form-group">
         {labelEl}
         <textarea
+          id={fieldId}
           value={value === undefined || value === null ? '' : String(value)}
           placeholder={field.default !== undefined ? String(field.default) : undefined}
           required={field.required}
@@ -227,6 +213,7 @@ function ConfigField({
     <div className="form-group">
       {labelEl}
       <input
+        id={fieldId}
         type={inputType}
         value={value === undefined || value === null ? '' : String(value)}
         placeholder={field.default !== undefined ? String(field.default) : undefined}
@@ -246,23 +233,55 @@ function ConfigField({
 
 /**
  * Renders a plugin's sandboxed-iframe config editor. The entry HTML is fetched WITH the API key
- * (which never enters the iframe) and injected as `srcdoc` into a `sandbox="allow-scripts"` iframe
- * (opaque origin — no access to the parent). The editor talks to the host over a postMessage bridge:
- *   iframe → host  { type: 'config:get' }          → host → iframe { type: 'config:value', config, schema }
+ * (which never enters the iframe), hardened (script nonces + a per-document CSP that pins media
+ * to 'self'/data: and forbids connections/forms — see utils/pluginFrameSecurity), and injected
+ * as `srcdoc` into a `sandbox="allow-scripts"` iframe (opaque origin — no access to the parent).
+ * The editor talks to the host over a postMessage bridge:
+ *   iframe → host  { type: 'config:get' }          → host → iframe { type: 'config:value', config, schema, theme }
  *   iframe → host  { type: 'config:save', config }  → host → iframe { type: 'config:saved' } | { type: 'config:error', message }
  * The host makes the authenticated PUT (secret redact/restore applies); the iframe only ever sees the
  * already-redacted config.
+ *
+ * `theme` is 'light' | 'dark', already resolved (so 'system' arrives as one of the two). The iframe has
+ * an opaque origin and cannot read the parent's theme itself, so without this an editor can only guess —
+ * which is how the Chat Flow editor ended up a glaring white panel inside a dark modal. Additive: an
+ * editor that ignores the field renders exactly as it did before.
+ *
+ * Sending it once, with the handshake, is sufficient: the theme control sits behind the modal overlay,
+ * so the theme cannot change while an editor is open, and reopening re-runs the handshake.
  */
 function PluginConfigUi({ plugin, sessionId }: { plugin: Plugin; sessionId?: string }) {
   const { t } = useTranslation();
   const toast = useToast();
   const queryClient = useQueryClient();
+  const { resolvedTheme } = useTheme();
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [html, setHtml] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [handshakeReceived, setHandshakeReceived] = useState(false);
+  const [handshakeError, setHandshakeError] = useState<string | null>(null);
+
+  const hardenConfigUiHtml = (source: string): string => {
+    const nonce = document.querySelector<HTMLMetaElement>('meta[name="openwa-csp-nonce"]')?.content ?? '';
+    const doc = new DOMParser().parseFromString(source, 'text/html');
+    if (nonce && nonce !== '__OPENWA_CSP_NONCE__') {
+      // Vite development has no production CSP, so there is nothing to stamp. Config UIs are
+      // required to be self-contained. Nonce only inline scripts; a plugin-supplied external
+      // `src` must still satisfy the parent's host allow-list rather than bypassing it via nonce.
+      for (const script of doc.querySelectorAll('script:not([src])')) script.setAttribute('nonce', nonce);
+    }
+    // Lock down media/connection egress for the frame's document — independent of the parent
+    // CSP, so it protects Vite dev sessions too. See utils/pluginFrameSecurity.
+    injectConfigUiCsp(doc);
+    return `<!doctype html>\n${doc.documentElement.outerHTML}`;
+  };
 
   useEffect(() => {
     let cancelled = false;
+    setHtml(null);
+    setError(null);
+    setHandshakeReceived(false);
+    setHandshakeError(null);
     pluginsApi
       .getConfigUi(plugin.id)
       .then(h => {
@@ -277,38 +296,45 @@ function PluginConfigUi({ plugin, sessionId }: { plugin: Plugin; sessionId?: str
   }, [plugin.id, t]);
 
   useEffect(() => {
+    if (html === null || handshakeReceived) return;
+    const timer = window.setTimeout(() => setHandshakeError(t('plugins.config.uiHandshakeError')), 5000);
+    return () => window.clearTimeout(timer);
+  }, [html, handshakeReceived, t]);
+
+  useEffect(() => {
     const onMessage = (e: MessageEvent) => {
       const frame = iframeRef.current?.contentWindow;
       if (!frame || e.source !== frame) return; // only our sandboxed iframe (its origin is opaque 'null')
       const msg = e.data as { type?: string; config?: Record<string, unknown> };
       const post = (m: unknown) => frame.postMessage(m, '*');
       if (msg?.type === 'config:get') {
+        setHandshakeReceived(true);
+        setHandshakeError(null);
         // Only expose schema-DECLARED fields (already secret-redacted by the API). An undeclared key
         // may hold a secret the host can't mask, so it never reaches the untrusted iframe; with no
         // schema there is nothing safe to send. The plugin must declare its fields to pre-fill them.
         // For a per-session editor (sessionId set), expose the resolved slice: the session's override
         // value where set, else the base value.
-        const props = plugin.configSchema?.properties;
-        const override = sessionId ? (plugin.sessionConfig?.[sessionId] ?? {}) : {};
-        const safeConfig = props
-          ? Object.fromEntries(
-              Object.keys(props).flatMap(k => {
-                if (sessionId && k in override) return [[k, override[k]]];
-                return k in plugin.config ? [[k, plugin.config[k]]] : [];
-              }),
-            )
-          : {};
-        post({ type: 'config:value', config: safeConfig, schema: plugin.configSchema });
+        post({
+          type: 'config:value',
+          config: configUiSafeConfig(plugin, sessionId),
+          schema: plugin.configSchema,
+          theme: resolvedTheme,
+        });
       } else if (msg?.type === 'config:save') {
         void (async () => {
           try {
-            if (sessionId)
-              await pluginsApi.updateSessionConfig(
-                plugin.id,
-                sessionId,
-                sparseSessionOverride(msg.config ?? {}, plugin),
-              );
-            else await pluginsApi.updateConfig(plugin.id, msg.config ?? {});
+            // These endpoints report a failure as 200 + {success:false}, so the result has to be read.
+            // Taking the absence of a throw as success told the operator "Saved!" — and told the editor
+            // its values were stored — for a save the server had rejected.
+            const res = sessionId
+              ? await pluginsApi.updateSessionConfig(
+                  plugin.id,
+                  sessionId,
+                  sparseSessionOverride(msg.config ?? {}, plugin),
+                )
+              : await pluginsApi.updateConfig(plugin.id, msg.config ?? {});
+            if (!res.success) throw new Error(res.message);
             void queryClient.invalidateQueries({ queryKey: queryKeys.plugins });
             post({ type: 'config:saved' });
             toast.success(t('plugins.toasts.savedTitle'), t('plugins.toasts.savedDesc'));
@@ -322,7 +348,7 @@ function PluginConfigUi({ plugin, sessionId }: { plugin: Plugin; sessionId?: str
     };
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, [plugin, sessionId, queryClient, t, toast]);
+  }, [plugin, sessionId, queryClient, t, toast, resolvedTheme]);
 
   if (error) return <div className="config-ui-status config-ui-error">{error}</div>;
   if (html === null)
@@ -332,14 +358,17 @@ function PluginConfigUi({ plugin, sessionId }: { plugin: Plugin; sessionId?: str
       </div>
     );
   return (
-    <iframe
-      ref={iframeRef}
-      className="plugin-config-ui-frame"
-      sandbox="allow-scripts"
-      srcDoc={html}
-      title={plugin.name}
-      style={{ height: plugin.configUi?.height ?? 600 }}
-    />
+    <>
+      {handshakeError && <div className="config-ui-status config-ui-error">{handshakeError}</div>}
+      <iframe
+        ref={iframeRef}
+        className="plugin-config-ui-frame"
+        sandbox="allow-scripts"
+        srcDoc={hardenConfigUiHtml(html)}
+        title={plugin.name}
+        style={{ height: plugin.configUi?.height ?? 600 }}
+      />
+    </>
   );
 }
 
@@ -476,7 +505,14 @@ function SessionsTab({ plugin }: { plugin: Plugin }) {
         <section className="sessions-section">
           <h3>{t('plugins.sessions.perSessionTitle')}</h3>
           <small>{t('plugins.sessions.perSessionDesc')}</small>
-          <select className="sessions-select" value={selSession} onChange={e => setSelSession(e.target.value)}>
+          {/* The heading above is a sibling, not a label, so the select had no accessible name of its
+              own: a screen reader announced an unnamed combobox. */}
+          <select
+            className="sessions-select"
+            aria-label={t('plugins.sessions.selectSession')}
+            value={selSession}
+            onChange={e => setSelSession(e.target.value)}
+          >
             <option value="">{t('plugins.sessions.selectSession')}</option>
             {sessions.map(s => (
               <option key={s.id} value={s.id}>
@@ -549,13 +585,36 @@ export default function Plugins() {
     void queryClient.invalidateQueries({ queryKey: queryKeys.plugins });
   };
 
+  // Required-config gate: a plugin whose schema declares required fields that are still unset fails
+  // INSIDE the sandbox with a raw "<id>: <field> is required" error and flips the card to ERROR.
+  // Open the config modal instead so the user completes the fields first — cures the whole class
+  // (after-hours `schedule`/`awayMessage`, faq-bot `rules`, any catalog plugin with required fields).
   const handleToggle = async (plugin: Plugin) => {
+    if (plugin.status !== 'enabled') {
+      const missing = missingRequiredConfig(plugin);
+      if (missing.length > 0) {
+        // Interpolation, not a template literal: with the field list baked into the default string the
+        // key could never be translated without silently dropping it.
+        toast.warning(
+          t('plugins.toasts.configRequiredTitle'),
+          t('plugins.toasts.configRequiredDesc', { fields: missing.join(', ') }),
+        );
+        handleOpenConfig(plugin);
+        return;
+      }
+    }
     setActionLoading(plugin.id);
     try {
-      if (plugin.status === 'enabled') {
-        await pluginsApi.disable(plugin.id);
-      } else {
-        await pluginsApi.enable(plugin.id);
+      // Both endpoints report lifecycle failures as 200 + {success:false} — surface them instead of
+      // silently refetching. The card flips to ERROR either way, but without the message the operator
+      // has to go to the logs to learn why.
+      const res =
+        plugin.status === 'enabled' ? await pluginsApi.disable(plugin.id) : await pluginsApi.enable(plugin.id);
+      if (!res.success) {
+        toast.warning(
+          plugin.status === 'enabled' ? t('plugins.toasts.disableFailedTitle') : t('plugins.toasts.enableFailedTitle'),
+          res.message,
+        );
       }
       refetchAll();
     } catch (err) {
@@ -604,7 +663,10 @@ export default function Plugins() {
     if (schemaFormRef.current && !schemaFormRef.current.reportValidity()) return;
     setSavingConfig(true);
     try {
-      await pluginsApi.updateConfig(configPlugin.id, schemaConfig);
+      // 200 + {success:false} is how a rejected save arrives; without this the modal closed on a
+      // "Saved!" toast and the operator's edit was silently gone on the next open.
+      const res = await pluginsApi.updateConfig(configPlugin.id, schemaConfig);
+      if (!res.success) throw new Error(res.message);
       void queryClient.invalidateQueries({ queryKey: queryKeys.plugins });
       toast.success(t('plugins.toasts.savedTitle'), t('plugins.toasts.savedDesc'));
       setShowConfigModal(false);
@@ -638,13 +700,17 @@ export default function Plugins() {
     }
   };
 
-  const loadCatalog = async () => {
+  const loadCatalog = async (silent = false) => {
     setCatalogLoading(true);
     setCatalogError(null);
     try {
       setCatalog(await pluginsApi.catalog());
     } catch (err) {
-      setCatalogError(err instanceof Error ? err.message : String(err));
+      // Silent mode is the page-mount prefetch that powers the update chips: a catalog that
+      // cannot be reached just means no chips, so the failure is not surfaced here — the
+      // drawer's own lazy-load effect (which skips while an error is set) retries loudly
+      // when the user actually opens the Catalog tab.
+      if (!silent) setCatalogError(err instanceof Error ? err.message : String(err));
     } finally {
       setCatalogLoading(false);
     }
@@ -657,6 +723,19 @@ export default function Plugins() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showInstallModal, installMode]);
+
+  // Prefetch once on mount so installed-plugin cards can flag newer catalog versions without the
+  // user having to open the Install drawer first. Silent: an unreachable catalog hides the chips.
+  useEffect(() => {
+    void loadCatalog(true);
+  }, []);
+
+  // Catalog entries with a strictly newer version than the installed one, keyed by plugin id —
+  // drives both the per-card update chip and the counter on the Install button.
+  const updatesById = useMemo(
+    () => new Map(catalog.filter(entry => entry.updateAvailable).map(entry => [entry.id, entry])),
+    [catalog],
+  );
 
   const handleInstallFromCatalog = async (entry: CatalogPlugin) => {
     if (!entry.download) {
@@ -745,6 +824,11 @@ export default function Plugins() {
             <button className="btn-primary" onClick={() => setShowInstallModal(true)}>
               <Upload size={16} />
               {t('plugins.install', 'Install plugin')}
+              {updatesById.size > 0 && (
+                <span className="install-update-count" title={t('plugins.catalog.updateAvailable', 'Update available')}>
+                  {updatesById.size}
+                </span>
+              )}
             </button>
           </>
         }
@@ -805,6 +889,23 @@ export default function Plugins() {
                       <div>
                         <h3 className="plugin-name">{lz.name}</h3>
                         <span className="plugin-version">v{plugin.version}</span>
+                        {updatesById.has(plugin.id) && (
+                          <button
+                            type="button"
+                            className="plugin-update-chip"
+                            title={`${t('plugins.catalog.updateAvailable', 'Update available')} (v${plugin.version} → v${updatesById.get(plugin.id)!.version})`}
+                            aria-label={t('plugins.catalog.updateAvailable', 'Update available')}
+                            onClick={() => {
+                              // Land the user directly on this plugin's catalog entry, where the
+                              // existing Update button (and its confirmation flow) lives.
+                              setInstallMode('catalog');
+                              setCatalogSearch(plugin.id);
+                              setShowInstallModal(true);
+                            }}
+                          >
+                            <ArrowUpCircle size={12} />v{updatesById.get(plugin.id)!.version}
+                          </button>
+                        )}
                       </div>
                     </div>
                     {plugin.builtIn && <span className="plugin-builtin-badge">{t('plugins.builtIn')}</span>}
@@ -903,14 +1004,13 @@ export default function Plugins() {
       )}
 
       {showInstallModal && (
-        <div className="modal-overlay" onClick={() => setShowInstallModal(false)}>
-          <div className="modal install-modal" onClick={e => e.stopPropagation()}>
-            <div className="modal-header">
-              <h2>{t('plugins.installModal.title', 'Install a plugin')}</h2>
-              <button className="btn-icon" onClick={() => setShowInstallModal(false)}>
-                <X size={20} />
-              </button>
-            </div>
+        <Modal
+          open
+          onClose={() => setShowInstallModal(false)}
+          title={t('plugins.installModal.title', 'Install a plugin')}
+          className="install-modal"
+          closeLabel={t('common.close')}
+          headerExtra={
             <div className="install-tabs">
               <button
                 className={`install-tab${installMode === 'upload' ? ' active' : ''}`}
@@ -925,163 +1025,180 @@ export default function Plugins() {
                 <Globe size={15} /> {t('plugins.installModal.tabCatalog', 'Catalog')}
               </button>
             </div>
-
-            {installMode === 'upload' ? (
+          }
+          footer={
+            installMode === 'upload' ? (
               <>
-                <div className="modal-body">
-                  <p className="install-hint">
-                    {t(
-                      'plugins.installModal.hint',
-                      'Upload a plugin packaged as a .zip (with a manifest.json). It runs sandboxed once enabled.',
-                    )}
-                  </p>
-                  <label className={`install-drop${installFile ? ' has-file' : ''}`}>
-                    <input
-                      type="file"
-                      accept=".zip,application/zip"
-                      hidden
-                      onChange={e => setInstallFile(e.target.files?.[0] ?? null)}
-                    />
-                    <Upload size={28} />
-                    <span className="install-drop-name">
-                      {installFile ? installFile.name : t('plugins.installModal.choose', 'Choose a .zip file…')}
-                    </span>
-                  </label>
-                </div>
-                <div className="modal-footer">
-                  <button className="btn-secondary" onClick={() => setShowInstallModal(false)} disabled={installing}>
-                    {t('common.cancel', 'Cancel')}
-                  </button>
-                  <button
-                    className="btn-primary"
-                    onClick={() => void handleInstall()}
-                    disabled={!installFile || installing}
-                  >
-                    {installing ? <Loader2 size={16} className="animate-spin" /> : <Upload size={16} />}
-                    {t('plugins.install', 'Install plugin')}
-                  </button>
-                </div>
+                <button className="btn-secondary" onClick={() => setShowInstallModal(false)} disabled={installing}>
+                  {t('common.cancel', 'Cancel')}
+                </button>
+                <button
+                  className="btn-primary"
+                  onClick={() => void handleInstall()}
+                  disabled={!installFile || installing}
+                >
+                  {installing ? <Loader2 size={16} className="animate-spin" /> : <Upload size={16} />}
+                  {t('plugins.install', 'Install plugin')}
+                </button>
               </>
             ) : (
-              <>
-                <div className="modal-body">
-                  <p className="install-hint">
-                    {t(
-                      'plugins.installModal.catalogHint',
-                      'Install directly from the OpenWA plugin catalog. The .zip is fetched server-side through the SSRF guard, then validated and sandboxed.',
-                    )}
-                  </p>
-                  {catalogLoading ? (
-                    <div className="catalog-empty">
-                      <Loader2 size={20} className="animate-spin" />
-                    </div>
-                  ) : catalogError ? (
-                    <div className="catalog-empty catalog-error">
-                      <AlertCircle size={16} /> {catalogError}
-                      <button className="btn-secondary" onClick={() => void loadCatalog()}>
-                        {t('plugins.refresh', 'Refresh')}
-                      </button>
-                    </div>
-                  ) : catalog.length === 0 ? (
-                    <div className="catalog-empty">{t('plugins.catalog.empty', 'No plugins in the catalog.')}</div>
-                  ) : (
-                    (() => {
-                      const q = catalogSearch.trim().toLowerCase();
-                      const filtered = q
-                        ? catalog.filter(e =>
-                            [e.name, e.description, e.author, e.id].some(f => f?.toLowerCase().includes(q)),
-                          )
-                        : catalog;
-                      return (
-                        <>
-                          <div className="catalog-search">
-                            <Search size={15} />
-                            <input
-                              type="text"
-                              value={catalogSearch}
-                              onChange={e => setCatalogSearch(e.target.value)}
-                              placeholder={t('plugins.catalog.searchPlaceholder', 'Search plugins…')}
-                            />
-                          </div>
-                          {filtered.length === 0 ? (
-                            <div className="catalog-empty">
-                              {t('plugins.catalog.noMatch', 'No plugins match your search.')}
-                            </div>
-                          ) : (
-                            <div className="catalog-list">
-                              {filtered.map(entry => {
-                                const lz = localizePlugin(entry, i18n.language);
-                                return (
-                                  <div className="catalog-row" key={entry.id}>
-                                    <div className="catalog-row-info">
-                                      <div className="catalog-row-name">
-                                        {lz.name} <span className="catalog-row-version">v{entry.version}</span>
-                                      </div>
-                                      {lz.description && <div className="catalog-row-desc">{lz.description}</div>}
-                                      <div className="catalog-row-meta">
-                                        {entry.author && <span className="catalog-row-author">{entry.author}</span>}
-                                        {entry.updateAvailable && (
-                                          <span className="catalog-badge update">
-                                            {t('plugins.catalog.updateAvailable', 'Update available')} (v
-                                            {entry.installedVersion} → v{entry.version})
-                                          </span>
-                                        )}
-                                      </div>
-                                    </div>
-                                    <div className="catalog-row-action">
-                                      {entry.installed ? (
-                                        entry.updateAvailable ? (
-                                          <button
-                                            className="btn-primary"
-                                            disabled={installingId !== null || !entry.download}
-                                            onClick={() => void handleUpdateFromCatalog(entry)}
-                                          >
-                                            {installingId === entry.id ? (
-                                              <Loader2 size={15} className="animate-spin" />
-                                            ) : (
-                                              <Download size={15} />
-                                            )}
-                                            {t('plugins.catalog.update', 'Update')}
-                                          </button>
-                                        ) : (
-                                          <span className="catalog-installed">
-                                            <CheckCircle size={15} /> {t('plugins.catalog.installed', 'Installed')}
-                                          </span>
-                                        )
-                                      ) : (
-                                        <button
-                                          className="btn-primary"
-                                          disabled={installingId !== null || !entry.download}
-                                          onClick={() => void handleInstallFromCatalog(entry)}
-                                        >
-                                          {installingId === entry.id ? (
-                                            <Loader2 size={15} className="animate-spin" />
-                                          ) : (
-                                            <Download size={15} />
-                                          )}
-                                          {t('plugins.catalog.install', 'Install')}
-                                        </button>
-                                      )}
-                                    </div>
-                                  </div>
-                                );
-                              })}
-                            </div>
-                          )}
-                        </>
-                      );
-                    })()
-                  )}
+              <button className="btn-secondary" onClick={() => setShowInstallModal(false)}>
+                {t('common.close', 'Close')}
+              </button>
+            )
+          }
+        >
+          {/* Trusted-code warning sits ABOVE the tab conditional: upload and catalog land the
+              same payload in the same process, so it must show on both. */}
+          <p className="install-hint install-hint-warning">
+            <AlertCircle size={15} />
+            {t(
+              'plugins.installModal.trustWarning',
+              "Plugins run with the gateway's full process privileges — the sandbox contains crashes, not malicious code. Install only plugins you trust.",
+            )}
+          </p>
+          {installMode === 'upload' ? (
+            <>
+              <p className="install-hint">
+                {t(
+                  'plugins.installModal.hint',
+                  'Upload a plugin packaged as a .zip (with a manifest.json). It runs sandboxed once enabled.',
+                )}
+              </p>
+              <label className={`install-drop${installFile ? ' has-file' : ''}`}>
+                <input
+                  type="file"
+                  accept=".zip,application/zip"
+                  hidden
+                  onChange={e => setInstallFile(e.target.files?.[0] ?? null)}
+                />
+                <Upload size={28} />
+                <span className="install-drop-name">
+                  {installFile ? installFile.name : t('plugins.installModal.choose', 'Choose a .zip file…')}
+                </span>
+              </label>
+              {/* Point first-time users at the Catalog tab — otherwise the marketplace is invisible
+                  and an operator only ever discovers plugins by hearing about one out-of-band. */}
+              <p className="install-hint install-hint-sub">
+                {t('plugins.installModal.catalogTeaser', 'Looking for plugins?')}{' '}
+                <button type="button" className="install-inline-link" onClick={() => setInstallMode('catalog')}>
+                  {t('plugins.installModal.tabCatalog', 'Catalog')}
+                </button>{' '}
+                {t('plugins.installModal.catalogTeaserSuffix', 'browses the official marketplace.')}
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="install-hint">
+                {t(
+                  'plugins.installModal.catalogHint',
+                  'Install directly from the OpenWA plugin catalog. The .zip is fetched server-side through the SSRF guard, then validated and sandboxed.',
+                )}
+              </p>
+              {catalogLoading ? (
+                <div className="catalog-empty">
+                  <Loader2 size={20} className="animate-spin" />
                 </div>
-                <div className="modal-footer">
-                  <button className="btn-secondary" onClick={() => setShowInstallModal(false)}>
-                    {t('common.close', 'Close')}
+              ) : catalogError ? (
+                <div className="catalog-empty catalog-error">
+                  <AlertCircle size={16} /> {catalogError}
+                  <button className="btn-secondary" onClick={() => void loadCatalog()}>
+                    {t('plugins.refresh', 'Refresh')}
                   </button>
                 </div>
-              </>
-            )}
-          </div>
-        </div>
+              ) : catalog.length === 0 ? (
+                <div className="catalog-empty">{t('plugins.catalog.empty', 'No plugins in the catalog.')}</div>
+              ) : (
+                (() => {
+                  const q = catalogSearch.trim().toLowerCase();
+                  const filtered = q
+                    ? catalog.filter(e =>
+                        [e.name, e.description, e.author, e.id].some(f => f?.toLowerCase().includes(q)),
+                      )
+                    : catalog;
+                  return (
+                    <>
+                      <div className="catalog-search">
+                        <Search size={15} />
+                        <input
+                          type="text"
+                          value={catalogSearch}
+                          onChange={e => setCatalogSearch(e.target.value)}
+                          placeholder={t('plugins.catalog.searchPlaceholder', 'Search plugins…')}
+                        />
+                      </div>
+                      {filtered.length === 0 ? (
+                        <div className="catalog-empty">
+                          {t('plugins.catalog.noMatch', 'No plugins match your search.')}
+                        </div>
+                      ) : (
+                        <div className="catalog-list">
+                          {filtered.map(entry => {
+                            const lz = localizePlugin(entry, i18n.language);
+                            return (
+                              <div className="catalog-row" key={entry.id}>
+                                <div className="catalog-row-info">
+                                  <div className="catalog-row-name">
+                                    {lz.name} <span className="catalog-row-version">v{entry.version}</span>
+                                  </div>
+                                  {lz.description && <div className="catalog-row-desc">{lz.description}</div>}
+                                  <div className="catalog-row-meta">
+                                    {entry.author && <span className="catalog-row-author">{entry.author}</span>}
+                                    {entry.updateAvailable && (
+                                      <span className="catalog-badge update">
+                                        {t('plugins.catalog.updateAvailable', 'Update available')} (v
+                                        {entry.installedVersion} → v{entry.version})
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                                <div className="catalog-row-action">
+                                  {entry.installed ? (
+                                    entry.updateAvailable ? (
+                                      <button
+                                        className="btn-update"
+                                        disabled={installingId !== null || !entry.download}
+                                        onClick={() => void handleUpdateFromCatalog(entry)}
+                                      >
+                                        {installingId === entry.id ? (
+                                          <Loader2 size={15} className="animate-spin" />
+                                        ) : (
+                                          <Download size={15} />
+                                        )}
+                                        {t('plugins.catalog.update', 'Update')}
+                                      </button>
+                                    ) : (
+                                      <span className="catalog-installed">
+                                        <CheckCircle size={15} /> {t('plugins.catalog.installed', 'Installed')}
+                                      </span>
+                                    )
+                                  ) : (
+                                    <button
+                                      className="btn-primary"
+                                      disabled={installingId !== null || !entry.download}
+                                      onClick={() => void handleInstallFromCatalog(entry)}
+                                    >
+                                      {installingId === entry.id ? (
+                                        <Loader2 size={15} className="animate-spin" />
+                                      ) : (
+                                        <Download size={15} />
+                                      )}
+                                      {t('plugins.catalog.install', 'Install')}
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </>
+                  );
+                })()
+              )}
+            </>
+          )}
+        </Modal>
       )}
 
       {showConfigModal &&
@@ -1092,16 +1209,14 @@ export default function Plugins() {
           // Instances tab. Either (or both) turns the modal into a tabbed view.
           const showTabs = configPlugin.sessionScoped !== false || configPlugin.ingressCapable;
           return (
-            <div className="modal-overlay" onClick={() => setShowConfigModal(false)}>
-              <div className="modal config-modal" onClick={e => e.stopPropagation()}>
-                <div className="modal-header">
-                  <h2>{t('plugins.config.title', { name: lz.name })}</h2>
-                  <button className="btn-icon" onClick={() => setShowConfigModal(false)}>
-                    <X size={20} />
-                  </button>
-                </div>
-
-                {showTabs && (
+            <Modal
+              open
+              onClose={() => setShowConfigModal(false)}
+              title={t('plugins.config.title', { name: lz.name })}
+              className="config-modal"
+              closeLabel={t('common.close')}
+              subheader={
+                showTabs ? (
                   <div className="modal-tabs">
                     <button
                       className={`modal-tab ${configTab === 'config' ? 'active' : ''}`}
@@ -1126,51 +1241,54 @@ export default function Plugins() {
                       </button>
                     )}
                   </div>
-                )}
-
-                <div className="modal-body">
-                  {showTabs && configTab === 'instances' && configPlugin.ingressCapable ? (
-                    <PluginInstances pluginId={configPlugin.id} />
-                  ) : showTabs && configTab === 'sessions' && configPlugin.sessionScoped !== false ? (
-                    <SessionsTab plugin={configPlugin} />
-                  ) : configPlugin.configUi ? (
-                    <PluginConfigUi plugin={configPlugin} />
-                  ) : lz.configSchema && Object.keys(lz.configSchema.properties).length > 0 ? (
-                    <form ref={schemaFormRef} className="config-form" onSubmit={e => e.preventDefault()}>
-                      {Object.entries(lz.configSchema.properties).map(([key, field]) => (
-                        <ConfigField
-                          key={key}
-                          field={field}
-                          label={field.title || key}
-                          value={schemaConfig[key]}
-                          onChange={v => setSchemaConfig({ ...schemaConfig, [key]: v })}
-                        />
-                      ))}
-                    </form>
-                  ) : (
-                    <div className="no-config">
-                      <Settings size={48} style={{ opacity: 0.3 }} />
-                      <p>{t('plugins.config.noOptions')}</p>
-                    </div>
-                  )}
-                </div>
-
-                <div className="modal-footer">
+                ) : undefined
+              }
+              footer={
+                <>
                   <button className="btn-secondary" onClick={() => setShowConfigModal(false)}>
                     {t('common.close')}
                   </button>
-                  {/* The Sessions and Instances tabs have their own actions; the footer Save is config-tab only. */}
-                  {showTabs && (configTab === 'sessions' || configTab === 'instances')
-                    ? null
-                    : configPlugin.configUi ? null : lz.configSchema &&
+                  {/* The Sessions and Instances tabs have their own actions; the footer Save is config-tab
+                      only. A plugin with its own editor saves through that editor, so the footer Save is
+                      omitted rather than left to save a form the operator cannot see. */}
+                  {(showTabs && (configTab === 'sessions' || configTab === 'instances')) ||
+                  configPlugin.configUi ? null : lz.configSchema &&
                     Object.keys(lz.configSchema.properties).length > 0 ? (
                     <button className="btn-primary" onClick={handleSaveSchemaConfig} disabled={savingConfig}>
                       {savingConfig ? <Loader2 size={16} className="animate-spin" /> : t('plugins.config.save')}
                     </button>
                   ) : null}
+                </>
+              }
+            >
+              {showTabs && configTab === 'instances' && configPlugin.ingressCapable ? (
+                <PluginInstances pluginId={configPlugin.id} />
+              ) : showTabs && configTab === 'sessions' && configPlugin.sessionScoped !== false ? (
+                <SessionsTab plugin={configPlugin} />
+              ) : /* A plugin that ships its own editor owns the whole config: rendering the generic
+                     form underneath it too produced a second copy of every field and a second Save
+                     button with different semantics, which is what the Chat Flow modal looked like. */
+              configPlugin.configUi ? (
+                <PluginConfigUi plugin={configPlugin} />
+              ) : lz.configSchema && Object.keys(lz.configSchema.properties).length > 0 ? (
+                <form ref={schemaFormRef} className="config-form" onSubmit={e => e.preventDefault()}>
+                  {Object.entries(lz.configSchema.properties).map(([key, field]) => (
+                    <ConfigField
+                      key={key}
+                      field={field}
+                      label={field.title || key}
+                      value={schemaConfig[key]}
+                      onChange={v => setSchemaConfig({ ...schemaConfig, [key]: v })}
+                    />
+                  ))}
+                </form>
+              ) : (
+                <div className="no-config">
+                  <Settings size={48} style={{ opacity: 0.3 }} />
+                  <p>{t('plugins.config.noOptions')}</p>
                 </div>
-              </div>
-            </div>
+              )}
+            </Modal>
           );
         })()}
     </div>

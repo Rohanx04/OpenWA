@@ -3,15 +3,19 @@
 </p>
 
 <h1 align="center">OpenWA</h1>
+
 <p align="center">
-  <strong>Open Source WhatsApp API Gateway</strong>
+  <strong>The open-source WhatsApp API gateway you actually own.</strong><br/>
+  Self-hosted. No vendor lock-in. No feature paywalls. One <code>docker compose up</code> away.
 </p>
 
 <p align="center">
-  <a href="#-features">Features</a> •
-  <a href="#-quick-start">Quick Start</a> •
+  <a href="#-sixty-seconds-to-your-first-message">Quick Start</a> •
+  <a href="#read-first">Read First</a> •
+  <a href="#-feature-matrix">Features</a> •
+  <a href="#-the-guided-api-tour">API Tour</a> •
+  <a href="#-mcp-server-ai-agents">AI Agents</a> •
   <a href="#-documentation">Docs</a> •
-  <a href="#-api-examples">API</a> •
   <a href="#-contributing">Contributing</a>
 </p>
 
@@ -20,83 +24,268 @@
   <img src="https://img.shields.io/github/package-json/v/rmyndharis/OpenWA?label=version&color=blue" alt="Version"/>
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"/>
   <img src="https://img.shields.io/badge/node-22_LTS-brightgreen.svg" alt="Node"/>
-  <img src="https://img.shields.io/badge/NestJS-11.x-red.svg" alt="NestJS"/>
+  <img src="https://img.shields.io/github/package-json/dependency-version/rmyndharis/OpenWA/@nestjs/core?label=NestJS&color=red" alt="NestJS"/>
   <img src="https://img.shields.io/badge/docker-ready-blue.svg" alt="Docker"/>
-  <img src="https://img.shields.io/badge/TypeScript-5.x-3178C6.svg" alt="TypeScript"/>
+  <img src="https://img.shields.io/github/package-json/dependency-version/rmyndharis/OpenWA/dev/typescript?label=TypeScript&color=3178C6" alt="TypeScript"/>
 </p>
+
+---
+
+## ⚡ Sixty seconds to your first message
+
+Four commands. No account, no API key purchase, no waiting on approval.
+
+```bash
+# 1 — Get it
+git clone https://github.com/rmyndharis/OpenWA.git && cd OpenWA
+
+# 2 — Run it (SQLite + local storage, zero config)
+docker compose -f docker-compose.dev.yml up -d
+
+# 3 — Open the dashboard, create a session, scan the QR with WhatsApp
+open http://localhost:2785        # Linux: xdg-open
+
+# 4 — Say hello
+curl -X POST http://localhost:2785/api/sessions/{sessionId}/messages/send-text \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -d '{"chatId": "628123456789@c.us", "text": "Hello from OpenWA!"}'
+```
+
+> 🎉 **That's it.** The dashboard, the REST API and the Swagger explorer all live on port `2785`.
+> Prefer to run it from source? See [Quick Start](#-quick-start) for the local-development path.
+
+---
+
+<a id="read-first"></a>
+
+## ⚠️ Read this before you connect a number
+
+**Please don't skip this part.** OpenWA is an unofficial, community-maintained gateway. It talks to
+WhatsApp through **reverse-engineered clients** — the [`whatsapp-web.js`](https://github.com/pedroslopez/whatsapp-web.js)
+project and [`@whiskeysockets/baileys`](https://github.com/WhiskeySockets/Baileys) — **not** through
+Meta's official Cloud API. That has real consequences.
+
+### 🚨 The three things that matter most
+
+| #   | Rule                                     | Why                                                                                                                                                      |
+| --- | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **Ban risk is never zero.**              | WhatsApp's anti-abuse systems actively hunt for unofficial automation. No amount of code quality on our side changes that.                               |
+| 2   | **Use a number you can afford to lose.** | Never link your primary personal or business number. If you run this for paying clients, pass that guidance on to them.                                  |
+| 3   | **Regulated workloads → official API.**  | Healthcare, finance, large-scale commercial messaging, EU/EEA end users under DMA/GDPR framings: treat OpenWA as **not approved** and use the Cloud API. |
+
+OpenWA is an excellent fit for personal projects, internal tooling, automation hobbyists and
+learning. It is **not** a drop-in replacement for [Meta's official WhatsApp Cloud API](https://developers.facebook.com/docs/whatsapp/cloud-api)
+in regulated environments.
+
+### 🧭 Which engine should you pick?
+
+Both engines speak the same OpenWA API — you switch with a single `ENGINE_TYPE` env var. They trade
+off differently:
+
+| Engine            | Ban-risk profile                                                                               | Resource cost                     | Pick it when…                                             |
+| ----------------- | ---------------------------------------------------------------------------------------------- | --------------------------------- | --------------------------------------------------------- |
+| `whatsapp-web.js` | **Lower** — drives a real headless Chromium that looks like genuine WhatsApp Web traffic.      | High RAM (~300–500 MB / session). | Account safety is your top priority and you have the RAM. |
+| `baileys`         | **Higher** — speaks the multi-device WebSocket protocol directly and is easier to fingerprint. | Low RAM (~30–80 MB / session).    | You need session density and accept the trade-off.        |
+
+> **Rule of thumb:** few sessions that must survive → `whatsapp-web.js` (the default).
+> Many sessions on a small box → `baileys`.
+
+### ✅ Safe-sending guidelines
+
+Practical guardrails, not guarantees — but they materially reduce the chance of being flagged.
+
+1. **Warm up fresh numbers.** For the first several days, behave like a human: scan the QR, exchange a
+   handful of messages with saved contacts, join a group or two, set a profile photo. Don't blast on day one.
+2. **Don't cold-blast strangers.** Sending a first-ever message to a large batch of numbers that have
+   never messaged you is the single most reliable way to get restricted — on either engine.
+3. **Rate-limit yourself.** OpenWA ships a configurable rate limiter (`RATE_LIMIT_*` env vars). Use it.
+   A few messages per minute per session is sustainable; "thousands in an hour" is not.
+4. **Prefer opted-in recipients.** The safest workloads are replies and alerts to people who already
+   expect to hear from you — OTPs to your own users, order updates, support replies.
+5. **Keep a fallback.** For anything auth-critical or revenue-critical, keep an SMS / email /
+   official-Cloud-API path. Do not bet a login flow solely on an unofficial client.
+6. **Mind the hosting IP.** Cheap datacenter IPs are flagged more aggressively than residential ones. A
+   residential proxy (supported per-session) can help — it is not a license to spam.
+
+<details>
+<summary><strong>🔍 Known platform behaviour — things that look like bugs but aren't</strong></summary>
+
+<br/>
+
+These are server-side WhatsApp policy, not OpenWA defects. We track them separately so real bugs stay visible.
+
+- **The first message to a brand-new contact sometimes never arrives.** The API returns success
+  because the message leaves OpenWA, but WhatsApp's server-side reach-out / trust policy drops it at
+  delivery. This is independent of OpenWA — tracked in [#830](https://github.com/rmyndharis/OpenWA/issues/830).
+- **Restricted accounts cannot be "unrestricted" by us.** If WhatsApp disables a number, you must
+  appeal through their channels. OpenWA has no lever to pull.
+
+</details>
+
+📖 For the deeper, maintainer-side risk analysis — protocol-change exposure, dependency strategy,
+security posture — see [Risk Management (`docs/16`)](./docs/16-risk-management.md).
 
 ---
 
 ## ✨ Why OpenWA?
 
-**OpenWA** is a free, open-source WhatsApp API Gateway designed for developers who need full control over their messaging infrastructure—without vendor lock-in or hidden paywalls.
+OpenWA is built for developers who want full control over their messaging infrastructure. Its
+**pluggable architecture** lets you choose database engines (SQLite / PostgreSQL), backup and
+migration storage backends (Local / S3) and cache layers (disabled / Redis) through **configuration
+rather than application-code changes**.
 
-Built on a **pluggable architecture**, OpenWA lets you swap database engines (SQLite/PostgreSQL), storage backends (Local/S3), and cache layers (Memory/Redis) without changing a single line of application code.
+> **On media:** message media is returned **inline** to API and webhook consumers. It is not
+> automatically persisted to the storage backend.
 
-|                               |                                                              |
-| ----------------------------- | ------------------------------------------------------------ |
-| 🔓 **100% Open Source**       | No licensing fees, no feature locks, full source code access |
-| 🏗️ **Pluggable Architecture** | Swap adapters for database, storage, and cache via config    |
-| 🖥️ **Full Dashboard**         | Modern React UI for session, webhook, and API key management |
-| 🔹 **Multi-Session Ready**    | Run multiple WhatsApp sessions concurrently on one instance  |
-| 🐳 **Docker Native**          | Production-ready with zero configuration                     |
-| 🔗 **n8n Integration**        | Community nodes for workflow automation                      |
-| 🧩 **Community Adapters**     | Third-party integrations (e.g. ioBroker) — see [docs](./docs/23-community-integrations.md) |
+|                               |                                                                                                                                          |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| 🔓 **100% Open Source**       | No licensing fees, no feature locks, full source code access                                                                             |
+| 🏗️ **Pluggable Architecture** | Swap adapters for database, storage and cache via config                                                                                 |
+| 🖥️ **Full Dashboard**         | Modern React UI for session, webhook and API key management                                                                              |
+| 🔹 **Multi-Session Ready**    | Run multiple WhatsApp sessions concurrently on one instance                                                                              |
+| 🐳 **Docker Native**          | Production-ready with zero configuration                                                                                                 |
+| 🤖 **AI-Agent Ready**         | Optional MCP server so Claude, Cursor and friends can drive WhatsApp                                                                     |
+| 🧩 **Official Plugins**       | Chatwoot, Typebot & more as sandboxed plugins on the Integration Fabric — [OpenWA-plugins](https://github.com/rmyndharis/OpenWA-plugins) |
+| 🔗 **n8n Integration**        | Community nodes for workflow automation                                                                                                  |
+| 🧩 **Community Adapters**     | Third-party integrations (e.g. ioBroker) — see [docs](./docs/23-community-integrations.md)                                               |
+| 🔐 **Session-scoped keys**    | Operator and viewer (reader) tokens can be limited to chosen sessions — or all sessions if none are selected                             |
+
+### Session-scoped operator & viewer tokens
+
+When you create or edit an **operator** or **viewer** API key in the dashboard, you can tick the WhatsApp sessions that key may use.
+
+- **No sessions selected** — the key can access every session, including ones created later.
+- **One or more sessions selected** — the key can only list, read, and (for operator) manage those sessions. A request naming any other session returns `401`; session-filtered lists (sessions, audit, webhook delivery failures) return that key's rows rather than an error; and the key-management routes and the queue dashboard, which name no session at all, return `403`.
+
+Admin keys stay unscoped in the dashboard so they can keep managing other API keys. The HTTP API still accepts `allowedSessions` on any role if you need that from a client.
 
 ---
 
-## 🎯 Features
+## 🗺 How it all fits together
 
-### Core Features
+```mermaid
+flowchart LR
+  subgraph Clients["👥 Your world"]
+    direction TB
+    APP["Your app / cURL"]
+    UI["Dashboard :2785"]
+    AGENT["AI agent via MCP"]
+  end
 
-| Feature       | Status | Description                          |
-| ------------- | ------ | ------------------------------------ |
-| REST API      | ✅     | Full WhatsApp API via HTTP endpoints |
-| Multi-Session | ✅     | Manage multiple WhatsApp accounts    |
+  subgraph Core["🚀 OpenWA · one process · port 2785"]
+    direction TB
+    API["REST API + Auth<br/>NestJS"]
+    HOOK["Plugins &<br/>Integration Fabric"]
+    ENG["Engine abstraction"]
+    API --> HOOK
+    API --> ENG
+  end
+
+  subgraph Out["🌍 The outside world"]
+    direction TB
+    WA(["WhatsApp"])
+    HOOKS["Your webhook endpoint"]
+  end
+
+  subgraph Adapters["🔌 Swap by config"]
+    direction TB
+    DB[("SQLite / PostgreSQL")]
+    CACHE[("Redis · optional")]
+    STORE[("Local / S3 / MinIO")]
+  end
+
+  APP --> API
+  UI --> API
+  AGENT --> API
+  ENG -->|whatsapp-web.js or baileys| WA
+  WA -->|events| ENG
+  ENG -->|HMAC-signed| HOOKS
+  Core <-.->|state & media| Adapters
+```
+
+---
+
+## 🎯 Feature matrix
+
+Everything below is **shipped and working** — no "coming soon" rows.
+
+<details open>
+<summary><strong>🧱 Core</strong></summary>
+
+<br/>
+
+| Feature       | Status | Description                                                                  |
+| ------------- | ------ | ---------------------------------------------------------------------------- |
+| REST API      | ✅     | Full WhatsApp API via HTTP endpoints                                         |
+| Multi-Session | ✅     | Manage multiple WhatsApp accounts                                            |
 | Webhooks      | ✅     | Real-time events with HMAC signature and optional smart pre-dispatch filters |
-| Web Dashboard | ✅     | Visual management interface          |
-| API Key Auth  | ✅     | Secure API authentication            |
-| Swagger Docs  | ✅     | Interactive API documentation        |
+| Web Dashboard | ✅     | Visual management interface                                                  |
+| API Key Auth  | ✅     | Secure API authentication                                                    |
+| Swagger Docs  | ✅     | Interactive API documentation                                                |
 
-### Messaging
+</details>
 
-| Feature           | Status | Description                      |
-| ----------------- | ------ | -------------------------------- |
-| Text Messages     | ✅     | Send/receive text messages       |
-| Media Messages    | ✅     | Images, videos, documents, audio |
-| Message Reactions | ✅     | React to messages with emoji     |
-| Bulk Messaging    | ✅     | Send to multiple recipients      |
-| Message Status    | ✅     | Track delivery and read receipts |
+<details>
+<summary><strong>💬 Messaging</strong></summary>
 
-### Advanced
+<br/>
 
-| Feature             | Status | Description                        |
-| ------------------- | ------ | ---------------------------------- |
-| Groups API          | ✅     | Create, manage, and message groups |
-| Channels/Newsletter | ✅     | WhatsApp Channels support          |
-| Labels Management   | ✅     | Organize chats with labels         |
-| Proxy Support       | ✅     | Per-session proxy configuration    |
-| Rate Limiting       | ✅     | Configurable request limits        |
-| CIDR Whitelisting   | ✅     | IP-based access control            |
-| Audit Logging       | ✅     | Track all API operations           |
+| Feature           | Status | Description                                               |
+| ----------------- | ------ | --------------------------------------------------------- |
+| Text Messages     | ✅     | Send/receive text messages                                |
+| Media Messages    | ✅     | Images, videos, documents, audio                          |
+| Message Reactions | ✅     | React to messages with emoji                              |
+| Message Editing   | ✅     | Send edits + live `message.edited` events on both engines |
+| Bulk Messaging    | ✅     | Send to multiple recipients                               |
+| Message Status    | ✅     | Track delivery and read receipts                          |
 
-### Infrastructure
+</details>
 
-| Feature          | Status | Description                    |
-| ---------------- | ------ | ------------------------------ |
-| SQLite           | ✅     | Zero-config embedded database  |
-| PostgreSQL       | ✅     | Production-grade database      |
-| Redis Cache      | ✅     | Optional performance caching   |
-| S3/MinIO Storage | ✅     | Scalable media storage         |
-| Docker           | ✅     | One-command deployment         |
-| Health Checks    | ✅     | Kubernetes-ready probes        |
-| Data Migration   | ✅     | Export/import between backends |
+<details>
+<summary><strong>🧠 Advanced</strong></summary>
+
+<br/>
+
+| Feature             | Status | Description                                                                                                                                                                  |
+| ------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Groups API          | ✅     | Create, manage, join (invite code), and configure groups                                                                                                                     |
+| Profile Management  | ✅     | Set own display name, about text, and profile picture                                                                                                                        |
+| Call Handling       | ✅     | `call.received` events, reject calls, per-session auto-reject                                                                                                                |
+| Channels/Newsletter | ✅     | WhatsApp Channels support                                                                                                                                                    |
+| Labels Management   | ✅     | Organize chats with labels                                                                                                                                                   |
+| Proxy Support       | ✅     | Per-session proxy configuration                                                                                                                                              |
+| Rate Limiting       | ✅     | Configurable request limits                                                                                                                                                  |
+| CIDR Whitelisting   | ✅     | IP-based access control                                                                                                                                                      |
+| Audit Logging       | ✅     | Audit trail for API-key, session, integration-instance, and infra admin operations (message sends and webhook deliveries are tracked in their own tables, not the audit log) |
+
+</details>
+
+<details>
+<summary><strong>🏗 Infrastructure</strong></summary>
+
+<br/>
+
+| Feature          | Status | Description                              |
+| ---------------- | ------ | ---------------------------------------- |
+| SQLite           | ✅     | Zero-config embedded database            |
+| PostgreSQL       | ✅     | Production-grade database                |
+| Redis Cache      | ✅     | Optional performance caching             |
+| S3/MinIO Storage | ✅     | Media-directory backup/migration backend |
+| Docker           | ✅     | One-command deployment                   |
+| Health Checks    | ✅     | Kubernetes-ready probes                  |
+| Data Migration   | ✅     | Export/import between backends           |
+
+</details>
 
 ---
 
 ## 🚀 Quick Start
 
-### Option A: Docker (Recommended)
+<details open>
+<summary><strong>🐳 Option A — Docker (recommended)</strong></summary>
+
+<br/>
 
 ```bash
 # Clone and start
@@ -106,125 +295,65 @@ docker compose -f docker-compose.dev.yml up -d
 
 # Access (the dashboard is bundled into the API image and served on the same port)
 # Dashboard: http://localhost:2785
-# API: http://localhost:2785/api
-# Swagger: http://localhost:2785/api/docs
+# API:       http://localhost:2785/api
+# Swagger:   http://localhost:2785/api/docs
 ```
 
-> **Using Podman instead of Docker?**
-> Podman rootless mode requires the socket to be running and `DOCKER_HOST` to be set:
->
-> ```bash
-> systemctl --user start podman.socket
-> systemctl --user enable podman.socket
-> export DOCKER_HOST=unix:///run/user/$(id -u)/podman/podman.sock
-> ```
->
-> Add the `export` line to your `~/.bashrc` to make it permanent.
+</details>
 
-### Option B: Local Development
+<details>
+<summary><strong>💻 Option B — Local development (hot reload)</strong></summary>
+
+<br/>
 
 ```bash
 # Clone repository
 git clone https://github.com/rmyndharis/OpenWA.git
 cd OpenWA
 
-# Install dependencies (includes dashboard)
-npm install
+# Install the locked dependencies (includes dashboard)
+npm ci
 
 # Start API + Dashboard (config is auto-generated on first run)
 npm run dev
 
 # Access (in dev the dashboard runs on the Vite server with hot reload)
 # Dashboard: http://localhost:2886
-# API: http://localhost:2785/api
-# Swagger: http://localhost:2785/api/docs
+# API:       http://localhost:2785/api
+# Swagger:   http://localhost:2785/api/docs
 ```
 
----
+Use `npm install` instead when intentionally changing dependencies. OpenWA's committed lockfile uses
+registry artifacts only, so npm 12 works with its secure default that blocks Git dependencies; do not
+disable that policy globally.
 
-## 🔒 Security Architecture
+</details>
 
-### Docker Socket Proxy
+<details>
+<summary><strong>🐧 Using Podman instead of Docker?</strong></summary>
 
-The production stack never exposes `/var/run/docker.sock` directly to the application container. Instead, a dedicated `docker-proxy` sidecar (based on [`tecnativa/docker-socket-proxy`](https://github.com/Tecnativa/docker-socket-proxy)) acts as the sole gateway to the Docker daemon:
+<br/>
 
-```
-openwa-api  ──TCP 2375──▶  docker-proxy  ──unix──▶  /var/run/docker.sock
-```
-
-Only the operations needed for container orchestration are enabled (`CONTAINERS`, `IMAGES`, `VOLUMES`, `INFO`, `PING`, `POST`, `DELETE`). The application connects via the `DOCKER_HOST=tcp://docker-proxy:2375` environment variable, which `DockerService` detects automatically.
-
----
-
-## 🔒 Security Architecture
-
-### Non-root Container Execution
-
-The production image never runs the Node.js process as root. On startup, the container follows this chain:
-
-```
-dumb-init (PID 1)
-  └─ docker-entrypoint.sh (root — fixes named-volume ownership via chown)
-       └─ gosu openwa node dist/main  (drops to the openwa user)
-```
-
-- **dumb-init** is PID 1 and forwards signals (SIGTERM, etc.) for graceful shutdown.
-- **docker-entrypoint.sh** runs as root only long enough to `chown` the named-volume mount points so the `openwa` user can write to them.
-- **gosu** performs a clean `exec`-based privilege drop — no `su` or `sudo` wrappers, so the node process is the direct child of dumb-init.
-
-Named volumes (e.g. `openwa-data`) get their ownership corrected automatically on every start, so no manual `chown` step is needed after volume creation.
-
----
-
-## 🏭 Production Deployment
-
-For production, use the main `docker-compose.yml` with optional services:
+Podman rootless mode requires the socket to be running and `DOCKER_HOST` to be set:
 
 ```bash
-# Basic production (SQLite, local storage)
-docker compose up -d
-
-# With PostgreSQL database
-docker compose --profile postgres up -d
-
-# Full stack (PostgreSQL, Redis, MinIO)
-docker compose --profile full up -d
+systemctl --user start podman.socket
+systemctl --user enable podman.socket
+export DOCKER_HOST=unix:///run/user/$(id -u)/podman/podman.sock
 ```
 
-| Profile    | Services              |
-| ---------- | --------------------- |
-| `postgres` | PostgreSQL database   |
-| `redis`    | Redis cache           |
-| `minio`    | S3-compatible storage |
-| `full`     | All services above    |
+Add the `export` line to your `~/.bashrc` to make it permanent.
 
-> The dashboard is bundled into the API image and served by NestJS on the API port, so it
-> needs no profile — it is always available wherever `openwa-api` runs. For TLS/public exposure,
-> put your own reverse proxy (nginx, Caddy, a cloud load balancer, or a k8s Ingress) in front;
-> see the nginx example in `docs/12-troubleshooting-faq.md`.
-
-> **Development vs Production**
->
-> - Development (`docker-compose.dev.yml`): SQLite, local storage, API serves the bundled dashboard
-> - Production (`docker-compose.yml`): Configurable database, profiles for optional services
->
-> Official GHCR images are published as multi-arch manifests for:
-> - `linux/amd64`
-> - `linux/arm64`
-
-## 🔌 Ports
-
-| Service         | Port            | Description                                   |
-| --------------- | --------------- | --------------------------------------------- |
-| API & Dashboard | `2785`          | REST API + bundled web dashboard (same port)  |
-| Swagger         | `2785/api/docs` | Interactive API docs                          |
-| Dashboard (dev) | `2886`          | Vite dev server with hot reload (`npm run dev`) |
+</details>
 
 ---
 
-## 📡 API Examples
+## 📡 The guided API tour
 
-### Create a Session
+Five requests, start to finish. Swap `{sessionId}` and `YOUR_API_KEY` for your own values — or click
+through the same calls live in Swagger at `http://localhost:2785/api/docs`.
+
+### 1️⃣ Create a session
 
 ```bash
 curl -X POST http://localhost:2785/api/sessions \
@@ -233,19 +362,19 @@ curl -X POST http://localhost:2785/api/sessions \
   -d '{"name": "my-bot"}'
 ```
 
-### Start Session & Get QR Code
+### 2️⃣ Start it and grab the QR code
 
 ```bash
 # Start the session
 curl -X POST http://localhost:2785/api/sessions/{sessionId}/start \
   -H "X-API-Key: YOUR_API_KEY"
 
-# Get QR code (scan with WhatsApp)
+# Get QR code (scan with WhatsApp → Linked devices)
 curl http://localhost:2785/api/sessions/{sessionId}/qr \
   -H "X-API-Key: YOUR_API_KEY"
 ```
 
-### Send a Message
+### 3️⃣ Send your first message
 
 ```bash
 curl -X POST http://localhost:2785/api/sessions/{sessionId}/messages/send-text \
@@ -257,7 +386,7 @@ curl -X POST http://localhost:2785/api/sessions/{sessionId}/messages/send-text \
   }'
 ```
 
-### Setup Webhook
+### 4️⃣ Listen for incoming events
 
 ```bash
 curl -X POST http://localhost:2785/api/sessions/{sessionId}/webhooks \
@@ -270,16 +399,37 @@ curl -X POST http://localhost:2785/api/sessions/{sessionId}/webhooks \
   }'
 ```
 
-> **Smart filters (optional):** add a `filters` object to fire the webhook only when conditions match
-> (AND), e.g. `{ "conditions": [{ "field": "sender", "operator": "is", "value": ["1234567890@c.us"] }] }`.
-> Fields: `sender` / `recipient` / `body` / `type` / `mentions` / `fromMe` / `hasMedia` / `isGroup`. A
-> webhook with no filters behaves exactly as before. See the API specification for the full schema.
+### 5️⃣ Bonus — fire only on what you care about
+
+Add a `filters` object to make the webhook fire only when **all** conditions match:
+
+```jsonc
+{
+  "conditions": [{ "field": "sender", "operator": "is", "value": ["1234567890@c.us"] }],
+}
+```
+
+Available fields: `sender` · `recipient` · `body` · `type` · `mentions` · `fromMe` · `hasMedia` ·
+`isGroup`. A webhook with no filters behaves exactly as before. See the
+[API specification](./docs/06-api-specification.md) for the full schema.
+
+---
 
 ## 🤖 MCP Server (AI Agents)
 
-OpenWA can expose a **curated set of tools over the [Model Context Protocol](https://modelcontextprotocol.io)** so AI agents (Claude, Cursor, …) can drive WhatsApp. It is **off by default** and **additive** — every REST route keeps working unchanged.
+OpenWA can expose a **curated set of tools over the [Model Context Protocol](https://modelcontextprotocol.io)**
+so AI agents (Claude, Cursor, …) can drive WhatsApp. It is **off by default** and **additive** —
+every REST route keeps working unchanged.
 
-Set `MCP_ENABLED=true` to mount a stateless Streamable-HTTP transport at **`POST /mcp`** on the existing server (same port, no extra process). It exposes ~39 curated tools (sessions, messaging, contacts, basic group ops, webhook reads) — a focused surface rather than the full API, so agents aren't overwhelmed and destructive operations stay off the agent path.
+Set `MCP_ENABLED=true` to mount a stateless Streamable-HTTP transport at **`POST /mcp`** on the
+existing server (same port, no extra process).
+
+| Mode                     | What gets mounted                                                                                     |
+| ------------------------ | ----------------------------------------------------------------------------------------------------- |
+| **Default (secure)**     | **25 read-only tools** — session, message, contact, group, webhook, label and automation-rule _reads_ |
+| **`MCP_READONLY=false`** | All **51 tools** — adds the write tier (send, reply, group operations)                                |
+
+Either way it is a focused surface rather than the full API, so agents aren't overwhelmed.
 
 ```bash
 MCP_ENABLED=true npm run start:prod   # or set MCP_ENABLED in your .env / compose
@@ -299,36 +449,140 @@ Point an MCP client at it (e.g. for Claude Code, a `.mcp.json` at your project r
 }
 ```
 
-The key can be passed as `Authorization: Bearer …` or `X-API-Key: …`. Every tool call goes through the **same API-key auth, role, and per-session scoping** as REST.
+The key can be passed as `Authorization: Bearer …` or `X-API-Key: …`. Every tool call goes through
+the **same API-key auth, role and per-session scoping** as REST.
 
-**Security guidance:**
+<details>
+<summary><strong>🔐 Security guidance — read before you point an agent at production</strong></summary>
 
-- **Mint a dedicated, least-privilege key** for the agent — a non-admin, **session-scoped** key (`OPERATOR` role at most). The plaintext key is shown only once on creation; to rotate, create a new key and delete the old one.
-- The key **must not** carry an IP allow-list (`allowedIps`) — there is no genuine client IP over MCP, so such a key is rejected.
+<br/>
+
+- **Mint a dedicated, least-privilege key** for the agent — a non-admin, **session-scoped** key
+  (`OPERATOR` role at most). The plaintext key is shown only once on creation; to rotate, create a new
+  key and delete the old one.
+- The key **must not** carry an IP allow-list (`allowedIps`) — there is no genuine client IP over MCP,
+  so such a key is rejected.
 - Set **`MCP_READONLY=true`** to mount only the read tools (no sends/writes).
 - Set **`MCP_RATE_LIMIT_MAX`** (default `60`) to limit tool calls per API key per window.
 - Set **`MCP_RATE_LIMIT_WINDOW_MS`** (default `60000`) to control the sliding window size in milliseconds.
-- **Do not expose `/mcp` to the public internet** without a fronting auth proxy. For a self-hosted, locally-reached deployment the static API key is appropriate; public exposure should use OAuth 2.1 (not yet built).
+- **Do not expose `/mcp` to the public internet** without a fronting auth proxy. For a self-hosted,
+  locally-reached deployment the static API key is appropriate; public exposure should use OAuth 2.1
+  (not yet built).
+
+</details>
 
 ---
 
-## 🛠 Tech Stack
+## 🔒 Security architecture
 
-| Layer         | Technology              |
-| ------------- | ----------------------- |
-| **Runtime**   | Node.js 22 LTS          |
-| **Framework** | NestJS 11.x             |
-| **Language**  | TypeScript 5.x          |
+### Docker socket proxy
+
+The production stack never exposes `/var/run/docker.sock` directly to the application container.
+A dedicated `docker-proxy` sidecar (based on [`tecnativa/docker-socket-proxy`](https://github.com/Tecnativa/docker-socket-proxy))
+is the sole gateway to the Docker daemon:
+
+```
+openwa-api  ──TCP 2375──▶  docker-proxy  ──unix──▶  /var/run/docker.sock
+```
+
+Only the operations needed for container orchestration are enabled (`CONTAINERS`, `IMAGES`,
+`VOLUMES`, `INFO`, `PING`, plus the `POST` method switch). The application connects via the
+`DOCKER_HOST=tcp://docker-proxy:2375` environment variable, which `DockerService` detects
+automatically.
+
+> ⚠️ **This is an operational gateway, not a fine-grained privilege boundary.** With `POST` enabled the
+> proxy admits every method to the enabled paths and cannot scope container-create payloads, so a
+> compromised API container would be host-root-equivalent. See [`SECURITY.md`](./SECURITY.md) for the
+> full threat model, mitigations, and how to disable the proxy if you don't use the built-in datastore
+> orchestration.
+
+### Non-root container execution
+
+The production image never runs the Node.js process as root. On startup the container follows this chain:
+
+```
+dumb-init (PID 1)
+  └─ docker-entrypoint.sh (root — fixes named-volume ownership via chown)
+       └─ gosu openwa node dist/main  (drops to the openwa user)
+```
+
+- **dumb-init** is PID 1 and forwards signals (SIGTERM, etc.) for graceful shutdown.
+- **docker-entrypoint.sh** runs as root only long enough to `chown` the named-volume mount points so
+  the `openwa` user can write to them.
+- **gosu** performs a clean `exec`-based privilege drop — no `su` or `sudo` wrappers, so the node
+  process is the direct child of dumb-init.
+
+Named volumes (e.g. `openwa-data`) get their ownership corrected automatically on every start, so no
+manual `chown` step is needed after volume creation.
+
+---
+
+## 🏭 Production deployment
+
+For production, use the main `docker-compose.yml` and turn on only the services you need:
+
+```bash
+# Basic production (SQLite, local storage)
+docker compose up -d
+
+# With PostgreSQL database
+docker compose --profile postgres up -d
+
+# Full stack (PostgreSQL, Redis, MinIO)
+docker compose --profile full up -d
+```
+
+| Profile    | Services              |
+| ---------- | --------------------- |
+| `postgres` | PostgreSQL database   |
+| `redis`    | Redis cache           |
+| `minio`    | S3-compatible storage |
+| `full`     | All services above    |
+
+> The dashboard is bundled into the API image and served by NestJS on the API port, so it needs no
+> profile — it is always available wherever `openwa-api` runs. For TLS/public exposure, put your own
+> reverse proxy (nginx, Caddy, a cloud load balancer, or a k8s Ingress) in front; see the nginx
+> example in [`docs/12-troubleshooting-faq.md`](./docs/12-troubleshooting-faq.md).
+
+> **Development vs Production**
+>
+> - Development (`docker-compose.dev.yml`): SQLite, local storage, API serves the bundled dashboard
+> - Production (`docker-compose.yml`): Configurable database, profiles for optional services
+>
+> Official GHCR images are published as multi-arch manifests for `linux/amd64` and `linux/arm64`.
+
+## 🔌 Ports
+
+| Service         | Port            | Description                                                                         |
+| --------------- | --------------- | ----------------------------------------------------------------------------------- |
+| API & Dashboard | `2785`          | REST API + bundled web dashboard (same port)                                        |
+| Swagger         | `2785/api/docs` | Interactive API docs — off under `NODE_ENV=production` unless `ENABLE_SWAGGER=true` |
+| Dashboard (dev) | `2886`          | Vite dev server with hot reload (`npm run dev`)                                     |
+
+---
+
+## 🛠 Tech stack
+
+| Layer         | Technology                                              |
+| ------------- | ------------------------------------------------------- |
+| **Runtime**   | Node.js 22 LTS                                          |
+| **Framework** | NestJS 11.x                                             |
+| **Language**  | TypeScript 6.x                                          |
 | **WA Engine** | whatsapp-web.js (default) / baileys — set `ENGINE_TYPE` |
-| **Database**  | SQLite / PostgreSQL     |
-| **Cache**     | Redis (optional)        |
-| **Storage**   | Local / S3 / MinIO      |
-| **ORM**       | TypeORM                 |
-| **Container** | Docker + Docker Compose |
+| **Database**  | SQLite / PostgreSQL                                     |
+| **Cache**     | Redis (optional)                                        |
+| **Storage**   | Local / S3 / MinIO                                      |
+| **ORM**       | TypeORM                                                 |
+| **Container** | Docker + Docker Compose                                 |
 
 ---
 
-## 📁 Project Structure
+## 📁 Project structure
+
+<details>
+<summary><strong>Expand the tree</strong></summary>
+
+<br/>
 
 ```
 openwa/
@@ -353,49 +607,62 @@ openwa/
 │       ├── infra/              # Infrastructure management
 │       └── health/             # Health checks
 ├── dashboard/                  # React web dashboard
-├── docs/                      # Documentation
+├── docs/                       # Documentation
 ├── docker-compose.yml
 ├── Dockerfile
 └── package.json
 ```
 
+</details>
+
 ---
 
 ## 📚 Documentation
 
-Comprehensive documentation is available in the `docs/` folder:
+Comprehensive documentation lives in the [`docs/`](./docs/README.md) folder. Start wherever you are:
 
-| Document                                                | Description                  |
-| ------------------------------------------------------- | ---------------------------- |
-| [Project Overview](./docs/01-project-overview.md)       | Introduction and goals       |
-| [Requirements](./docs/02-requirements-specification.md) | Feature specifications       |
-| [Architecture](./docs/03-system-architecture.md)        | System design                |
-| [Security](./docs/04-security-design.md)                | Security implementation      |
-| [Database](./docs/05-database-design.md)                | Data models and migrations   |
-| [API Spec](./docs/06-api-specification.md)              | Complete API reference       |
-| [Development](./docs/08-development-guidelines.md)      | Coding standards             |
-| [Migration Guide](./docs/14-migration-guide.md)         | Database & storage migration |
+| I want to…                   | Read this                                                                 |
+| ---------------------------- | ------------------------------------------------------------------------- |
+| 🧭 Understand what this is   | [Project Overview](./docs/01-project-overview.md)                         |
+| 📋 Check a feature exists    | [Requirements](./docs/02-requirements-specification.md)                   |
+| 🏛 See how it's built        | [Architecture](./docs/03-system-architecture.md)                          |
+| 🔐 Review the security model | [Security](./docs/04-security-design.md) · [`SECURITY.md`](./SECURITY.md) |
+| 🗄 Understand the data layer | [Database](./docs/05-database-design.md)                                  |
+| 📡 Look up an endpoint       | [API Spec](./docs/06-api-specification.md)                                |
+| 🧑‍💻 Contribute code           | [Development Guidelines](./docs/08-development-guidelines.md)             |
+| 🚚 Move between backends     | [Migration Guide](./docs/14-migration-guide.md)                           |
+| ⚖️ Weigh the risks           | [Risk Management](./docs/16-risk-management.md)                           |
+| 🧯 Fix something that broke  | [Troubleshooting & FAQ](./docs/12-troubleshooting-faq.md)                 |
 
 ---
 
 ## 🤝 Contributing
 
-We welcome contributions! Here's how to get started:
+Contributions are genuinely welcome — bug reports, docs fixes and features alike.
 
-1. **Fork** the repository
-2. **Create** your feature branch (`git checkout -b feature/amazing-feature`)
-3. **Commit** your changes (`git commit -m 'Add amazing feature'`)
-4. **Push** to the branch (`git push origin feature/amazing-feature`)
-5. **Open** a Pull Request
+```bash
+# 1. Fork, then branch
+git checkout -b feature/amazing-feature
 
-Please read our [Development Guidelines](./docs/08-development-guidelines.md) for coding standards and best practices.
+# 2. Make it good, then verify locally
+npm run lint && npm test
+
+# 3. Commit and push
+git commit -m "Add amazing feature"
+git push origin feature/amazing-feature
+
+# 4. Open a Pull Request 🎉
+```
+
+Please read the [Development Guidelines](./docs/08-development-guidelines.md) for coding standards
+and the [Code of Conduct](./CODE_OF_CONDUCT.md) before you start. Found a security issue? **Don't open
+a public issue** — follow [`SECURITY.md`](./SECURITY.md) instead.
 
 ---
 
 ## 📄 License
 
-This project is licensed under the **MIT License** – free for personal and commercial use.
-
+Released under the **MIT License** — free for personal and commercial use.
 See [LICENSE](./LICENSE) for details.
 
 ---
@@ -408,6 +675,6 @@ See [LICENSE](./LICENSE) for details.
 
 <br/>
 
-<sub>Made with ❤️ by <a href="https://github.com/rmyndharis">Yudhi Armyndharis</a> and the OpenWA Community</sub>
+<sub>Made with ❤️ by TachyEl Technologies Private Limited and the OpenWA Community</sub>
 
 </div>

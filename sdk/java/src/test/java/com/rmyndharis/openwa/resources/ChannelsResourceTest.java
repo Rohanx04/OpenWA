@@ -7,8 +7,12 @@ import com.rmyndharis.openwa.ClientConfig;
 import com.rmyndharis.openwa.OpenWAClient;
 import com.rmyndharis.openwa.http.HttpMethod;
 import com.rmyndharis.openwa.model.ChannelMessageQuery;
+import com.rmyndharis.openwa.model.ChannelMessageRecord;
+import com.rmyndharis.openwa.model.ChannelRecord;
 import com.rmyndharis.openwa.model.SubscribeChannelRequest;
 import com.rmyndharis.openwa.support.MockTransport;
+import com.rmyndharis.openwa.model.DemoteChannelAdminRequest;
+import com.rmyndharis.openwa.model.TransferChannelOwnershipRequest;
 import org.junit.jupiter.api.Test;
 
 class ChannelsResourceTest {
@@ -30,6 +34,38 @@ class ChannelsResourceTest {
         client.channels.get("a/b", "123@newsletter");
         assertEquals("http://h/api/sessions/a%2Fb/channels/123@newsletter", tx.lastRequest().url());
         assertEquals(HttpMethod.GET, tx.lastRequest().method());
+    }
+
+    /** Guards the wire contract: the backend `Channel` carries inviteCode/picture/verified/createdAt (#754). */
+    @Test
+    void listDeserializesTheChannelWireShape() {
+        tx.respond(
+            200,
+            "[{\"id\":\"123@newsletter\",\"name\":\"News\",\"description\":\"d\",\"inviteCode\":\"abc123\","
+                + "\"subscriberCount\":7,\"picture\":\"https://x/p.jpg\",\"verified\":true,"
+                + "\"createdAt\":1700000000}]");
+        ChannelRecord channel = client.channels.list("s").get(0);
+        assertEquals("123@newsletter", channel.id());
+        assertEquals("abc123", channel.inviteCode());
+        assertEquals(7, channel.subscriberCount());
+        assertEquals("https://x/p.jpg", channel.picture());
+        assertTrue(channel.verified());
+        assertEquals(1700000000L, channel.createdAt());
+    }
+
+    /** Guards the wire contract: channel messages are the engine payload, not a persisted MessageRecord (#754). */
+    @Test
+    void messagesDeserializesTheEngineChannelMessageShape() {
+        tx.respond(
+            200,
+            "[{\"id\":\"m1\",\"body\":\"hi\",\"timestamp\":1700000000,\"hasMedia\":true,"
+                + "\"mediaUrl\":\"https://x/m.jpg\"}]");
+        ChannelMessageRecord message = client.channels.messages("s", "123@newsletter", null).get(0);
+        assertEquals("m1", message.id());
+        assertEquals("hi", message.body());
+        assertEquals(1700000000L, message.timestamp());
+        assertTrue(message.hasMedia());
+        assertEquals("https://x/m.jpg", message.mediaUrl());
     }
 
     @Test
@@ -65,4 +101,18 @@ class ChannelsResourceTest {
         assertEquals("http://h/api/sessions/s/channels/123@newsletter", tx.lastRequest().url());
         assertEquals(HttpMethod.DELETE, tx.lastRequest().method());
     }
+    @Test
+    void demoteAdminAndTransferOwnershipHitTheirOwnPaths() {
+        tx.respond(200, "{\"success\":true}");
+        client.channels.demoteAdmin("s", "c", DemoteChannelAdminRequest.builder().userId("a@c.us").build());
+        assertEquals("http://h/api/sessions/s/channels/c/admins/demote", tx.lastRequest().url());
+        assertTrue(tx.lastRequest().body().contains("a@c.us"));
+
+        tx.respond(200, "{\"success\":true}");
+        client.channels.transferOwnership(
+            "s", "c", TransferChannelOwnershipRequest.builder().newOwnerId("b@c.us").build());
+        assertEquals("http://h/api/sessions/s/channels/c/owner/transfer", tx.lastRequest().url());
+        assertTrue(tx.lastRequest().body().contains("b@c.us"));
+    }
+
 }

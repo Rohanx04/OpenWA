@@ -8,6 +8,8 @@ use GuzzleHttp\ClientInterface;
 use OpenWA\Exceptions\OpenWAException;
 use OpenWA\Http\HttpExecutor;
 use OpenWA\Resources\CatalogResource;
+use OpenWA\Resources\CallsResource;
+use OpenWA\Resources\MediaResource;
 use OpenWA\Resources\ChannelsResource;
 use OpenWA\Resources\ChatsResource;
 use OpenWA\Resources\ContactsResource;
@@ -15,6 +17,7 @@ use OpenWA\Resources\GroupsResource;
 use OpenWA\Resources\HealthResource;
 use OpenWA\Resources\LabelsResource;
 use OpenWA\Resources\MessagesResource;
+use OpenWA\Resources\ProfileResource;
 use OpenWA\Resources\SearchResource;
 use OpenWA\Resources\SessionsResource;
 use OpenWA\Resources\StatusResource;
@@ -63,6 +66,9 @@ class Client
     public ChannelsResource $channels;
     public CatalogResource $catalog;
     public TemplatesResource $templates;
+    public ProfileResource $profile;
+    public CallsResource $calls;
+    public MediaResource $media;
 
     /**
      * @param array{
@@ -107,6 +113,9 @@ class Client
         $this->channels = new ChannelsResource($this->http);
         $this->catalog = new CatalogResource($this->http);
         $this->templates = new TemplatesResource($this->http);
+        $this->profile = new ProfileResource($this->http);
+        $this->calls = new CallsResource($this->http);
+        $this->media = new MediaResource($this->http);
     }
 
     /**

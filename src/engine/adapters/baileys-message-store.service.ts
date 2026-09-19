@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import type * as BaileysLib from '@whiskeysockets/baileys';
 import type { WAMessage } from '@whiskeysockets/baileys';
 import { BaileysStoredMessage } from './baileys-stored-message.entity';
@@ -88,12 +88,30 @@ export class BaileysMessageStoreService implements BaileysMessageStore {
   }
 
   async getMessage(sessionId: string, messageId: string): Promise<WAMessage | null> {
+    // Baileys retry/poll paths can hand over a key with no id; treat that as not-found rather than
+    // letting an undefined criterion reach the ORM (TypeORM 1.x throws; 0.3 matched an arbitrary row).
+    if (!messageId) return null;
     const row = await this.repo.findOne({ where: { sessionId, waMessageId: messageId } });
     if (!row) {
       return null;
     }
     const { BufferJSON } = await this.loadLib();
     return JSON.parse(row.serializedMessage, BufferJSON.reviver) as WAMessage;
+  }
+
+  async getMessages(sessionId: string, messageIds: string[]): Promise<WAMessage[]> {
+    // One query for the whole batch: the read-receipt path resolves up to a hundred ids at a time,
+    // and a findOne apiece would be a hundred sequential round trips for a single request.
+    const ids = messageIds.filter(Boolean);
+    if (ids.length === 0) {
+      return [];
+    }
+    const rows = await this.repo.find({ where: { sessionId, waMessageId: In(ids) } });
+    if (rows.length === 0) {
+      return [];
+    }
+    const { BufferJSON } = await this.loadLib();
+    return rows.map(row => JSON.parse(row.serializedMessage, BufferJSON.reviver) as WAMessage);
   }
 
   async clearSession(sessionId: string): Promise<void> {
@@ -108,7 +126,7 @@ export class BaileysMessageStoreService implements BaileysMessageStore {
       order: { createdAt: 'DESC', id: 'DESC' },
       skip: limit,
       take: 1,
-      select: ['id', 'createdAt'],
+      select: { id: true, createdAt: true },
     });
     if (cutoff.length === 0) {
       return; // under the cap — nothing to evict

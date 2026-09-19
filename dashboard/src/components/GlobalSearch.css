@@ -101,7 +101,7 @@
 }
 
 .global-search-hit-snippet mark {
-  background: var(--warning, #fde68a);
+  background: var(--warning);
   color: inherit;
   border-radius: 2px;
   padding: 0 1px;
@@ -121,5 +121,5 @@
 
 .global-search-more:hover {
   background: var(--primary-soft);
-  color: var(--primary);
+  color: var(--primary-text);
 }

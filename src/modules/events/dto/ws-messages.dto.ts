@@ -4,29 +4,31 @@
  * WebSocket message types for subscription protocol
  */
 
-// Client -> Server message types
-export type WSClientMessageType = 'subscribe' | 'unsubscribe' | 'ping';
-
-// Server -> Client message types
-export type WSServerMessageType = 'subscribed' | 'unsubscribed' | 'event' | 'error' | 'pong';
-
 // Valid event types that can be subscribed to over the socket. Every entry here MUST have a
 // matching EventsGateway.emit* producer — the drift guard in events.gateway.spec asserts this.
-// (group.* are NOT listed: they have no engine emit source and were never delivered; they stay
-// reserved on the webhook side via WEBHOOK_RESERVED_EVENTS.)
 export const SUBSCRIBABLE_EVENTS = [
   'message.received',
   'message.sent',
   'message.ack',
   'message.revoked',
   'message.reaction',
+  'message.edited',
   'session.status',
   'session.qr',
   'session.authenticated',
   'session.disconnected',
+  'session.restriction',
+  'group.join',
+  'group.leave',
+  'group.update',
+  'group.join_request',
+  'call.received',
+  'status.received',
+  'presence.update',
+  'call.accepted',
+  'call.rejected',
+  'call.missed',
 ] as const;
-
-export type SubscribableEvent = (typeof SUBSCRIBABLE_EVENTS)[number] | '*';
 
 // Client -> Server: Subscribe request
 export interface WSSubscribeRequest {
@@ -96,18 +98,7 @@ export interface WSPongResponse {
   timestamp: string;
 }
 
-// Union type for all server messages
-export type WSServerMessage =
-  WSSubscribedResponse | WSUnsubscribedResponse | WSEventMessage | WSErrorResponse | WSPongResponse;
-
 // Room name builder
 export function buildRoomName(sessionId: string, event: string): string {
   return `session:${sessionId}:${event}`;
-}
-
-// Parse room name back to components
-export function parseRoomName(room: string): { sessionId: string; event: string } | null {
-  const match = room.match(/^session:([^:]+):(.+)$/);
-  if (!match) return null;
-  return { sessionId: match[1], event: match[2] };
 }

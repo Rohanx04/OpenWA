@@ -1,3 +1,4 @@
+import { ValidationPipe } from '@nestjs/common';
 import { plainToInstance } from 'class-transformer';
 import { validate, ValidationError } from 'class-validator';
 import {
@@ -6,15 +7,27 @@ import {
   ReactMessageDto,
   DeleteMessageDto,
   ForwardMessageDto,
+  EditMessageDto,
+  ReplyMessageDto,
 } from './message-actions.dto';
+import { GLOBAL_VALIDATION_OPTIONS } from '../../../config/app-validation';
 
 /**
  * Regression locks: these endpoints previously took inline @Body literals (no
  * runtime validation). e2e is deferred (broken harness), so we validate the
  * decorators directly via class-validator.
  */
+// The transform option has to match src/config/app-validation.ts. Without it these specs exercise a
+// stricter pipe than the one that actually runs, so a payload rejected here can still be accepted in
+// production — which is exactly how a stringly-typed boolean stayed invisible.
+const PIPE_TRANSFORM_OPTS = { enableImplicitConversion: true };
+
 function errorsFor<T extends object>(cls: new () => T, obj: object): Promise<ValidationError[]> {
-  return validate(plainToInstance(cls, obj));
+  return validate(plainToInstance(cls, obj, PIPE_TRANSFORM_OPTS));
+}
+
+function instanceFor<T extends object>(cls: new () => T, obj: object): T {
+  return plainToInstance(cls, obj, PIPE_TRANSFORM_OPTS);
 }
 
 describe('message action DTOs', () => {
@@ -87,9 +100,91 @@ describe('message action DTOs', () => {
     expect(await errorsFor(DeleteMessageDto, { chatId: 'x@c.us', messageId: 'm1' })).toHaveLength(0);
   });
 
+  // The service defaults an absent forEveryone to true, so `false` is the only reason to send the
+  // field at all. Asserting the VALUE, not just the error count: a form-encoded "false" read as
+  // `true` would retract the message from the recipient instead of hiding it locally, and that
+  // cannot be undone.
+  it('DeleteMessageDto: a form-encoded "false" stays false', () => {
+    const base = { chatId: 'x@c.us', messageId: 'm1' };
+    expect(instanceFor(DeleteMessageDto, { ...base, forEveryone: 'false' }).forEveryone).toBe(false);
+    expect(instanceFor(DeleteMessageDto, { ...base, forEveryone: 'true' }).forEveryone).toBe(true);
+    expect(instanceFor(DeleteMessageDto, { ...base, forEveryone: false }).forEveryone).toBe(false);
+    expect(instanceFor(DeleteMessageDto, { ...base, forEveryone: true }).forEveryone).toBe(true);
+  });
+
+  it('DeleteMessageDto: rejects an ambiguous forEveryone rather than defaulting it to true', async () => {
+    for (const value of ['yes', 'no', '0', '1', 'FALSE']) {
+      const errs = await errorsFor(DeleteMessageDto, { chatId: 'x@c.us', messageId: 'm1', forEveryone: value });
+      expect(errs.some(e => e.property === 'forEveryone')).toBe(true);
+    }
+  });
+
   it('ForwardMessageDto: requires all three ids', async () => {
     const errs = await errorsFor(ForwardMessageDto, { fromChatId: 'a@c.us' });
     expect(errs.some(e => e.property === 'toChatId')).toBe(true);
     expect(errs.some(e => e.property === 'messageId')).toBe(true);
+  });
+
+  it('EditMessageDto: a valid edit passes', async () => {
+    expect(await errorsFor(EditMessageDto, { chatId: 'x@c.us', messageId: 'm1', body: 'new text' })).toHaveLength(0);
+  });
+
+  it('EditMessageDto: an empty body is rejected (an edit needs text)', async () => {
+    const errs = await errorsFor(EditMessageDto, { chatId: 'x@c.us', messageId: 'm1', body: '' });
+    expect(errs.some(e => e.property === 'body')).toBe(true);
+  });
+
+  it('EditMessageDto: a body over 4096 chars is rejected (same cap as send-text)', async () => {
+    const errs = await errorsFor(EditMessageDto, { chatId: 'x@c.us', messageId: 'm1', body: 'x'.repeat(4097) });
+    expect(errs.some(e => e.property === 'body')).toBe(true);
+  });
+
+  it('EditMessageDto: missing messageId is rejected', async () => {
+    const errs = await errorsFor(EditMessageDto, { chatId: 'x@c.us', body: 'new text' });
+    expect(errs.some(e => e.property === 'messageId')).toBe(true);
+  });
+});
+
+/**
+ * These run through the REAL production pipe rather than bare `validate()`, because the defect they
+ * lock is a whitelist rejection: `forbidNonWhitelisted` answers 400 "property X should not exist"
+ * for anything the DTO does not declare, and a plain validate() call cannot see that at all.
+ */
+describe('mentions on the quoted-send and edit routes (whitelist behaviour)', () => {
+  const pipe = new ValidationPipe(GLOBAL_VALIDATION_OPTIONS);
+  const through = (metatype: unknown, value: object): Promise<unknown> =>
+    pipe.transform(value, { type: 'body', metatype: metatype as never });
+
+  const REPLY = { chatId: '120363000000000000@g.us', quotedMessageId: 'Q1', text: 'hi @62811' };
+  const EDIT = { chatId: '120363000000000000@g.us', messageId: 'M1', body: 'hi @62811' };
+
+  it('ReplyMessageDto accepts a mentions array', async () => {
+    await expect(through(ReplyMessageDto, { ...REPLY, mentions: ['62811@c.us'] })).resolves.toMatchObject({
+      mentions: ['62811@c.us'],
+    });
+  });
+
+  it('EditMessageDto accepts a mentions array', async () => {
+    await expect(through(EditMessageDto, { ...EDIT, mentions: ['62811@c.us'] })).resolves.toMatchObject({
+      mentions: ['62811@c.us'],
+    });
+  });
+
+  // Control for both cases above. Without it, a pipe whose whitelist had been switched off entirely
+  // would satisfy them just as well, and the assertions would prove nothing about the new field.
+  it('still refuses a property no DTO declares', async () => {
+    await expect(through(ReplyMessageDto, { ...REPLY, notAField: 1 })).rejects.toMatchObject({
+      response: { message: ['property notAField should not exist'] },
+    });
+    await expect(through(EditMessageDto, { ...EDIT, notAField: 1 })).rejects.toMatchObject({
+      response: { message: ['property notAField should not exist'] },
+    });
+  });
+
+  it('rejects a mentions entry that is not an individual WID', async () => {
+    // A group id is not a participant, and the shared constraint refuses it on every route that
+    // takes the field.
+    await expect(through(ReplyMessageDto, { ...REPLY, mentions: ['120363000000000000@g.us'] })).rejects.toBeDefined();
+    await expect(through(EditMessageDto, { ...EDIT, mentions: ['not-a-wid'] })).rejects.toBeDefined();
   });
 });
