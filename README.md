@@ -251,7 +251,7 @@ Everything below is **shipped and working** — no "coming soon" rows.
 | ------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Groups API          | ✅     | Create, manage, join (invite code), and configure groups                                                                                                                     |
 | Profile Management  | ✅     | Set own display name, about text, and profile picture                                                                                                                        |
-| Call Handling       | ✅     | `call.received` events, reject calls, per-session auto-reject                                                                                                                |
+| Call Handling       | ✅     | `call.received` events (not reliable on whatsapp-web.js), reject calls and per-session auto-reject (Baileys only)                                                            |
 | Channels/Newsletter | ✅     | WhatsApp Channels support                                                                                                                                                    |
 | Labels Management   | ✅     | Organize chats with labels                                                                                                                                                   |
 | Proxy Support       | ✅     | Per-session proxy configuration                                                                                                                                              |
@@ -409,9 +409,7 @@ Add a `filters` object to make the webhook fire only when **all** conditions mat
 }
 ```
 
-Available fields: `sender` · `recipient` · `body` · `type` · `mentions` · `fromMe` · `hasMedia` ·
-`isGroup`. A webhook with no filters behaves exactly as before. See the
-[API specification](./docs/06-api-specification.md) for the full schema.
+Available fields: `sender` · `recipient` · `chatId` · `body` · `type` · `mentions` · `fromMe` · `hasMedia` · `isGroup` · `kind`. Use `chatId` to allowlist specific groups or DMs (e.g. `{ "field": "chatId", "operator": "is", "value": ["120…@g.us"] }`). A webhook with no filters behaves exactly as before. See the [API specification](./docs/06-api-specification.md) for the full schema.
 
 ---
 

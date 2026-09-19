@@ -19,7 +19,7 @@ import type { Session, Chat, ChatMessage } from '../services/api';
 import type { installJsdomGlobals as installJsdomGlobalsFn } from '../test-helpers/jsdom.ts';
 // socket.io-client resolves to a double under this runner (see vite-shim-hooks.mjs), which is what
 // lets a test deliver a server frame to the page's realtime handlers.
-import { lastSocket, resetSocketDouble } from '../test-helpers/socket-io-double.ts';
+import { holdConnect, lastSocket, resetSocketDouble } from '../test-helpers/socket-io-double.ts';
 
 // ── Fixtures + fetch stub ────────────────────────────────────────────────────
 
@@ -451,6 +451,36 @@ test('status compose modal posts a text status with the baileys recipient allow-
   });
 });
 
+test('Refresh on a feed that never connected refetches the open thread once the socket is back', async () => {
+  const { screen, fireEvent, within, waitFor, act } = rtl;
+  resetFetchCalls();
+  holdConnect();
+  const { container } = renderChats();
+
+  await screen.findByText('Main (15551234567)');
+  fireEvent.click(await screen.findByText('Alice'));
+  await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
+  const threadReads = (): number =>
+    fetchCalls.filter(c => c.method === 'GET' && c.path.startsWith(`/api/sessions/${SESSION.id}/messages?`)).length;
+  const readsBeforeRetry = threadReads();
+
+  // A rejected handshake delivers its connect and the server's close in one batch, so this socket
+  // never renders as connected, and the thread misses whatever arrives while the banner is up.
+  const rejected = lastSocket();
+  assert.ok(rejected, 'expected the page to have opened a socket');
+  act(() => {
+    rejected.receive('connect');
+    rejected.receive('disconnect', 'io server disconnect');
+  });
+  const banner = await screen.findByRole('alert');
+  fireEvent.click(within(banner).getByRole('button', { name: 'Refresh' }));
+  const redialed = lastSocket();
+  assert.ok(redialed && redialed !== rejected, 'expected Refresh to open a fresh socket');
+  act(() => redialed.receive('connect'));
+
+  await waitFor(() => assert.equal(threadReads(), readsBeforeRetry + 1));
+});
+
 test('a typed draft survives closing and reopening the room', async () => {
   const { screen, fireEvent, within } = rtl;
   resetFetchCalls();
@@ -472,6 +502,30 @@ test('a typed draft survives closing and reopening the room', async () => {
   await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
   const input = screen.getByPlaceholderText('Type a message...') as HTMLInputElement;
   assert.equal(input.value, 'draft survives');
+});
+
+test('Escape closes the open room, and is left alone while a dialog owns it', async () => {
+  const { screen, fireEvent, within, waitFor } = rtl;
+  resetFetchCalls();
+  const { container } = renderChats();
+
+  await screen.findByText('Main (15551234567)');
+  fireEvent.click(await screen.findByText('Alice'));
+  await within(container.querySelector('.room-messages') as HTMLElement).findByText('hello from alice');
+
+  // A modal owns Escape while it is open: the room must survive it, or closing a dialog would also
+  // throw away the conversation behind it.
+  const dialog = document.createElement('div');
+  dialog.setAttribute('role', 'dialog');
+  document.body.appendChild(dialog);
+  fireEvent.keyDown(document, { key: 'Escape' });
+  assert.ok(screen.queryByRole('button', { name: 'Back' }), 'Escape closed the room while a dialog was open');
+
+  dialog.remove();
+  fireEvent.keyDown(document, { key: 'Escape' });
+  await waitFor(() =>
+    assert.equal(screen.queryByRole('button', { name: 'Back' }), null, 'Escape did not close the room'),
+  );
 });
 
 // Stage a file in the open room and wait for the preview banner. A non-image type is used on

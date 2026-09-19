@@ -210,8 +210,9 @@ export class MessageSendService {
    * Resolve a stored template, render its body (with optional header/footer
    * flattened using newlines) using the supplied variables, and delegate to the
    * existing {@link sendText} path so plugin hooks, persistence, and status
-   * tracking are reused. Throws NotFoundException when the template cannot be
-   * resolved by id or name.
+   * tracking are reused. Throws NotFoundException when the identifier matches
+   * nothing, BadRequestException when neither templateId nor templateName is
+   * given.
    *
    * The FINAL rendered text is capped at template.renderMaxChars (default 64 KiB): caller-supplied
    * variables can inflate a small template unboundedly, so an over-cap render is rejected with a
@@ -511,6 +512,41 @@ export class MessageSendService {
         : await engine.replyToMessage(finalDto.chatId, finalDto.quotedMessageId, finalDto.text);
     } catch (error) {
       return this.failSend(sessionId, 'reply', message, finalDto, error);
+    }
+    return this.persistSentState(message, result);
+  }
+
+  async clickButton(
+    sessionId: string,
+    dto: { chatId: string; messageId: string; buttonId: string; text?: string },
+  ): Promise<MessageResponseDto> {
+    const finalDto = await this.applySendingGate(sessionId, 'click-button', dto);
+    const engine = this.getEngine(sessionId);
+
+    const message = await this.saveOutgoingMessage(sessionId, {
+      chatId: finalDto.chatId,
+      body: finalDto.text || finalDto.buttonId,
+      type: 'text',
+      metadata: {
+        quotedMessage: { id: finalDto.messageId, body: '' },
+        button: { id: finalDto.buttonId, text: finalDto.text },
+      },
+    });
+
+    let result: MessageResult;
+    try {
+      result = await engine.clickButton(finalDto.chatId, finalDto.messageId, finalDto.buttonId, finalDto.text);
+    } catch (error) {
+      return this.failSend(sessionId, 'click-button', message, finalDto, error);
+    }
+    // The engine resolves the visible label from the stored prompt when the caller omitted `text`.
+    // Persist that label (not the raw buttonId) so the row agrees with what went on the wire.
+    if (result.body) {
+      message.body = result.body;
+      message.metadata = {
+        ...(message.metadata ?? {}),
+        button: { id: finalDto.buttonId, text: result.body },
+      };
     }
     return this.persistSentState(message, result);
   }

@@ -15,6 +15,8 @@ import {
 import {
   buildIncomingMessageFromBaileys,
   extractBaileysBody,
+  extractBaileysButtonReply,
+  extractBaileysButtons,
   extractBaileysCommerce,
   extractBaileysContext,
   extractBaileysLocation,
@@ -33,10 +35,12 @@ import {
   isMediaDownloadEnabled,
   withInboundDownloadTimeout,
 } from './inbound-media-cap';
+import type { Dispatcher } from 'undici';
 import type { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
 import { type createLogger } from '../../common/services/logger.service';
 import { createSilentLogger } from './baileys-logger';
 import { BAILEYS_QUERY_BUDGET_MS, withQueryDeadline } from './baileys-query-deadline';
+import { parseWaId, userPart } from '../identity/wa-id';
 
 /**
  * Inbound event handling extracted from BaileysAdapter: the socket event handlers
@@ -76,6 +80,18 @@ const PRESENCE_STATES: ReadonlySet<PresenceState> = new Set<PresenceState>([
   'paused',
 ]);
 
+/**
+ * Top-level Message keys that carry no user content. A live message made only of these is dropped;
+ * messageContextInfo rides along on real content too, so on its own it is not enough to drop.
+ */
+const PROTOCOL_NOISE_KEYS: ReadonlySet<string> = new Set([
+  'senderKeyDistributionMessage',
+  'fastRatchetKeySenderKeyDistributionMessage',
+  'messageContextInfo',
+  'messageHistoryNotice',
+  'messageHistoryBundle',
+]);
+
 export interface BaileysEventsHost {
   /** Live socket handle for media re-upload requests (inbound media download). */
   getSocket(): WASocket;
@@ -86,8 +102,8 @@ export interface BaileysEventsHost {
   normalizedSelfJid(): string;
   /** Lazily loaded @whiskeysockets/baileys module (ESM-only; loaded on first connect, not at boot). */
   loadLib(): Promise<typeof BaileysLib>;
-  /** Unix-seconds timestamp of the last 'open' connection.update — the live-vs-history discriminator. */
-  readonly connectedAt: number;
+  /** Session proxy dispatcher for the media download; undefined = direct. */
+  getFetchDispatcher(): Dispatcher | undefined;
   /** The adapter's inbound media download gate (shared so the bound holds across all inbound paths). */
   readonly inboundLimiter: ConcurrencyLimiter;
   /** Learn any lid->pn pair a message key carries (also writes through to the persistent table). */
@@ -98,6 +114,13 @@ export interface BaileysEventsHost {
   recordMessageEdit(chatId: string, messageId: string, text: string): void;
   /** Persist an inbound message to the store; undefined when no store is configured. */
   putStoredMessage(msg: WAMessage): Promise<void> | undefined;
+  /**
+   * True exactly once for the id of a message this session sent through the API, whose library echo
+   * is arriving; false for anything the session did not send (see OwnSendRegistry).
+   */
+  consumeOwnSend(id: string | null | undefined): boolean;
+  /** A message this session already delivered or sent, from the persistent store; undefined without a store. */
+  getStoredMessage(messageId: string): Promise<WAMessage | null> | undefined;
   /** The currently-registered onMessage callback, if any (assigned at initialize()). */
   getOnMessage(): EngineEventCallbacks['onMessage'];
   /** The currently-registered onMessageCreate callback, if any (assigned at initialize()). */
@@ -140,24 +163,25 @@ export class BaileysEvents {
       if (!msg.message || !msg.key?.remoteJid) {
         continue; // protocol/empty messages carry no neutral content
       }
-      if (event.type !== 'notify') {
-        // Baileys echoes back OUR OWN just-sent messages through this same 'append' path too, and
-        // sendContent() already emits onMessageCreate for those via emitOwnSendEcho() — always
-        // exclude fromMe here (unconditionally, regardless of timestamp) so that echo doesn't fire
-        // onMessageCreate a second time.
-        if (msg.key.fromMe === true) {
-          continue;
-        }
-        // For everyone else: gate on the message's own timestamp vs. this connection's open time,
-        // not the upsert batch's `type` tag. `type: 'append'` usually means real history-sync
-        // backfill, but Baileys can also tag a genuinely new CUSTOMER message 'append' when it
-        // arrives in the same window as a reconnect's state-sync handshake — a strict
-        // `type !== 'notify'` filter silently drops that message (observed as "the first message
-        // after a reconnect gets ignored"). A message sent AFTER this connection opened is live
-        // regardless of which tag the batch carries; true backfill always predates it.
-        if (toUnixSeconds(msg.messageTimestamp) < this.host.connectedAt) {
-          continue;
-        }
+      // Baileys echoes every message this session sends through the API back through this same
+      // path, tagged 'append', and sendContent() already emits onMessageCreate for those via
+      // emitOwnSendEcho(). WhatsApp replays what the account typed on its phone while the gateway
+      // was down through the same tag (`node.attrs.offline ? 'append' : 'notify'` in Baileys'
+      // messages-recv), and those the session has never seen. Nothing on the batch tells the two
+      // apart except the id, which the adapter recorded when it sent: skip only what we sent, so
+      // the echo cannot fire onMessageCreate twice and the phone's outage-window sends still land
+      // as outgoing messages. Real history never reaches this handler; it arrives on
+      // messaging-history.set and is captured dispatch-free. A re-delivered inbound message is
+      // harmless, since the insert oracle dedupes on the WhatsApp message id and does not dispatch
+      // a stored message again. That oracle does NOT gate dispatch on the own-send path, which is
+      // why the echo has to be caught here, and why a fromMe message the store already holds is
+      // dropped in processInboundMessage before it can be reported a second time.
+      if (msg.key.fromMe === true && this.host.consumeOwnSend(msg.key.id)) {
+        this.host.logger.debug('Skipping the echo of a message this session sent', {
+          msgId: msg.key.id ?? 'unknown',
+          type: event.type,
+        });
+        continue;
       }
       // Throttle through the limiter so a burst of media messages can't run unbounded parallel
       // downloads (each a full decrypted buffer in heap). Ordering stays correct — the message store
@@ -304,18 +328,41 @@ export class BaileysEvents {
       }
 
       // --- contentless protocol traffic: don't emit onMessage ---
-      // Baileys' getContentType only matches keys named `conversation` or containing `Message`, and
-      // excludes senderKeyDistributionMessage BY NAME, so a sender-key distribution (Signal traffic
-      // every group participant emits on first write or key rotation), a messageHistoryNotice or any
-      // other suffix-less proto resolves here as contentType `undefined`, never as its own key.
-      // These carry no user content yet reached consumers as bodyless `unknown` message.received
-      // events (#1568). mapHistoryMessage drops exactly this set via its `!contentType` guard, and
-      // emitOwnSendEcho has always skipped undefined the same way, so live inbound must agree.
-      if (!contentType || contentType === 'senderKeyDistributionMessage') {
+      // A sender-key distribution (Signal traffic every group participant emits on first write or key
+      // rotation) or a history-sync notice carries no user content, yet reached consumers as a bodyless
+      // `unknown` message.received (#1568). Drop only a message made entirely of those keys. Anything
+      // else without a resolvable content type (a call log, a type newer than the bundled proto, which
+      // decodes to a lone messageContextInfo) still flows on as `unknown`, as it always has.
+      //
+      // Known limit: a type newer than the bundled proto that arrives in the same stanza as its sender's
+      // key distribution is dropped too. Baileys merges the stanza's decrypted parts into one message
+      // and protobuf decoding discards unknown fields, so it reads { senderKeyDistributionMessage,
+      // messageContextInfo }: nothing records which part the context info came from or that a field was
+      // skipped, and a messageContextInfo field such as messageSecret is not proof of content either,
+      // since the sending client decides what it carries. It stops once the proto knows the type.
+      const keys = Object.keys(normalizedRoot ?? {});
+      if (keys.every(k => PROTOCOL_NOISE_KEYS.has(k)) && keys.some(k => k !== 'messageContextInfo')) {
+        this.host.logger.debug('Dropping contentless protocol message', {
+          action: 'baileys_drop_protocol_noise',
+          msgId: msg.key.id,
+          remoteJid,
+          keys,
+        });
         return;
       }
 
       // --- Normal message: enrich + emit ---
+      // A fromMe message the store already holds was delivered or sent before: WhatsApp re-delivers
+      // a node whose ack was lost on a drop, and the own-send path downstream dispatches message.sent
+      // whatever its insert did, so the second copy has to stop here. The store is written by both
+      // the inbound path below and the send path, and it survives a restart, which the registry
+      // consulted in handleMessagesUpsert does not.
+      if (msg.key.fromMe === true && msg.key.id && (await this.host.getStoredMessage(msg.key.id))) {
+        this.host.logger.debug('Skipping a re-delivered message this session already recorded', {
+          msgId: msg.key.id,
+        });
+        return;
+      }
       const incoming = await this.mapMessage(msg, contentType, { skipMediaDownload: opts?.skipMedia });
       if (msg.key.fromMe === true) {
         this.host.getOnMessageCreate()?.(incoming);
@@ -377,6 +424,50 @@ export class BaileysEvents {
       payload.actorId = this.host.toNeutralJid(actor);
     }
     this.host.getOnGroupEvent()?.(payload);
+  }
+
+  /**
+   * Baileys `groups.upsert`: this session was added to or joined a group. Baileys turns the w:gp2
+   * `create` notification into this event and a content-less GROUP_CREATE stub, never into
+   * `group-participants.update`. It drops the notification's type and reason, so a new group, an add
+   * to an existing group and an invite-link join all arrive alike. Each entry is reported as a join of
+   * this session's own id through the participants path, which owns the id guard, the authorPn
+   * preference and the receipt timestamp. The entry lists the whole group, so members added with the
+   * session are not reported.
+   */
+  handleGroupsUpsert(
+    groups: Array<{ id?: string; author?: string; authorPn?: string; owner?: string; ownerPn?: string }>,
+  ): void {
+    const selfJid = this.host.normalizedSelfJid();
+    if (!selfJid) {
+      return; // no own id to report as the joining participant
+    }
+    const phone = userPart(selfJid);
+    const lid = this.host.getSocketOrNull()?.user?.lid;
+    const lidUser = lid ? userPart(lid) : undefined;
+    const isSelf = (jid: string | undefined): boolean => {
+      if (!jid) return false;
+      const { kind, userPart: user } = parseWaId(jid);
+      return kind === 'user' ? user === phone : kind === 'lid' && user === lidUser;
+    };
+    for (const group of Array.isArray(groups) ? groups : []) {
+      // Live, whatsapp-web.js emits no group.join when the session created the group, so that entry is
+      // skipped. The acting participant alone does not identify it: an invite-link join may name the
+      // joining session there, so the session must also be the group's owner.
+      if (
+        !group ||
+        ((isSelf(group.authorPn) || isSelf(group.author)) && (isSelf(group.ownerPn) || isSelf(group.owner)))
+      ) {
+        continue;
+      }
+      this.handleGroupParticipantsUpdate({
+        id: group.id,
+        author: group.author,
+        authorPn: group.authorPn,
+        action: 'add',
+        participants: [selfJid],
+      });
+    }
   }
 
   /**
@@ -728,24 +819,37 @@ export class BaileysEvents {
     msg: WAMessage,
     maxBytes: number,
   ): Promise<Buffer | { overflowBytes: number } | null> {
+    // A proxied session must not fetch media around its proxy (#859). Baileys reads the dispatcher
+    // from the nested `options`; a top-level one is ignored.
+    const dispatcher = this.host.getFetchDispatcher();
     // Hold the stream handle in the outer scope so the timeout can destroy it. A genuine
     // download/read error still rejects (propagating to the caller's catch as before).
     let stream: (AsyncIterable<Buffer> & { destroy?: () => void }) | undefined;
+    // The timeout can fire before the stream exists (an expired-media re-upload wait, a slow response):
+    // the abandoned download must then stop on its own instead of buffering outside the limiter.
+    let timedOut = false;
     const download = (async (): Promise<Buffer | { overflowBytes: number }> => {
       const b = await this.host.loadLib();
       stream = (await b.downloadMediaMessage(
         msg,
         'stream',
-        {},
+        dispatcher ? { options: { dispatcher } as RequestInit } : {},
         {
           logger: createSilentLogger(),
           reuploadRequest: this.host.getSocket().updateMediaMessage,
         },
       )) as AsyncIterable<Buffer> & { destroy?: () => void };
+      if (timedOut) {
+        stream.destroy?.();
+        return Buffer.alloc(0);
+      }
 
       const chunks: Buffer[] = [];
       let total = 0;
       for await (const chunk of stream) {
+        if (timedOut) {
+          break;
+        }
         total += chunk.length;
         if (total > maxBytes) {
           stream.destroy?.();
@@ -759,7 +863,10 @@ export class BaileysEvents {
     // A slow/trickling sender never trips the byte cap, so without a deadline it pins a concurrency
     // slot (and, on Baileys, the whole inbound handler) indefinitely. On timeout, destroy the stream
     // and treat it as no usable media.
-    return withInboundDownloadTimeout(download, inboundMediaTimeoutMs(), () => stream?.destroy?.());
+    return withInboundDownloadTimeout(download, inboundMediaTimeoutMs(), () => {
+      timedOut = true;
+      stream?.destroy?.();
+    });
   }
 
   /**
@@ -901,6 +1008,10 @@ export class BaileysEvents {
     // Commerce ids (order token, product id): the generic path sees an empty body and drops them,
     // and they are the only handle a caller has on the order or the product.
     const commerce = extractBaileysCommerce(normalized, contentType);
+    // Button / list / native-flow reply ids: body carries the visible label; this is the stable id.
+    const button = extractBaileysButtonReply(normalized, contentType);
+    // Prompt choices (Sim/Não, list rows, …) offered by a business interactive message.
+    const buttons = extractBaileysButtons(normalized, contentType);
 
     return buildIncomingMessageFromBaileys(
       {
@@ -919,6 +1030,8 @@ export class BaileysEvents {
         quotedMessage: context.quotedMessage,
         order: commerce.order,
         product: commerce.product,
+        button,
+        buttons,
         isCatalogShare: isBaileysCatalogShare(normalized),
         ephemeralDuration: context.ephemeralDuration,
         mentionedJids: context.mentionedJids,

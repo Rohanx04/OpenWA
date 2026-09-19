@@ -67,6 +67,36 @@ describe('redactSensitiveHeaders (persisted ingress payloads)', () => {
     expect(recorded.payload.headers.authorization).toBe('[redacted]');
     expect(recorded.payload.headers['x-delivery']).toBe('d1');
   });
+
+  it("redacts a shared-secret route's declared credential header in the persisted and enqueued payload", async () => {
+    const d = deps({
+      manifestRoute: jest.fn().mockReturnValue({
+        route: 'chatwoot',
+        mode: 'async',
+        verify: 'core',
+        maxBodyBytes: 1024,
+        signature: { scheme: 'shared-secret', header: 'X-Provider-Token' },
+        dedupHeader: 'x-delivery',
+      }),
+    });
+    const res = await new IngressService(d).handle({
+      pluginId: 'chatwoot',
+      instanceId: 'acct1',
+      route: 'chatwoot',
+      method: 'POST',
+      headers: { 'x-delivery': 'd1', 'x-provider-token': 's' },
+      query: {},
+      rawBody: '{}',
+    });
+    expect(res.status).toBe(202);
+    const recorded = (
+      d.events.recordOrSkip.mock.calls as unknown as [[{ payload: { headers: Record<string, string> } }]]
+    )[0][0];
+    expect(recorded.payload.headers['x-provider-token']).toBe('[redacted]');
+    expect(recorded.payload.headers['x-delivery']).toBe('d1');
+    const job = (d.enqueue.mock.calls as unknown as [[{ payload: { headers: Record<string, string> } }]])[0][0];
+    expect(job.payload.headers['x-provider-token']).toBe('[redacted]');
+  });
 });
 
 describe('IngressService.handle', () => {
@@ -133,12 +163,13 @@ describe('IngressService.handle', () => {
     expect(d.enqueue).toHaveBeenCalledWith(expect.objectContaining({ deliveryId: webhookId }), webhookId);
   });
 
-  it('short-circuits a duplicate delivery with 200 and no enqueue', async () => {
+  it('short-circuits a duplicate delivery with the route ack and no enqueue', async () => {
     const d = deps({ events: { recordOrSkip: jest.fn().mockResolvedValue(false) } });
     const svc = new IngressService(d);
     const res = await svc.handle(req);
     expect(d.enqueue).not.toHaveBeenCalled();
-    expect(res.status).toBe(200);
+    // No declared `response`, so this is the default ack: byte-identical to a first delivery's.
+    expect(res).toEqual({ status: 202, body: 'accepted' });
   });
 
   it('rejects an oversized body with 413 before any dedup or enqueue', async () => {
@@ -537,6 +568,9 @@ describe('IngressService.handle — response contract', () => {
     });
     const res = await new IngressService(d).handle(baseReq);
     expect(res.status).toBe(503);
+    // The provider retries a 503 only when it carries Retry-After, so re-packing the rejection into
+    // {status, body} silently turned a retryable rejection into a lost delivery.
+    expect(res.headers).toEqual({ 'Retry-After': '5' });
     expect(d.events.recordOrSkip).not.toHaveBeenCalled();
     expect(d.enqueue).not.toHaveBeenCalled();
     expect(d.log).toHaveBeenCalledWith(
@@ -629,22 +663,30 @@ describe('IngressService.handle — response contract', () => {
     );
   });
 
-  it('keeps the duplicate path as 200 "duplicate" regardless of a declared ack', async () => {
-    const d = depsWith({
+  it('answers a re-delivery with the same ack as the first delivery', async () => {
+    // The whole point of dedup is that a retry is indistinguishable. A route declaring a 204 used to
+    // answer a bare 204 first and a 200 text/plain 'duplicate' on the retry, which a provider that
+    // validates the ack rejects on the exact path dedup exists for.
+    const route = {
+      route: 'send-sms',
+      mode: 'async',
+      verify: 'core',
+      maxBodyBytes: 1024,
+      signature: { scheme: 'none' },
+      dedupHeader: 'x-delivery',
+      response: { ack: { status: 204, headers: { 'content-type': 'application/json' } } },
+    };
+    const first = await new IngressService(depsWith({ manifestRoute: jest.fn().mockReturnValue(route) })).handle(
+      baseReq,
+    );
+    const dup = depsWith({
       events: { recordOrSkip: jest.fn().mockResolvedValue(false) },
-      manifestRoute: jest.fn().mockReturnValue({
-        route: 'send-sms',
-        mode: 'async',
-        verify: 'core',
-        maxBodyBytes: 1024,
-        signature: { scheme: 'none' },
-        dedupHeader: 'x-delivery',
-        response: { ack: { status: 200, body: '{"ok":true}' } },
-      }),
+      manifestRoute: jest.fn().mockReturnValue(route),
     });
-    const res = await new IngressService(d).handle(baseReq);
-    expect(res.status).toBe(200);
-    expect(res.body).toBe('duplicate');
-    expect(d.enqueue).not.toHaveBeenCalled();
+    const retry = await new IngressService(dup).handle(baseReq);
+
+    expect(first).toEqual({ status: 204, headers: { 'content-type': 'application/json' } });
+    expect(retry).toEqual(first);
+    expect(dup.enqueue).not.toHaveBeenCalled();
   });
 });
