@@ -12,11 +12,21 @@ const linkifyOptions = {
   target: '_blank',
   rel: 'noopener noreferrer',
   defaultProtocol: 'https',
-  ignoreTags: ['code', 'pre'],
+  // 'bdi' isolates a resolved @mention (see the 'mention' case below) from Linkify: a push name
+  // is attacker-controlled text, and linkify-react auto-links a bare word with no scheme (e.g.
+  // "localhost"), so character-stripping the name is not enough — keeping it out of Linkify's own
+  // tree walk is what stops it. 'bdi' also isolates a right-to-left name's directionality.
+  ignoreTags: ['code', 'pre', 'bdi'],
   attributes: {
     onClick: (e: React.MouseEvent) => e.stopPropagation(),
   },
 };
+
+/**
+ * Longest body handed to Linkify. Its scan of an unbroken run of domain-like characters grows with
+ * the square of the run, so a longer body renders without links instead of freezing the thread.
+ */
+const MAX_LINKED_LENGTH = 4096;
 
 function renderNode(node: MessageNode, key: number): ReactNode {
   switch (node.type) {
@@ -36,15 +46,16 @@ function renderNode(node: MessageNode, key: number): ReactNode {
           <code>{node.value}</code>
         </pre>
       );
+    case 'mention':
+      return <bdi key={key}>{node.value}</bdi>;
   }
 }
 
 function MessageBodyBase({ text, className, enableLinks = true }: Props) {
   const nodes = parseMessageBody(text);
   const rendered = <>{nodes.map(renderNode)}</>;
-  return (
-    <div className={className}>{enableLinks ? <Linkify options={linkifyOptions}>{rendered}</Linkify> : rendered}</div>
-  );
+  const linked = enableLinks && text.length <= MAX_LINKED_LENGTH;
+  return <div className={className}>{linked ? <Linkify options={linkifyOptions}>{rendered}</Linkify> : rendered}</div>;
 }
 
 export default memo(MessageBodyBase);

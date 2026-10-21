@@ -1,13 +1,16 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsInt, IsNotEmpty, IsString, Matches, Min, ValidateIf } from 'class-validator';
+import { IsInt, IsNotEmpty, IsString, Matches, Min, ValidateIf, MaxLength } from 'class-validator';
+import { CHAT_ID_MAX_LENGTH } from '../../message/dto/send-message.dto';
 
 export class MuteChatDto {
   @ApiProperty({
+    maxLength: CHAT_ID_MAX_LENGTH,
     description: "Chat ID in the active engine's native format (e.g. 1234567890-123@g.us on whatsapp-web.js)",
     example: '1234567890-123@g.us',
   })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   // Engine-neutral structural check (localpart@host, no whitespace) so a different engine's JID scheme
   // (e.g. Baileys `…@s.whatsapp.net`) is accepted too; the adapter validates/normalises for its engine.
   @Matches(/^[^\s@]+@[^\s@]+$/, {
@@ -23,8 +26,9 @@ export class MuteChatDto {
       'Milliseconds, not seconds: a seconds-scale value is an instant in 1970, so the mute expires ' +
       'immediately while the request still answers 200.',
     example: 1800000000000,
-    type: Number,
+    type: 'integer',
     nullable: true,
+    minimum: 1,
   })
   // `null` is a real instruction (unmute), so it skips the numeric checks rather than failing them.
   // A missing field is NOT null, so it still falls through to @IsInt and is rejected with a 400.

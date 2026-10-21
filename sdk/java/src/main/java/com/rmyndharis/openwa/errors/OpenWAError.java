@@ -5,4 +5,8 @@ public class OpenWAError extends RuntimeException {
     public OpenWAError(String message) {
         super(message);
     }
+
+    public OpenWAError(String message, Throwable cause) {
+        super(message, cause);
+    }
 }

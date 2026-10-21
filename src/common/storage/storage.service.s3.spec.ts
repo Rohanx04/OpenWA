@@ -3,11 +3,6 @@ import * as os from 'os';
 import * as path from 'path';
 import { ConfigService } from '@nestjs/config';
 
-// `archiver` v8 ships ESM-only, which ts-jest can't parse transitively. These tests never touch the
-// export path (archiver's only consumer), so a lightweight stub suffices — same approach as the local
-// spec. Must run before importing StorageService.
-jest.mock('archiver', () => ({ default: jest.fn() }));
-
 // Mock the AWS SDK so no real network call is made: HeadBucket resolves (bucket reachable), and the
 // S3Client constructor is a jest.fn so each test can assert on the exact config it received.
 jest.mock('@aws-sdk/client-s3', () => {
@@ -26,7 +21,7 @@ jest.mock('@aws-sdk/client-s3', () => {
 
 import { S3Client } from '@aws-sdk/client-s3';
 import { LoggerService } from '../services/logger.service';
-import { StorageService } from './storage.service';
+import { S3_CONNECT_TIMEOUT_MS, S3_SOCKET_TIMEOUT_MS, StorageService } from './storage.service';
 
 // The subset of the AWS SDK's S3Client config this service sets — used purely to type the mock's call
 // args so the assertions below are type-checked instead of `any`.
@@ -35,6 +30,7 @@ type S3ClientConfig = {
   region: string;
   forcePathStyle?: boolean;
   credentials: { accessKeyId: string; secretAccessKey: string };
+  requestHandler?: { connectionTimeout?: number; socketTimeout?: number; requestTimeout?: number };
 };
 
 const mockedS3Client = S3Client as unknown as jest.Mock<unknown, [S3ClientConfig]>;
@@ -51,6 +47,9 @@ const ENV_KEYS = [
 
 // initializeS3Bucket() runs as a fire-and-forget promise; let its HeadBucket settle before asserting.
 const flush = (): Promise<void> => new Promise(resolve => setImmediate(resolve));
+
+/** Whether the service currently routes to the bucket (the flag the boot probe and the re-probe set). */
+const s3AvailableOf = (svc: StorageService): boolean => (svc as unknown as { s3Available: boolean }).s3Available;
 
 /** The config passed to the most recent S3Client construction (throws if it was never constructed). */
 function lastConfig(): S3ClientConfig {
@@ -101,7 +100,7 @@ describe('StorageService (s3) client init', () => {
     expect(cfg.forcePathStyle).toBeFalsy(); // AWS uses virtual-hosted addressing
     expect(cfg.region).toBe('ap-southeast-1');
     expect(cfg.credentials).toEqual({ accessKeyId: 'AKIAEXAMPLE', secretAccessKey: 'shhh-secret' });
-    expect(svc.isS3Available()).toBe(true);
+    expect(s3AvailableOf(svc)).toBe(true);
   });
 
   it('keeps endpoint + forcePathStyle for an S3-compatible store (MinIO)', async () => {
@@ -115,7 +114,19 @@ describe('StorageService (s3) client init', () => {
     const cfg = lastConfig();
     expect(cfg.endpoint).toBe('http://minio:9000');
     expect(cfg.forcePathStyle).toBe(true);
-    expect(svc.isS3Available()).toBe(true);
+    expect(s3AvailableOf(svc)).toBe(true);
+  });
+
+  // A store that accepts the connection and never answers would otherwise leave every request (the
+  // availability probe, media reads and archive writes) pending forever.
+  it('bounds every request with a connect and an idle-socket timeout', async () => {
+    new StorageService(makeConfig({ accessKeyId: 'minio', secretAccessKey: 'minio123', region: 'us-east-1' }));
+    await flush();
+
+    expect(lastConfig().requestHandler).toEqual({
+      connectionTimeout: S3_CONNECT_TIMEOUT_MS,
+      socketTimeout: S3_SOCKET_TIMEOUT_MS,
+    });
   });
 
   it('falls back to local (no client) when credentials are missing, and says so', async () => {
@@ -127,7 +138,7 @@ describe('StorageService (s3) client init', () => {
     await flush();
 
     expect(mockedS3Client).not.toHaveBeenCalled();
-    expect(svc.isS3Available()).toBe(false);
+    expect(s3AvailableOf(svc)).toBe(false);
     expect(svc.getCurrentStorageType()).toBe('s3');
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('S3_ACCESS_KEY_ID'));
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('S3_SECRET_ACCESS_KEY'));
@@ -156,6 +167,6 @@ describe('StorageService (s3) client init', () => {
     await flush();
 
     expect(lastConfig().credentials).toEqual({ accessKeyId: 'ENVKEY', secretAccessKey: 'ENVSECRET' });
-    expect(svc.isS3Available()).toBe(true);
+    expect(s3AvailableOf(svc)).toBe(true);
   });
 });

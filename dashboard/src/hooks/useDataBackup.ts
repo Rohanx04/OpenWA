@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { shouldOfferStopOrphansRetry } from '../utils/importRefusal';
+import { keepsSameKey } from '../utils/authLifecycle';
 import { useTranslation } from 'react-i18next';
 import { infraApi } from '../services/api';
 import { useToast } from './useToast';
@@ -24,8 +25,11 @@ export function useDataBackup(): DataBackup {
   // database) so the data can be re-imported into the new one — switching otherwise starts empty (#488).
   const exportBackup = async () => {
     setMigrating(true);
+    const sameKey = keepsSameKey();
     try {
       const dump = await infraApi.exportData();
+      // The dump holds every integration instance's secrets in plaintext: not for a signed-out page.
+      if (!sameKey()) return;
       const blob = new Blob([JSON.stringify(dump, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');

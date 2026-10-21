@@ -218,6 +218,21 @@ describe('SessionProxyInterceptor', () => {
       expect(JSON.parse(String(sentBody))).toEqual({ servedBy: 'the-owner' });
     });
 
+    it('labels a re-serialised form body as JSON, so the owner parses what was sent', async () => {
+      const req = request({
+        method: 'POST',
+        originalUrl: `/api/sessions/${SID}/messages/send-text`,
+        headers: { 'x-api-key': 'k-123', 'content-type': 'application/x-www-form-urlencoded' },
+        body: { chatId: '628@c.us', text: 'hi & bye' },
+      });
+      const { interceptor, context, next } = build({ req, row: row({ nodeUrl: serverUrl }) });
+
+      await interceptor.intercept(context, next);
+
+      expect(seen[0].headers['content-type']).toBe('application/json');
+      expect(JSON.parse(seen[0].body)).toEqual({ chatId: '628@c.us', text: 'hi & bye' });
+    });
+
     it('a GET carries no body', async () => {
       const { interceptor, context, next } = build({ req: request(), row: row({ nodeUrl: serverUrl }) });
 
@@ -227,9 +242,6 @@ describe('SessionProxyInterceptor', () => {
       expect(seen[0].body).toBe('');
     });
 
-    // Without the chain the owner sees every forwarded call as coming from THIS node — an
-    // allowedIps-restricted key 401s on every forwarded request, and the per-IP throttler pools
-    // all forwarded traffic into one bucket.
     // End-to-end proof of the absolute-form vector: a raw HTTP request whose target names another
     // origin must still be forwarded to the OWNER, never to the origin the caller chose — otherwise
     // the caller receives the attacker origin's response with their own API key already spent on it.
@@ -257,6 +269,9 @@ describe('SessionProxyInterceptor', () => {
       }
     });
 
+    // Without the chain the owner sees every forwarded call as coming from THIS node: an
+    // allowedIps-restricted key is refused with 403 on every forwarded request, and the per-IP
+    // throttler pools all forwarded traffic into one bucket.
     it('appends the observed peer to x-forwarded-for so the owner can resolve the real client', async () => {
       const direct = build({
         req: request({ socket: { remoteAddress: '::ffff:203.0.113.7' } }),
@@ -274,6 +289,42 @@ describe('SessionProxyInterceptor', () => {
       });
       await chained.interceptor.intercept(chained.context, chained.next);
       expect(seen[1].headers['x-forwarded-for']).toBe('198.51.100.9, 10.0.0.4');
+    });
+
+    // The owner claims the Idempotency-Key, not this hop: a send landing on a non-owner node is
+    // forwarded before the route's own interceptor runs. Without the header the owner would run the
+    // send unclaimed, and a client retry after a timeout would send the message twice.
+    it('forwards the Idempotency-Key to the owner', async () => {
+      const req = request({
+        method: 'POST',
+        originalUrl: `/api/sessions/${SID}/messages/send-text`,
+        headers: { 'x-api-key': 'k-123', 'content-type': 'application/json', 'idempotency-key': 'order-42' },
+        body: { chatId: '628@c.us', text: 'halo' },
+      });
+      const { interceptor, context, next } = build({ req, row: row({ nodeUrl: serverUrl }) });
+
+      await interceptor.intercept(context, next);
+
+      expect(seen[0].headers['idempotency-key']).toBe('order-42');
+    });
+
+    // Without it a client cannot tell an answer replayed from a stored key from a new send.
+    it('relays Idempotent-Replayed from the owner to the client', async () => {
+      const replaying = http.createServer((_req, res) => {
+        res.writeHead(201, { 'content-type': 'application/json', 'Idempotent-Replayed': 'true' });
+        res.end(JSON.stringify({ messageId: 'M1' }));
+      });
+      await new Promise<void>(resolve => replaying.listen(0, '127.0.0.1', resolve));
+      const url = `http://127.0.0.1:${(replaying.address() as AddressInfo).port}`;
+
+      try {
+        const { interceptor, context, next, res } = build({ row: row({ nodeUrl: url }) });
+        await interceptor.intercept(context, next);
+
+        expect(res.setHeader).toHaveBeenCalledWith('idempotent-replayed', 'true');
+      } finally {
+        await new Promise<void>(resolve => replaying.close(() => resolve()));
+      }
     });
 
     // A forwarded 429 comes from the OWNER's counters; without relaying its throttle headers the
@@ -438,5 +489,18 @@ describe('forwardTarget', () => {
 
   it('carries the owner base path when one is configured', () => {
     expect(forwardTarget('/api/sessions/s1', 'http://10.0.0.5:2785/')).toBe('http://10.0.0.5:2785/api/sessions/s1');
+    // An owner behind a path-prefixed reverse proxy: the prefix is where its API lives.
+    expect(forwardTarget('/api/sessions/s1?x=1', 'https://node-a.example.com/openwa/')).toBe(
+      'https://node-a.example.com/openwa/api/sessions/s1?x=1',
+    );
+    expect(forwardTarget('/api/sessions/s1', 'https://node-a.example.com/openwa')).toBe(
+      'https://node-a.example.com/openwa/api/sessions/s1',
+    );
+  });
+
+  it('keeps the owner origin and prefix for a network-path target under a prefixed base', () => {
+    const target = new URL(forwardTarget('http://attacker.tld//evil.host/x', 'https://node-a.example.com/openwa'));
+    expect(target.origin).toBe('https://node-a.example.com');
+    expect(target.pathname.startsWith('/openwa/')).toBe(true);
   });
 });

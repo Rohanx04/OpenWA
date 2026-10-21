@@ -1,5 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsString, IsOptional, MaxLength, IsUrl } from 'class-validator';
+import { IsOptional, IsString, IsUrl, Validate } from 'class-validator';
+import { MaxCodePoints } from '../../../common/validation/max-code-points';
+import { HasDecodableProxyCredentialsConstraint } from './has-decodable-proxy-credentials.validator';
 import type { Session } from '../entities/session.entity';
 
 export type SessionProxyType = 'http' | 'https' | 'socks4' | 'socks5';
@@ -53,14 +55,16 @@ export class UpdateSessionProxyDto {
     description:
       'Per-session egress proxy URL (http/https/socks4/socks5; credentialed form allowed). Send ' +
       '`null` to clear the proxy. Must be a real, reachable proxy — an unreachable value blocks the ' +
-      'WhatsApp WebSocket and session start times out (~30s).',
+      'WhatsApp WebSocket (no QR is delivered). On whatsapp-web.js the session start then times out ' +
+      '(~30s); on Baileys the start succeeds and the session keeps retrying the connection.',
     type: String,
     nullable: true,
+    maxLength: 255,
     example: 'http://user:pass@proxy.example.com:8080',
   })
   @IsOptional()
   @IsString()
-  @MaxLength(255)
+  @MaxCodePoints(255)
   @IsUrl(
     {
       protocols: ['http', 'https', 'socks4', 'socks5'],
@@ -70,6 +74,7 @@ export class UpdateSessionProxyDto {
     },
     { message: 'proxyUrl must be a valid http(s)/socks4/socks5 URL' },
   )
+  @Validate(HasDecodableProxyCredentialsConstraint)
   proxyUrl?: string | null;
 }
 

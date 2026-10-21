@@ -36,6 +36,10 @@ describe('isBlockedAddress', () => {
     ['192.168.1.1', 'RFC1918 192.168/16'],
     ['169.254.169.254', 'link-local / cloud metadata'],
     ['100.64.0.1', 'CGNAT 100.64/10'],
+    ['192.0.0.8', 'IETF protocol assignments 192.0.0.0/24'],
+    ['198.19.255.255', 'benchmarking 198.18.0.0/15, upper end'],
+    ['224.0.0.1', 'IPv4 multicast 224.0.0.0/4'],
+    ['255.255.255.255', 'reserved 240.0.0.0/4, broadcast'],
     ['0.0.0.0', 'unspecified'],
     ['::1', 'IPv6 loopback'],
     ['fc00::1', 'IPv6 ULA fc00::/7'],
@@ -55,6 +59,9 @@ describe('isBlockedAddress', () => {
     ['64:ff9b::a9fe:a9fe', 'NAT64 of cloud metadata 169.254.169.254'],
     ['64:ff9b::7f00:1', 'NAT64 of loopback 127.0.0.1'],
     ['64:ff9b::127.0.0.1', 'NAT64 of loopback (dotted tail)'],
+    ['64:ff9b:1::7f00:1', 'local-use NAT64 /96 of loopback 127.0.0.1'],
+    ['64:ff9b:1:7f00:0:100:808:808', 'local-use NAT64 /48 layout embedding loopback 127.0.0.1'],
+    ['64:ff9b:1:a00:0:100:808:808', 'local-use NAT64 /48 layout embedding RFC1918 10.0.0.1'],
     ['2002:7f00:1::', '6to4 of loopback 127.0.0.1'],
     ['2002:a9fe:a9fe::', '6to4 of cloud metadata 169.254.169.254'],
     ['2002:0a00:0001::', '6to4 of RFC1918 10.0.0.1'],
@@ -84,6 +91,7 @@ describe('isBlockedAddress', () => {
     ['::ffff:8.8.8.8', 'IPv4-mapped public 8.8.8.8 (dotted) — the reserved-block catch must not swallow it'],
     ['2002:0808:0808::', '6to4 of public 8.8.8.8 stays allowed'],
     ['64:ff9b::0808:0808', 'NAT64 of public 8.8.8.8 stays allowed'],
+    ['64:ff9b:1::808:808', 'local-use NAT64 /96 of public 8.8.8.8 stays allowed'],
     ['::ffff:0:0808:0808', 'IPv4-translatable public 8.8.8.8 stays allowed'],
     ['0:0:0:0:0:ffff:0808:0808', 'fully-expanded IPv4-mapped public 8.8.8.8 stays allowed (hex)'],
     ['0:0:0:0:0:ffff:8.8.8.8', 'fully-expanded IPv4-mapped public 8.8.8.8 stays allowed (dotted)'],
@@ -249,6 +257,23 @@ describe('resolveSafeFetchTarget', () => {
       else process.env.SSRF_DNS_TIMEOUT_MS = prev;
     }
   }, 1000);
+
+  it('falls back to the default deadline when SSRF_DNS_TIMEOUT_MS overflows a Node timer', async () => {
+    // Node clamps a delay above 2^31-1 ms to 1 ms, which would fail every lookup at once.
+    const prev = process.env.SSRF_DNS_TIMEOUT_MS;
+    process.env.SSRF_DNS_TIMEOUT_MS = '9999999999';
+    (dnsPromises.lookup as jest.Mock).mockReturnValueOnce(
+      new Promise(resolve => setTimeout(() => resolve([{ address: '93.184.216.34', family: 4 }]), 50)),
+    );
+    try {
+      await expect(resolveSafeFetchTarget('https://slow.example/hook')).resolves.toEqual([
+        { address: '93.184.216.34', family: 4 },
+      ]);
+    } finally {
+      if (prev === undefined) delete process.env.SSRF_DNS_TIMEOUT_MS;
+      else process.env.SSRF_DNS_TIMEOUT_MS = prev;
+    }
+  }, 1000);
 });
 
 describe('withSafeFetch (guarded + pinned fetch)', () => {
@@ -264,8 +289,8 @@ describe('withSafeFetch (guarded + pinned fetch)', () => {
 
   it('pins the connection by passing a dispatcher to fetch for a hostname target', async () => {
     // The security property: for a DNS hostname the connection MUST go through a pinned dispatcher,
-    // else fetch re-resolves DNS independently and the rebind window reopens. Removing the pin
-    // (dispatcher = undefined) makes this fail.
+    // else fetch re-resolves DNS independently and the rebind window reopens. Dropping the dispatcher
+    // fails here; the real-socket test below fails if it stops dialling the vetted address.
     (dnsPromises.lookup as jest.Mock).mockResolvedValueOnce([{ address: '93.184.216.34', family: 4 }]);
     (undiciFetch as jest.Mock).mockResolvedValue({ status: 200, type: 'basic' });
     const use = jest.fn(() => 'used');
@@ -450,7 +475,7 @@ describe('withSafeFetch (guarded + pinned fetch)', () => {
     const init = {
       method: 'POST',
       body: 'payload',
-      headers: { authorization: 'Bearer secret', 'x-custom': 'keep' },
+      headers: { authorization: 'Bearer secret', cookie: 'sid=abc', 'x-custom': 'keep' },
     };
 
     await withSafeFetch('https://api.example.com/upload', init, use, { followRedirects: true });
@@ -462,6 +487,7 @@ describe('withSafeFetch (guarded + pinned fetch)', () => {
     expect(hop2.method).toBe('GET');
     expect(hop2.body).toBeUndefined();
     expect(hop2.headers?.get('authorization')).toBeNull();
+    expect(hop2.headers?.get('cookie')).toBeNull();
     expect(hop2.headers?.get('x-custom')).toBe('keep');
   });
 
@@ -772,7 +798,9 @@ describe('withSafeFetch followRedirects validates every hop over real sockets', 
   });
 
   afterEach(() => {
-    process.env.SSRF_ALLOWED_HOSTS = savedAllowedHosts;
+    // Assigning undefined to process.env stores the string 'undefined', an allowlist entry of its own.
+    if (savedAllowedHosts === undefined) delete process.env.SSRF_ALLOWED_HOSTS;
+    else process.env.SSRF_ALLOWED_HOSTS = savedAllowedHosts;
     (undiciFetch as unknown as jest.Mock).mockReset();
   });
 
@@ -833,6 +861,28 @@ describe('withSafeFetch followRedirects validates every hop over real sockets', 
     } finally {
       await new Promise<void>(resolve => target.close(() => resolve()));
       await new Promise<void>(resolve => redirector.close(() => resolve()));
+    }
+  });
+
+  it('connects a vetted hostname to the address it was vetted at, not a fresh resolution', async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('PINNED');
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
+    // `.invalid` never resolves through real DNS, so the request can only reach the server through
+    // the address the guard vetted and pinned into the dispatcher.
+    process.env.SSRF_ALLOWED_HOSTS = 'pinned.invalid';
+    (dnsPromises.lookup as jest.Mock).mockResolvedValueOnce([{ address: '127.0.0.1', family: 4 }]);
+
+    try {
+      const body = await withSafeFetch(`http://pinned.invalid:${port}/`, {}, async response => await response.text(), {
+        guard: true,
+      });
+      expect(body).toBe('PINNED');
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
     }
   });
 

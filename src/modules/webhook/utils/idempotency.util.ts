@@ -50,6 +50,10 @@ export function generateIdempotencyKey(event: string, data: Record<string, unkno
       // the legacy `ack` integer for backward compatibility with older payloads.
       return `ack_${toStr(data.sessionId)}_${toStr(data.id ?? data.messageId)}_${toStr(data.status ?? data.ack, '0')}`;
 
+    case 'message.receipt':
+      // One receipt per recipient and status: the participant keeps two members' `read` apart.
+      return `receipt_${toStr(data.sessionId)}_${toStr(data.id ?? data.messageId)}_${toStr(data.participant)}_${toStr(data.status)}`;
+
     case 'message.failed':
       return `failed_${toStr(data.sessionId)}_${toStr(data.id ?? data.messageId)}_${toStr(data.status ?? data.ack, '0')}`;
 
@@ -109,12 +113,19 @@ export function generateIdempotencyKey(event: string, data: Record<string, unkno
       // is already distinct — no occurrence salt, matching call.received's stable key.
       return `call_${toStr(data.sessionId)}_${toStr(data.callId)}_${toStr(data.outcome)}`;
 
+    case 'event.response':
+      // Each RSVP is its own message with its own id, and a changed answer is a new RSVP with a new
+      // id, so (session, RSVP id) is already unique per occurrence and stable across retries.
+      return `rsvp_${toStr(data.sessionId)}_${toStr(data.responseMessageId)}`;
+
     case 'presence.update':
       // Keyed on the chat and salted per occurrence. Only genuine state CHANGES are dispatched, and
       // a contact who types, stops, and types again produces the same payload each time — content
       // hashing would collapse that back into one delivery and hide the very transitions the event
-      // exists to report.
-      return `pres_${toStr(data.sessionId)}_${toStr(data.chatId)}${occurrence}`;
+      // exists to report. The participants are hashed in as well: two group members changing state
+      // in the same millisecond are two events and must not share a key. Pre-stringified for the
+      // same reason as group.update below.
+      return `pres_${toStr(data.sessionId)}_${toStr(data.chatId)}_${hashData({ participants: JSON.stringify(data.participants ?? null) })}${occurrence}`;
 
     case 'group.join':
       // A membership change carries no unique id and repeats with identical content (the same user

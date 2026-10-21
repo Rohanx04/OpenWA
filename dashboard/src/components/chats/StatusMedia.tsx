@@ -1,10 +1,13 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { sessionApi } from '../../services/api';
+import { loadArchivedMedia } from '../../utils/archivedMediaLoad';
 
 // Status image item. <img src="/api/..."> can't carry the X-API-Key header, so the bytes are
 // fetched via sessionApi (which does) and re-exposed as a local object URL. The URL is revoked on
-// unmount/statusId change to avoid leaking blob memory as the viewer browses items.
+// unmount/statusId change to avoid leaking blob memory as the viewer browses items. Every item of the
+// open contact mounts at once, so the fetches take their turns a gap apart and a refusal for rate is
+// retried, as the previews of archived chat media do.
 function StatusMedia({
   sessionId,
   statusId,
@@ -22,10 +25,10 @@ function StatusMedia({
     if (!sessionId) return undefined;
     let objectUrl: string | null = null;
     let cancelled = false;
+    const controller = new AbortController();
     setSrc(null);
     setError(false);
-    sessionApi
-      .getStatusMediaBlob(sessionId, statusId)
+    loadArchivedMedia(controller.signal, () => sessionApi.getStatusMediaBlob(sessionId, statusId, controller.signal))
       .then(blob => {
         if (cancelled) return;
         objectUrl = URL.createObjectURL(blob);
@@ -36,6 +39,7 @@ function StatusMedia({
       });
     return () => {
       cancelled = true;
+      controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [sessionId, statusId]);

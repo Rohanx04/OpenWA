@@ -26,11 +26,13 @@ export interface SafeUrlInfo {
  * request — so that generator is never reached: Baileys spreads the caller's send options last
  * (messages-send.js:1086), so passing this as `getUrlInfo` there wins over its hardcoded one.
  *
- * `withSafeFetch` validates the destination and then PINS the connection to the vetted addresses, so
- * a hostname that resolves publicly once and to `127.0.0.1` a moment later cannot be used to reach
- * the loopback interface — the rebinding window that a validate-then-hand-off approach would leave
- * open. It also honours the deployment's own `WEBHOOK_SSRF_PROTECT` / `SSRF_ALLOWED_HOSTS` settings,
- * so an operator who intentionally allows an internal host keeps that behaviour here too.
+ * `withSafeFetch` validates the destination and then PINS a direct or SOCKS-proxied connection to the
+ * vetted addresses, so a hostname that resolves publicly once and to `127.0.0.1` a moment later cannot
+ * be used to reach the loopback interface, the rebinding window that a validate-then-hand-off
+ * approach would leave open. Behind an HTTP/HTTPS session proxy the proxy resolves the name itself,
+ * so that window stays open there (SESSION_PROXY_URL_FETCH=false or a SOCKS proxy closes it).
+ * Like media-by-URL fetches, it is always guarded: `WEBHOOK_SSRF_PROTECT` does not turn it off, and
+ * an operator who intentionally allows an internal host lists it in `SSRF_ALLOWED_HOSTS`.
  *
  * Returns undefined rather than throwing on any failure: a preview is decoration, and a site that is
  * slow, unreachable, or refused must never turn into a failed message send. That includes an
@@ -65,16 +67,17 @@ export async function generateSafeLinkPreview(
         if (!type.includes('html') && !type.includes('xml')) return undefined;
 
         const html = await readCapped(response, maxBytes);
-        const title = firstMatch(html, [
-          /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']*)["']/i,
-          /<meta[^>]+content=["']([^"']*)["'][^>]+property=["']og:title["']/i,
-          /<title[^>]*>([^<]*)<\/title>/i,
-        ]);
-        const description = firstMatch(html, [
-          /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']*)["']/i,
-          /<meta[^>]+content=["']([^"']*)["'][^>]+property=["']og:description["']/i,
-          /<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i,
-        ]);
+        // One pass over the <meta> tags, each read only up to the next '<', then one attribute at a
+        // time. Matching attribute pairs across the whole body backtracks from every '<meta' to the
+        // end of the text: a crafted page of unclosed tags held the event loop for minutes.
+        const metas = new Map<string, string>();
+        for (const [, attrs] of html.matchAll(/<meta\b([^<]*)/gi)) {
+          const key = (attribute(attrs, 'property') ?? attribute(attrs, 'name'))?.toLowerCase();
+          const content = attribute(attrs, 'content');
+          if (key && content && !metas.has(key)) metas.set(key, content);
+        }
+        const title = metas.get('og:title') ?? /<title\b[^<>]*>([^<]*)<\/title>/i.exec(html)?.[1]?.trim();
+        const description = metas.get('og:description') ?? metas.get('description');
 
         // A page with neither says nothing the raw link does not, so there is no point attaching a
         // preview at all.
@@ -90,8 +93,9 @@ export async function generateSafeLinkPreview(
         };
       },
       // The fetched URL comes from the message text, so it is caller-supplied the same way a media
-      // URL is: on a proxied session it leaves through the session proxy (#1626).
-      { proxyUrl: urlFetchProxy(opts.sessionProxyUrl) },
+      // URL is: on a proxied session it leaves through the session proxy (#1626). A bare domain, an
+      // http link and a short link all answer with a redirect; the guard vets every hop it follows.
+      { proxyUrl: urlFetchProxy(opts.sessionProxyUrl), followRedirects: true },
     );
   } catch {
     // Blocked destination, DNS failure, timeout, malformed response — all the same to a caller who
@@ -149,25 +153,61 @@ async function readCapped(response: Response, maxBytes: number): Promise<string>
   return out;
 }
 
-function firstMatch(html: string, patterns: RegExp[]): string | undefined {
-  for (const pattern of patterns) {
-    const value = pattern.exec(html)?.[1]?.trim();
-    if (value) return value;
-  }
-  return undefined;
+/**
+ * A quoted attribute's trimmed value from one tag's attribute text. The value ends at the quote that
+ * opened it, so an apostrophe inside a double-quoted title stays part of it.
+ */
+function attribute(attrs: string, name: 'property' | 'name' | 'content'): string | undefined {
+  const m = new RegExp(`\\b${name}=(?:"([^"]*)"|'([^']*)')`, 'i').exec(attrs);
+  return (m?.[1] ?? m?.[2])?.trim();
 }
 
-/** The handful of entities that actually show up in title/description text. */
+/**
+ * The Latin-1 named references (HTML 2), in code point order from U+00A0. `nbsp` is then replaced by a
+ * plain space, as it always was here.
+ */
+const LATIN1_NAMES =
+  'nbsp iexcl cent pound curren yen brvbar sect uml copy ordf laquo not shy reg macr deg plusmn sup2 sup3 acute ' +
+  'micro para middot cedil sup1 ordm raquo frac14 frac12 frac34 iquest Agrave Aacute Acirc Atilde Auml Aring ' +
+  'AElig Ccedil Egrave Eacute Ecirc Euml Igrave Iacute Icirc Iuml ETH Ntilde Ograve Oacute Ocirc Otilde Ouml ' +
+  'times Oslash Ugrave Uacute Ucirc Uuml Yacute THORN szlig agrave aacute acirc atilde auml aring aelig ccedil ' +
+  'egrave eacute ecirc euml igrave iacute icirc iuml eth ntilde ograve oacute ocirc otilde ouml divide oslash ' +
+  'ugrave uacute ucirc uuml yacute thorn yuml';
+
+/** Named references, as code points: the five markup ones, the typographic punctuation, and Latin-1. */
+const NAMED_ENTITIES = new Map<string, number>([
+  ...LATIN1_NAMES.split(' ').map((name, index): [string, number] => [name, 0xa0 + index]),
+  ['nbsp', 0x20],
+  ['quot', 0x22],
+  ['amp', 0x26],
+  ['apos', 0x27],
+  ['lt', 0x3c],
+  ['gt', 0x3e],
+  ['ndash', 0x2013],
+  ['mdash', 0x2014],
+  ['lsquo', 0x2018],
+  ['rsquo', 0x2019],
+  ['ldquo', 0x201c],
+  ['rdquo', 0x201d],
+  ['bull', 0x2022],
+  ['hellip', 0x2026],
+  ['euro', 0x20ac],
+  ['trade', 0x2122],
+]);
+
+/**
+ * Decode character references in title/description text: decimal and hexadecimal ones generally, named
+ * ones from {@link NAMED_ENTITIES}. One pass, so `&amp;#39;` stays `&#39;`. A reference that names no
+ * character (a control, a surrogate, past U+10FFFF) or no known name is left as written.
+ */
 function decodeEntities(value: string): string {
-  return (
-    value
-      .replace(/&quot;/g, '"')
-      .replace(/&#0?39;/g, "'")
-      .replace(/&apos;/g, "'")
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&nbsp;/g, ' ')
-      // Ampersand last: decoding it first would let `&amp;lt;` become `<`.
-      .replace(/&amp;/g, '&')
+  return value.replace(
+    /&(?:#(\d{1,7})|#[xX]([0-9a-fA-F]{1,6})|([A-Za-z][A-Za-z0-9]{1,31}));/g,
+    (whole, decimal?: string, hex?: string, name?: string) => {
+      const code = name ? NAMED_ENTITIES.get(name) : decimal ? Number(decimal) : parseInt(hex ?? '', 16);
+      if (code === undefined || code < 0x20 || (code >= 0x7f && code <= 0x9f)) return whole;
+      if (code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return whole;
+      return String.fromCodePoint(code);
+    },
   );
 }

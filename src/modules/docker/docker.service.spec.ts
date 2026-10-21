@@ -1,5 +1,5 @@
 import Docker from 'dockerode';
-import { DockerService } from './docker.service';
+import { DockerService, prestartBuiltinDatabase } from './docker.service';
 
 // Prevent actual Docker connections on module init during tests
 jest.mock('dockerode');
@@ -7,6 +7,11 @@ jest.mock('dockerode');
 // The auto-mocked constructor: initializeDocker does `new Docker(...)` internally, so the
 // onModuleInit/isDockerAvailable tests steer the daemon by replacing its implementation.
 const DockerMock = Docker as unknown as jest.Mock;
+
+/** A daemon with no local copy of any image: inspect answers 404, so createService pulls. */
+const imageNotCached = () => ({
+  inspect: jest.fn().mockRejectedValue(Object.assign(new Error('no such image'), { statusCode: 404 })),
+});
 
 describe('DockerService.getRunningBuiltinServices', () => {
   const container = (name: string, service: string, state: string) => ({
@@ -77,7 +82,7 @@ describe('DockerService.buildDockerOptions', () => {
 });
 
 describe('DockerService.stopManagedService (stop-only teardown)', () => {
-  // Teardown is deliberately stop-only: the pinned docker-socket-proxy v0.4.2 never reads its
+  // Teardown is deliberately stop-only: the pinned docker-socket-proxy v0.5.0 never reads its
   // DELETE env flag (deletion is admitted only as an undocumented side effect of its POST
   // method gate), so the code must not depend on container.remove() at all.
   const makeService = (container: unknown) => {
@@ -186,6 +191,7 @@ describe('DockerService.onModuleInit', () => {
   const happyDocker = () => ({
     ping: jest.fn().mockResolvedValue(undefined),
     listContainers: jest.fn().mockResolvedValue([]),
+    getImage: imageNotCached,
     pull: (_image: string, cb: (err: Error | null, stream: null) => void) => cb(null, null),
     modem: { followProgress: (_stream: null, cb: (err: Error | null) => void) => cb(null) },
     createVolume: jest.fn().mockResolvedValue({}),
@@ -232,14 +238,68 @@ describe('DockerService.onModuleInit', () => {
 
   it('logs a warning but still resolves when bootstrap orchestration fails', async () => {
     process.env.REDIS_BUILTIN = 'true';
-    DockerMock.mockImplementation(() => ({
+    const docker = {
       ...happyDocker(),
       pull: (_image: string, cb: (err: Error | null, stream: null) => void) => cb(new Error('pull denied'), null),
-    }));
+    };
+    DockerMock.mockImplementation(() => docker);
     const service = new DockerService();
+    const warn = jest
+      .spyOn((service as unknown as { logger: { warn: () => void } }).logger, 'warn')
+      .mockImplementation(() => undefined);
 
     await expect(service.onModuleInit()).resolves.toBeUndefined();
     expect(service.isDockerAvailable()).toBe(true);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('[Bootstrap Orchestration] Issues'));
+    expect(docker.createContainer).not.toHaveBeenCalled();
+  });
+});
+
+describe('prestartBuiltinDatabase', () => {
+  const builtin = { DATABASE_TYPE: 'postgres', POSTGRES_BUILTIN: 'true' };
+
+  afterEach(() => DockerMock.mockReset());
+
+  it('starts a stopped built-in postgres container through a real DockerService', async () => {
+    const container = {
+      inspect: jest.fn().mockResolvedValue({ State: { Running: false } }),
+      start: jest.fn().mockResolvedValue(undefined),
+    };
+    const docker = {
+      ping: jest.fn().mockResolvedValue(undefined),
+      listContainers: jest.fn().mockResolvedValue([{ Id: 'pg' }]),
+      getContainer: jest.fn().mockReturnValue(container),
+    };
+    DockerMock.mockImplementation(() => docker);
+
+    await prestartBuiltinDatabase(builtin, new DockerService());
+
+    expect(docker.listContainers).toHaveBeenCalledWith({
+      all: true,
+      filters: { label: ['com.openwa.service=database'] },
+      abortSignal: expect.any(AbortSignal) as unknown,
+    });
+    expect(container.start).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['an sqlite deployment', { DATABASE_TYPE: 'sqlite', POSTGRES_BUILTIN: 'true' }],
+    ['an external postgres', { DATABASE_TYPE: 'postgres', POSTGRES_BUILTIN: 'false' }],
+    ['no built-in flag', { DATABASE_TYPE: 'postgres' }],
+  ])('does nothing for %s', async (_label, env) => {
+    const service = { startBuiltinDatabase: jest.fn().mockResolvedValue(undefined) };
+    await prestartBuiltinDatabase(env, service);
+    expect(service.startBuiltinDatabase).not.toHaveBeenCalled();
+  });
+
+  it('gives up after the timeout when the Docker endpoint never answers', async () => {
+    const service = { startBuiltinDatabase: () => new Promise<void>(() => undefined) };
+    await expect(prestartBuiltinDatabase(builtin, service, 10)).resolves.toBeUndefined();
+  });
+
+  it('never throws, so boot proceeds to the data connection as before', async () => {
+    const service = { startBuiltinDatabase: jest.fn().mockRejectedValue(new Error('boom')) };
+    await expect(prestartBuiltinDatabase(builtin, service)).resolves.toBeUndefined();
   });
 });
 
@@ -354,6 +414,7 @@ describe('DockerService.getContainerByService label match and guard rails', () =
     expect(listContainers).toHaveBeenCalledWith({
       all: true,
       filters: { label: ['com.openwa.service=database'] },
+      abortSignal: expect.any(AbortSignal) as unknown,
     });
     expect(getContainer).toHaveBeenCalledWith('label-hit-1');
     expect(result).toEqual({ id: 'label-hit-1' });
@@ -408,6 +469,7 @@ describe('DockerService.createService', () => {
   it('pulls, creates the volume and container, and starts it (a pre-existing volume is fine)', async () => {
     const start = jest.fn().mockResolvedValue(undefined);
     const docker = {
+      getImage: imageNotCached,
       pull: (_image: string, cb: (err: Error | null, stream: null) => void) => cb(null, null),
       modem: { followProgress: (_stream: null, cb: (err: Error | null) => void) => cb(null) },
       // EEXIST races are normal — the volume may survive from an earlier run.
@@ -428,6 +490,7 @@ describe('DockerService.createService', () => {
 
   it('returns false when the daemon rejects the image pull', async () => {
     const docker = {
+      getImage: imageNotCached,
       pull: (_image: string, cb: (err: Error | null, stream: null) => void) =>
         cb(new Error('pull access denied'), null),
     };
@@ -435,6 +498,42 @@ describe('DockerService.createService', () => {
     jest.spyOn(service, 'getContainerByService').mockResolvedValue(null);
 
     await expect(service.createService('redis')).resolves.toBe(false);
+  });
+
+  it('creates the container from a cached image without pulling it', async () => {
+    const start = jest.fn().mockResolvedValue(undefined);
+    const getImage = jest.fn(() => ({ inspect: jest.fn().mockResolvedValue({ Id: 'sha256:abc' }) }));
+    const docker = {
+      getImage,
+      pull: jest.fn(),
+      createVolume: jest.fn().mockResolvedValue({}),
+      createContainer: jest.fn().mockResolvedValue({ start }),
+    };
+    const service = withDocker(docker);
+    jest.spyOn(service, 'getContainerByService').mockResolvedValue(null);
+
+    await expect(service.createService('redis')).resolves.toBe(true);
+
+    expect(getImage).toHaveBeenCalledWith('redis:7-alpine');
+    expect(docker.pull).not.toHaveBeenCalled();
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+
+  it('pulls the pinned image once when it is not on the host', async () => {
+    const pull = jest.fn((_image: string, cb: (err: Error | null, stream: null) => void) => cb(null, null));
+    const docker = {
+      getImage: imageNotCached,
+      pull,
+      modem: { followProgress: (_stream: null, cb: (err: Error | null) => void) => cb(null) },
+      createVolume: jest.fn().mockResolvedValue({}),
+      createContainer: jest.fn().mockResolvedValue({ start: jest.fn().mockResolvedValue(undefined) }),
+    };
+    const service = withDocker(docker);
+    jest.spyOn(service, 'getContainerByService').mockResolvedValue(null);
+
+    await expect(service.createService('redis')).resolves.toBe(true);
+    expect(pull).toHaveBeenCalledTimes(1);
+    expect(pull).toHaveBeenCalledWith('redis:7-alpine', expect.any(Function));
   });
 });
 
@@ -487,6 +586,98 @@ describe('DockerService.startService', () => {
     jest.spyOn(service, 'getContainerByService').mockResolvedValue(container as never);
 
     await expect(service.startService('cache')).resolves.toBe(false);
+  });
+});
+
+describe('DockerService image drift warning', () => {
+  const OLD_IMAGE = 'minio/minio:RELEASE.2024-01-01T00-00-00Z';
+  const pinOf = (service: DockerService, profile: string): string =>
+    (service as unknown as { getContainerSpec(p: string): { image: string } }).getContainerSpec(profile).image;
+  const retained = (running: boolean, image?: string) => ({
+    inspect: jest.fn().mockResolvedValue({
+      Name: '/openwa-minio',
+      State: { Running: running },
+      ...(image ? { Config: { Image: image } } : {}),
+    }),
+    start: jest.fn().mockResolvedValue(undefined),
+  });
+  const setup = (container: unknown) => {
+    const service = new DockerService();
+    Object.assign(service as unknown as Record<string, unknown>, { docker: {}, isAvailable: true });
+    jest.spyOn(service, 'getContainerByService').mockResolvedValue(container as never);
+    const warn = jest.spyOn((service as unknown as { logger: { warn: () => void } }).logger, 'warn');
+    warn.mockImplementation(() => undefined);
+    return { service, warn };
+  };
+
+  it('warns when a stopped retained container runs an older image, and still starts it', async () => {
+    const container = retained(false, OLD_IMAGE);
+    const { service, warn } = setup(container);
+
+    await expect(service.startService('storage')).resolves.toBe(true);
+
+    expect(container.start).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    const message = String((warn.mock.calls[0] as unknown[])[0]);
+    expect(message).toContain('openwa-minio');
+    expect(message).toContain(OLD_IMAGE);
+    expect(message).toContain(pinOf(service, 'minio'));
+    expect(message).toContain('docker rm -f openwa-minio');
+    expect(message).not.toContain('data migration');
+  });
+
+  it('adds the data-migration caveat for a drifted PostgreSQL container', async () => {
+    const container = {
+      inspect: jest.fn().mockResolvedValue({
+        Name: '/openwa-postgres',
+        State: { Running: false },
+        Config: { Image: 'postgres:15-alpine' },
+      }),
+      start: jest.fn().mockResolvedValue(undefined),
+    };
+    const { service, warn } = setup(container);
+
+    await expect(service.startService('database')).resolves.toBe(true);
+    expect(warn).toHaveBeenCalledTimes(1);
+    const message = String((warn.mock.calls[0] as unknown[])[0]);
+    expect(message).toContain('docker rm -f openwa-postgres');
+    expect(message).toContain('major version change needs a data migration');
+  });
+
+  it('warns for a running drifted container without starting it', async () => {
+    const container = retained(true, OLD_IMAGE);
+    const { service, warn } = setup(container);
+
+    await expect(service.startService('storage')).resolves.toBe(true);
+    expect(container.start).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('stays quiet when the container runs the pinned image or reports no image', async () => {
+    const pinned = setup(null);
+    const onPin = retained(false, pinOf(pinned.service, 'minio'));
+    jest.spyOn(pinned.service, 'getContainerByService').mockResolvedValue(onPin as never);
+    await expect(pinned.service.startService('storage')).resolves.toBe(true);
+    expect(pinned.warn).not.toHaveBeenCalled();
+
+    const bare = setup(retained(false));
+    await expect(bare.service.startService('storage')).resolves.toBe(true);
+    expect(bare.warn).not.toHaveBeenCalled();
+  });
+
+  it('warns on the createService name-fallback branch too', async () => {
+    const { service, warn } = setup(retained(false, OLD_IMAGE));
+
+    await expect(service.createService('minio')).resolves.toBe(true);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(OLD_IMAGE));
+  });
+
+  it('does not turn a drifted retained container into an orchestration failure', async () => {
+    const { service } = setup(retained(false, OLD_IMAGE));
+
+    const result = await service.orchestrateProfiles(['minio']);
+    expect(result.success).toBe(true);
+    expect(result.containersStarted).toEqual(['minio']);
   });
 });
 
@@ -574,7 +765,7 @@ describe('DockerService.orchestrateProfiles', () => {
     expect(result.success).toBe(true);
     expect(result.containersStarted).toEqual(['postgres']);
     expect(result.errors).toEqual([
-      "Service 'redis' container not found. It may need to be created first with docker-compose.",
+      "Failed to create or start the 'redis' container; see the server log for the Docker error.",
     ]);
     expect(result.message).toBe(result.errors.join('; '));
   });
@@ -589,53 +780,5 @@ describe('DockerService.orchestrateProfiles', () => {
     expect(result.containersStarted).toEqual([]);
     expect(result.errors).toEqual(['Failed to start postgres: boom']);
     expect(result.message).toBe('Failed to start postgres: boom');
-  });
-});
-
-describe('DockerService.getSystemInfo', () => {
-  it('reports unavailable when Docker is not connected', async () => {
-    expect(await new DockerService().getSystemInfo()).toEqual({ available: false });
-  });
-
-  it('maps the daemon info into the public shape', async () => {
-    const service = new DockerService();
-    Object.assign(service as unknown as Record<string, unknown>, {
-      docker: {
-        info: jest.fn().mockResolvedValue({
-          Containers: 5,
-          ContainersRunning: 2,
-          ContainersPaused: 1,
-          ContainersStopped: 2,
-          Images: 9,
-          ServerVersion: '27.0.3',
-          OperatingSystem: 'Docker Desktop',
-          Architecture: 'aarch64',
-        }),
-      },
-      isAvailable: true,
-    });
-
-    expect(await service.getSystemInfo()).toEqual({
-      available: true,
-      info: {
-        containers: 5,
-        containersRunning: 2,
-        containersPaused: 1,
-        containersStopped: 2,
-        images: 9,
-        serverVersion: '27.0.3',
-        operatingSystem: 'Docker Desktop',
-        architecture: 'aarch64',
-      },
-    });
-  });
-
-  it('reports unavailable when the daemon info call fails', async () => {
-    const service = new DockerService();
-    Object.assign(service as unknown as Record<string, unknown>, {
-      docker: { info: jest.fn().mockRejectedValue(new Error('daemon gone')) },
-      isAvailable: true,
-    });
-    expect(await service.getSystemInfo()).toEqual({ available: false });
   });
 });

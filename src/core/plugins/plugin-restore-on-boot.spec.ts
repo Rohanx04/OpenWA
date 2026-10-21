@@ -3,7 +3,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { ConfigService } from '@nestjs/config';
 import { ModuleRef } from '@nestjs/core';
-import { PluginLoaderService } from './plugin-loader.service';
+import { PLUGIN_RESTORE_BOOT_BUDGET_MS, PluginLoaderService } from './plugin-loader.service';
+import type { ShutdownService } from '../../common/services/shutdown.service';
 import { PluginStorageService } from './plugin-storage.service';
 import { HookManager } from '../hooks';
 import { PluginStatus, PluginType, type PluginManifest } from './plugin.interfaces';
@@ -140,6 +141,197 @@ describe('PluginLoaderService — restoring the operator enable decision across 
     // A plugin that cannot come back must never hold up the gateway.
     await expect(loader2.onApplicationBootstrap()).resolves.toBeUndefined();
     expect(enable).toHaveBeenCalledWith(second.id);
+  });
+
+  it('stops restoring plugins once shutdown teardown begins', async () => {
+    const second: PluginManifest = { ...manifest, id: 'ext-two', name: 'Ext Two' };
+    const secondDir = path.join(tmpDir, 'plugins', second.id);
+    fs.mkdirSync(secondDir, { recursive: true });
+    fs.writeFileSync(path.join(secondDir, 'manifest.json'), JSON.stringify(second));
+    fs.writeFileSync(path.join(secondDir, 'index.js'), 'module.exports = class {};');
+
+    const storage2 = new PluginStorageService(config);
+    const loader2 = makeLoader(storage2);
+    loader2.loadPlugin(pluginDir);
+    loader2.loadPlugin(secondDir);
+    storage2.setPluginEnabledByOperator(manifest.id, true);
+    storage2.setPluginEnabledByOperator(second.id, true);
+
+    const log = jest
+      .spyOn((loader2 as unknown as { logger: { log: (...args: unknown[]) => void } }).logger, 'log')
+      .mockImplementation(() => undefined);
+    // The gateway starts shutting down while the first plugin is being restored.
+    let destroying: Promise<void> | undefined;
+    const enable = jest.spyOn(loader2, 'enablePlugin').mockImplementation(() => {
+      destroying = loader2.onModuleDestroy();
+      return Promise.resolve();
+    });
+
+    await loader2.onApplicationBootstrap();
+    await destroying;
+
+    expect(enable).toHaveBeenCalledTimes(1);
+    expect(enable).not.toHaveBeenCalledWith(second.id);
+    // The skipped plugins are reported, so an operator can tell the restore was cut short.
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining('stopped at 1 of 2'),
+      expect.objectContaining({ action: 'plugin_restore_aborted' }),
+    );
+  });
+
+  it('stops restoring plugins once the gateway starts draining, before its own module is destroyed', async () => {
+    const second: PluginManifest = { ...manifest, id: 'ext-two', name: 'Ext Two' };
+    const secondDir = path.join(tmpDir, 'plugins', second.id);
+    fs.mkdirSync(secondDir, { recursive: true });
+    fs.writeFileSync(path.join(secondDir, 'manifest.json'), JSON.stringify(second));
+    fs.writeFileSync(path.join(secondDir, 'index.js'), 'module.exports = class {};');
+
+    const storage2 = new PluginStorageService(config);
+    // The drain flag flips at the signal; PluginsModule is destroyed last, long after.
+    let draining = false;
+    const shutdown = { isShuttingDown: () => draining };
+    const loader2 = new PluginLoaderService(
+      config,
+      new HookManager(),
+      storage2,
+      {} as unknown as ModuleRef,
+      undefined,
+      shutdown as unknown as ShutdownService,
+    );
+    loader2.loadPlugin(pluginDir);
+    loader2.loadPlugin(secondDir);
+    storage2.setPluginEnabledByOperator(manifest.id, true);
+    storage2.setPluginEnabledByOperator(second.id, true);
+    const enable = jest.spyOn(loader2, 'enablePlugin').mockImplementation(() => {
+      draining = true;
+      return Promise.resolve();
+    });
+
+    await loader2.onApplicationBootstrap();
+
+    expect(enable).toHaveBeenCalledTimes(1);
+  });
+
+  describe('a plugin that takes a long time to come back', () => {
+    const second: PluginManifest = { ...manifest, id: 'ext-two', name: 'Ext Two' };
+    let loader2: PluginLoaderService;
+    let releaseFirst: () => void;
+    let enable: jest.SpyInstance;
+
+    beforeEach(() => {
+      jest.useFakeTimers();
+      const secondDir = path.join(tmpDir, 'plugins', second.id);
+      fs.mkdirSync(secondDir, { recursive: true });
+      fs.writeFileSync(path.join(secondDir, 'manifest.json'), JSON.stringify(second));
+      fs.writeFileSync(path.join(secondDir, 'index.js'), 'module.exports = class {};');
+
+      const storage2 = new PluginStorageService(config);
+      loader2 = makeLoader(storage2);
+      loader2.loadPlugin(pluginDir);
+      loader2.loadPlugin(secondDir);
+      storage2.setPluginEnabledByOperator(manifest.id, true);
+      storage2.setPluginEnabledByOperator(second.id, true);
+      // The first plugin's enable hangs (a backend that is down) until the test lets it go.
+      enable = jest.spyOn(loader2, 'enablePlugin').mockImplementation((id: string) =>
+        id === manifest.id
+          ? new Promise<void>(resolve => {
+              releaseFirst = resolve;
+            })
+          : Promise.resolve(),
+      );
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('does not hold the gateway back past the restore budget, and finishes restoring the rest afterwards', async () => {
+      const warn = jest
+        .spyOn((loader2 as unknown as { logger: { warn: (...args: unknown[]) => void } }).logger, 'warn')
+        .mockImplementation(() => undefined);
+
+      const booted = loader2.onApplicationBootstrap();
+      await jest.advanceTimersByTimeAsync(PLUGIN_RESTORE_BOOT_BUDGET_MS);
+
+      await expect(booted).resolves.toBeUndefined();
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('remaining plugins come up in the background'),
+        expect.objectContaining({ action: 'plugin_restore_deferred' }),
+      );
+      // The first plugin is still being enabled, so the second has not started: order is kept.
+      expect(enable).toHaveBeenCalledTimes(1);
+
+      releaseFirst();
+      await jest.advanceTimersByTimeAsync(0);
+
+      expect(enable).toHaveBeenCalledWith(second.id);
+    });
+
+    it('returns as soon as every plugin is back, without waiting out the budget', async () => {
+      const booted = loader2.onApplicationBootstrap();
+      releaseFirst();
+
+      await expect(booted).resolves.toBeUndefined();
+      expect(enable).toHaveBeenCalledTimes(2);
+      // No timer is left running for the budget.
+      expect(jest.getTimerCount()).toBe(0);
+    });
+
+    it('stops the background restore when the gateway shuts down', async () => {
+      const booted = loader2.onApplicationBootstrap();
+      await jest.advanceTimersByTimeAsync(PLUGIN_RESTORE_BOOT_BUDGET_MS);
+      await booted;
+
+      await loader2.onModuleDestroy();
+      releaseFirst();
+      await jest.advanceTimersByTimeAsync(0);
+
+      expect(enable).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps a plugin pending from the start of the restore until its own enable settles', async () => {
+      const booted = loader2.onApplicationBootstrap();
+      await jest.advanceTimersByTimeAsync(PLUGIN_RESTORE_BOOT_BUDGET_MS);
+      await booted;
+
+      // The first is being enabled and the second is queued behind it: neither takes a lifecycle change yet.
+      expect(loader2.isRestorePending(manifest.id)).toBe(true);
+      expect(loader2.isRestorePending(second.id)).toBe(true);
+      expect(loader2.isRestorePending('never-queued')).toBe(false);
+
+      releaseFirst();
+      await jest.advanceTimersByTimeAsync(0);
+
+      expect(loader2.isRestorePending(manifest.id)).toBe(false);
+      expect(loader2.isRestorePending(second.id)).toBe(false);
+    });
+
+    it('stops holding a plugin whose restore failed', async () => {
+      enable.mockImplementation((id: string) =>
+        id === manifest.id ? Promise.reject(new Error('backend down')) : Promise.resolve(),
+      );
+      jest
+        .spyOn((loader2 as unknown as { logger: { error: (...args: unknown[]) => void } }).logger, 'error')
+        .mockImplementation(() => undefined);
+
+      await loader2.onApplicationBootstrap();
+
+      expect(loader2.isRestorePending(manifest.id)).toBe(false);
+      expect(loader2.isRestorePending(second.id)).toBe(false);
+    });
+
+    it('lets go of the plugins it never reached when the gateway shuts down', async () => {
+      const booted = loader2.onApplicationBootstrap();
+      await jest.advanceTimersByTimeAsync(PLUGIN_RESTORE_BOOT_BUDGET_MS);
+      await booted;
+
+      await loader2.onModuleDestroy();
+      releaseFirst();
+      await jest.advanceTimersByTimeAsync(0);
+
+      expect(loader2.isRestorePending(manifest.id)).toBe(false);
+      expect(loader2.isRestorePending(second.id)).toBe(false);
+    });
   });
 
   it('does not treat the shutdown teardown as the operator disabling the plugin', async () => {

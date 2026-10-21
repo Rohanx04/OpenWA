@@ -1,13 +1,16 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsNotEmpty, IsString, Matches } from 'class-validator';
+import { IsNotEmpty, IsString, Matches, MaxLength } from 'class-validator';
+import { CHAT_ID_MAX_LENGTH } from '../../message/dto/send-message.dto';
 
 export class DeleteChatDto {
   @ApiProperty({
+    maxLength: CHAT_ID_MAX_LENGTH,
     description: "Chat ID in the active engine's native format (e.g. 1234567890-123@g.us on whatsapp-web.js)",
     example: '1234567890-123@g.us',
   })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   // Engine-neutral structural check (localpart@host, no whitespace) so a different engine's JID scheme
   // (e.g. Baileys `…@s.whatsapp.net`) is accepted too; the adapter validates/normalises for its engine.
   @Matches(/^[^\s@]+@[^\s@]+$/, {

@@ -1,11 +1,12 @@
 import { z } from 'zod';
 import { ApiKeyRole } from '../../../modules/auth/entities/api-key.entity';
 import type { LabelService } from '../../../modules/label/label.service';
+import { chatIdSchema } from '../chat-id-schema';
 import { defineTool, type AnyToolDescriptor } from '../tool-descriptor';
 
 const sessionId = z.string().min(1).describe('Session UUID (the session id, not the name)');
 const labelId = z.string().min(1).describe('Label id');
-const chatId = z.string().min(1).describe('Chat JID, e.g. 628123456789@c.us or <id>@g.us');
+const chatId = chatIdSchema.describe('Chat JID, e.g. 628123456789@c.us or <id>@g.us');
 
 /**
  * Labels are a WhatsApp Business feature, and the two engines split them almost exactly down the
@@ -37,16 +38,21 @@ export function labelTools(labels: LabelService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'LabelListChats',
+      chatScope: 'filtered',
       description:
         'List the chats carrying a label. Use it to answer "which conversations are tagged X". ' +
         'WhatsApp Business only, and whatsapp-web.js only — Baileys answers 501.',
       tier: 'read',
       sessionScoped: true,
       inputSchema: z.object({ sessionId, labelId }),
-      handler: input => labels.getChatsByLabel(input.sessionId, input.labelId),
+      handler: async (input, apiKey, chatScope) => {
+        const chats = await labels.getChatsByLabel(input.sessionId, input.labelId);
+        return chatScope ? chatScope.filter(apiKey, chats, chat => chat.id) : chats;
+      },
     }),
     defineTool({
       name: 'LabelListForChat',
+      chatScope: ['chatId'],
       description:
         'List the labels on one chat. WhatsApp Business only, and whatsapp-web.js only — Baileys answers 501.',
       tier: 'read',
@@ -63,6 +69,7 @@ export function labelTools(labels: LabelService): AnyToolDescriptor[] {
         'labels and answers 501.',
       tier: 'write',
       sessionScoped: true,
+      destructive: true,
       requiredRole: ApiKeyRole.OPERATOR,
       inputSchema: z.object({
         sessionId,
@@ -95,6 +102,7 @@ export function labelTools(labels: LabelService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'LabelAddToChat',
+      chatScope: ['chatId'],
       description: 'Tag a chat with an existing label. Works on both engines. WhatsApp Business only.',
       tier: 'write',
       sessionScoped: true,
@@ -105,6 +113,7 @@ export function labelTools(labels: LabelService): AnyToolDescriptor[] {
     }),
     defineTool({
       name: 'LabelRemoveFromChat',
+      chatScope: ['chatId'],
       description:
         'Remove a label from a chat, leaving the label itself in place. Works on both engines. ' +
         'WhatsApp Business only.',

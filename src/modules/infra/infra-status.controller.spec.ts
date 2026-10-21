@@ -1,8 +1,3 @@
-// StorageService (imported transitively by the infra controllers) pulls in `archiver`
-// v8, which is ESM-only and cannot be parsed by ts-jest. The controller logic
-// under test never touches archiver, so a lightweight stub is sufficient.
-jest.mock('archiver', () => ({ default: jest.fn() }));
-
 // saveConfig writes the generated env via fs.writeFileSync and reads the existing file
 // via fs.existsSync/readFileSync; mock those so tests assert produced content without
 // touching the filesystem. existsSync defaults to false (no prior config).
@@ -22,6 +17,7 @@ jest.mock('fs', () => {
 
 import { InfraStatusController } from './infra-status.controller';
 import { recordPinnedEnvKeys } from '../../config/env-precedence';
+import { producerConnectWaitMs } from '../queue/redis-connection';
 
 describe('InfraStatusController.getStatus DB health (active SELECT 1 probe, not just isInitialized)', () => {
   const build = (query: jest.Mock) => {
@@ -53,9 +49,14 @@ describe('InfraStatusController.getStatus DB health (active SELECT 1 probe, not 
 });
 
 describe('InfraStatusController.getStatus queue job counts', () => {
-  function buildStatusController(opts: { queueEnabled: boolean; queue?: { getJobCounts: jest.Mock } }) {
+  function buildStatusController(opts: {
+    queueEnabled: boolean;
+    queue?: { getJobCounts: jest.Mock; waitUntilReady?: jest.Mock };
+  }) {
     const configService = {
-      get: (key: string, def?: unknown) => (key === 'queue.enabled' ? opts.queueEnabled : def),
+      // engine.type=baileys skips the wa-web-version registry fetch (no network in unit tests).
+      get: (key: string, def?: unknown) =>
+        key === 'queue.enabled' ? opts.queueEnabled : key === 'engine.type' ? 'baileys' : def,
     };
     const dataSource = { isInitialized: true, query: jest.fn().mockResolvedValue([{ '1': 1 }]) } as unknown;
     const engineFactory = { create: jest.fn() };
@@ -70,7 +71,7 @@ describe('InfraStatusController.getStatus queue job counts', () => {
       dockerService as never,
       cacheService as never,
       storageService as never,
-      opts.queue as never,
+      (opts.queue && { waitUntilReady: jest.fn().mockResolvedValue(undefined), ...opts.queue }) as never,
     );
   }
 
@@ -82,6 +83,24 @@ describe('InfraStatusController.getStatus queue job counts', () => {
 
     expect(getJobCounts).toHaveBeenCalledWith('wait', 'active', 'delayed', 'completed', 'failed');
     expect(status.queue).toEqual({ enabled: true, webhooks: { pending: 6, completed: 10, failed: 1 } });
+  });
+
+  // Until the first connect BullMQ holds a queue call for as long as Redis stays unreachable.
+  it('reports zeros once the connect timeout passes when Redis has never connected', async () => {
+    const getJobCounts = jest.fn();
+    const waitUntilReady = jest.fn(() => new Promise<never>(() => {}));
+    const controller = buildStatusController({ queueEnabled: true, queue: { getJobCounts, waitUntilReady } });
+    let status: Awaited<ReturnType<InfraStatusController['getStatus']>> | undefined;
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
+    try {
+      void controller.getStatus().then(s => (status = s));
+      await jest.advanceTimersByTimeAsync(producerConnectWaitMs());
+    } finally {
+      jest.useRealTimers();
+    }
+
+    expect(getJobCounts).not.toHaveBeenCalled();
+    expect(status?.queue).toEqual({ enabled: true, webhooks: { pending: 0, completed: 0, failed: 0 } });
   });
 
   it('reports zeros (and does not touch the queue) when the queue is disabled', async () => {
@@ -121,13 +140,32 @@ describe('InfraStatusController.getStatus engine (reads the real engine.puppetee
       {} as never, // engineFactory
       { isDockerAvailable: () => false } as never, // dockerService — no Docker in unit tests
       cache as never,
-      { isS3Available: () => false, refreshS3Availability: () => Promise.resolve(false) } as never, // storageService
+      { refreshS3Availability: () => Promise.resolve(false) } as never, // storageService
     );
 
     const status = await controller.getStatus();
     expect(status.engine.headless).toBe(false);
     expect(status.engine.browserArgs).toBe('--foo --bar');
     expect(status.engine.sessionDataPath).toBe('./sess');
+  });
+
+  it('reports the default Chromium flags when no args are configured', async () => {
+    const config = { get: (key: string, def?: unknown) => (key === 'engine.type' ? 'whatsapp-web.js' : def) };
+    const ds = { isInitialized: true, query: jest.fn().mockResolvedValue([{ '1': 1 }]) };
+    const controller = new InfraStatusController(
+      config as never,
+      ds as never,
+      ds as never,
+      {} as never,
+      { isDockerAvailable: () => false } as never,
+      { isAvailable: () => Promise.resolve(false) } as never,
+      { refreshS3Availability: () => Promise.resolve(false) } as never,
+    );
+
+    const status = await controller.getStatus();
+    expect(status.engine.browserArgs).toBe(
+      '--no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage --disable-gpu',
+    );
   });
 });
 
@@ -151,7 +189,7 @@ describe('InfraStatusController.getStatus storage (reads the real storage.localP
       {} as never, // engineFactory
       { isDockerAvailable: () => false } as never, // dockerService — no Docker in unit tests
       cache as never,
-      { isS3Available: () => false, refreshS3Availability: () => Promise.resolve(false) } as never, // storageService
+      { refreshS3Availability: () => Promise.resolve(false) } as never, // storageService
     );
   };
 
@@ -202,7 +240,7 @@ describe('InfraStatusController.getStatus envPinned', () => {
       {} as never,
       { isDockerAvailable: () => false } as never,
       { isAvailable: () => Promise.resolve(false) } as never,
-      { isS3Available: () => false, refreshS3Availability: () => Promise.resolve(false) } as never,
+      { refreshS3Availability: () => Promise.resolve(false) } as never,
     );
   };
 
@@ -215,6 +253,26 @@ describe('InfraStatusController.getStatus envPinned', () => {
     expect(status.envPinned).toEqual(['ENGINE_TYPE']);
     // PATH is shadowing too but has no control on the page — naming it would be noise.
     expect(status.envPinned).not.toContain('PATH');
+  });
+
+  it('reports the storage path and engine launch options the Quick Start stack pins', async () => {
+    // docker-compose.dev.yml forwards these four with non-empty defaults, so a dashboard edit reverts.
+    recordPinnedEnvKeys({
+      SESSION_DATA_PATH: '/app/data/sessions',
+      PUPPETEER_HEADLESS: 'true',
+      PUPPETEER_ARGS: '--no-sandbox',
+      STORAGE_LOCAL_PATH: '/app/data/media',
+      PATH: '/usr/bin',
+    });
+
+    const status = await buildController().getStatus();
+
+    expect(status.envPinned).toEqual([
+      'STORAGE_LOCAL_PATH',
+      'PUPPETEER_HEADLESS',
+      'SESSION_DATA_PATH',
+      'PUPPETEER_ARGS',
+    ]);
   });
 
   it('reports an empty list when nothing above data/.env.generated supplies a selection key', async () => {

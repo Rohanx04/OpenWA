@@ -7,6 +7,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { ConfigService } from '@nestjs/config';
 import { PluginStorageService } from './plugin-storage.service';
+import { PluginStatus, PluginType } from './plugin.interfaces';
 
 describe('PluginStorageService sandboxed per-plugin storage containment', () => {
   let dataDir: string;
@@ -121,12 +122,35 @@ describe('PluginStorageService sandboxed per-plugin storage containment', () => 
     fs.writeFileSync(manifestPath, JSON.stringify({ id: pluginId }));
     fs.writeFileSync(packagePath, JSON.stringify({ name: pluginId }));
 
+    expect(await storage.list()).toEqual([]); // a listed key must be one get()/delete() will act on
     expect(await storage.get('manifest')).toBeNull();
     await storage.set('manifest', { pluginState: true });
     await storage.delete('manifest');
 
     expect(JSON.parse(fs.readFileSync(manifestPath, 'utf8'))).toEqual({ id: pluginId });
     expect(JSON.parse(fs.readFileSync(packagePath, 'utf8'))).toEqual({ name: pluginId });
+  });
+
+  it('lists no package file as a key when storage shares the package directory', async () => {
+    // By default <dataDir>/plugins/<id> is both the installed package and ctx.storage, so a
+    // clear-all loop over list() must not reach the package's own root JSON files.
+    const pluginDataDir = path.join(dataDir, 'plugins', pluginId);
+    fs.writeFileSync(path.join(pluginDataDir, 'manifest.json'), JSON.stringify({ id: pluginId }));
+    for (const name of ['tsconfig.json', 'package-lock.json', 'defaults.json']) {
+      fs.writeFileSync(path.join(pluginDataDir, name), '{}');
+    }
+    await storage.set('real', 1);
+
+    expect(await storage.list()).toEqual(['real']);
+    for (const key of await storage.list()) await storage.delete(key);
+    expect(fs.readdirSync(pluginDataDir).sort()).toEqual([
+      'defaults.json',
+      'manifest.json',
+      'package-lock.json',
+      'tsconfig.json',
+    ]);
+    // A legacy key the plugin names explicitly stays readable.
+    expect(await storage.get('defaults')).toEqual({});
   });
 
   it('does not mangle a literal legacy filename that happens to start with "key-"', async () => {
@@ -254,5 +278,104 @@ describe('PluginStorageService per-plugin storage quota', () => {
     const configService = { get: (k: string) => (k === 'dataDir' ? dataDir : undefined) } as unknown as ConfigService;
     const storage = new PluginStorageService(configService).createPluginStorage('default-quota');
     await expect(storage.set('state', 'x'.repeat(1000))).resolves.toBeUndefined();
+    // One byte over 50 MiB once JSON-quoted; refused before anything is written.
+    await expect(storage.set('big', 'x'.repeat(50 * 1024 * 1024 - 1))).rejects.toThrow(
+      /storage quota exceeded.*max 52428800\)/,
+    );
+  });
+
+  describe('running total', () => {
+    const pluginDir = (id = 'quota-plugin'): string => path.join(dataDir, 'plugins', id);
+
+    it('reads the directory once, not on every write', async () => {
+      const storage = makeStorage(10 * 1024 * 1024);
+      const readdir = jest.spyOn(fs, 'readdirSync');
+      try {
+        for (let i = 0; i < 50; i++) await storage.set(`key-${i}`, 'x'.repeat(100));
+        expect(readdir.mock.calls.filter(([dir]) => String(dir) === pluginDir())).toHaveLength(1);
+      } finally {
+        readdir.mockRestore();
+      }
+    });
+
+    it('frees a deleted key and counts a replaced key at its new size', async () => {
+      const storage = makeStorage(1024);
+      await storage.set('a', 'x'.repeat(500)); // 502 bytes
+      await storage.set('b', 'y'.repeat(400)); // 402 bytes
+      await expect(storage.set('c', 'z'.repeat(300))).rejects.toThrow(/storage quota exceeded/);
+
+      await storage.delete('a');
+      await expect(storage.set('c', 'z'.repeat(300))).resolves.toBeUndefined(); // 402 + 302
+
+      await storage.set('b', 'y'.repeat(10)); // 402 -> 12 bytes
+      await expect(storage.set('d', 'w'.repeat(600))).resolves.toBeUndefined(); // 302 + 12 + 602
+      await expect(storage.set('e', 'v'.repeat(300))).rejects.toThrow(/storage quota exceeded/);
+    });
+
+    it('recounts from the directory before refusing, so files removed behind its back do not block writes', async () => {
+      const storage = makeStorage(1024);
+      await storage.set('a', 'x'.repeat(900)); // 902 bytes
+
+      for (const file of fs.readdirSync(pluginDir())) fs.unlinkSync(path.join(pluginDir(), file));
+
+      await expect(storage.set('b', 'y'.repeat(900))).resolves.toBeUndefined();
+      // The recount did not forget the new key: a third write that cannot fit is still refused.
+      await expect(storage.set('c', 'z'.repeat(300))).rejects.toThrow(/storage quota exceeded/);
+    });
+
+    it('starts again from zero once the plugin data is deleted', async () => {
+      const configService = {
+        get: (k: string) => (k === 'dataDir' ? dataDir : k === 'plugins.storageMaxBytes' ? 1024 : undefined),
+      } as unknown as ConfigService;
+      const service = new PluginStorageService(configService);
+      const first = service.createPluginStorage('reinstalled');
+      await first.set('state', 'x'.repeat(900));
+
+      service.deletePluginData('reinstalled');
+      const second = service.createPluginStorage('reinstalled');
+
+      await expect(second.set('state', 'y'.repeat(900))).resolves.toBeUndefined();
+    });
+  });
+});
+
+describe('PluginStorageService unreadable registry', () => {
+  let dataDir: string;
+  let configService: ConfigService;
+
+  beforeEach(() => {
+    dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'owa-pluginreg-'));
+    fs.mkdirSync(path.join(dataDir, 'plugins'));
+    configService = { get: (k: string) => (k === 'dataDir' ? dataDir : undefined) } as unknown as ConfigService;
+  });
+
+  afterEach(() => {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  const writeEntry = (service: PluginStorageService): void =>
+    service.setPluginEntry({
+      id: 'other',
+      type: PluginType.EXTENSION,
+      name: 'Other',
+      version: '1.0.0',
+      status: PluginStatus.INSTALLED,
+      config: {},
+      builtIn: false,
+      installedAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+  it.each([
+    ['fails to parse', '[{"id":"p","config":{"apiKey":"SECRET"},"enabledByOperator":true},]'],
+    ['is not an array', '{"id":"p","config":{"apiKey":"SECRET"}}'],
+  ])('moves a registry that %s aside instead of overwriting it on the next save', (_label, content) => {
+    fs.writeFileSync(path.join(dataDir, 'plugins', 'registry.json'), content);
+
+    writeEntry(new PluginStorageService(configService));
+
+    const aside = fs.readdirSync(path.join(dataDir, 'plugins')).filter(f => f.startsWith('registry.json.corrupt-'));
+    expect(aside).toHaveLength(1);
+    expect(fs.readFileSync(path.join(dataDir, 'plugins', aside[0]), 'utf-8')).toBe(content);
   });
 });

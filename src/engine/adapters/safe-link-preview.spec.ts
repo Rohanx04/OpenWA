@@ -1,3 +1,5 @@
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { generateSafeLinkPreview } from './safe-link-preview';
 import * as ssrfGuard from '../../common/security/ssrf-guard';
 
@@ -44,7 +46,10 @@ describe('generateSafeLinkPreview', () => {
 
       await generateSafeLinkPreview('https://example.com/a', { sessionProxyUrl: 'socks5://proxy.invalid:1080' });
 
-      expect((withSafeFetch.mock.calls[0] as unknown[])[3]).toEqual({ proxyUrl: 'socks5://proxy.invalid:1080' });
+      expect((withSafeFetch.mock.calls[0] as unknown[])[3]).toEqual({
+        proxyUrl: 'socks5://proxy.invalid:1080',
+        followRedirects: true,
+      });
     });
 
     it('leaves an unproxied session fetching direct', async () => {
@@ -52,7 +57,7 @@ describe('generateSafeLinkPreview', () => {
 
       await generateSafeLinkPreview('https://example.com/a');
 
-      expect((withSafeFetch.mock.calls[0] as unknown[])[3]).toEqual({ proxyUrl: undefined });
+      expect((withSafeFetch.mock.calls[0] as unknown[])[3]).toEqual({ proxyUrl: undefined, followRedirects: true });
     });
 
     it('fetches direct when the operator switches the session-proxy URL fetch off', async () => {
@@ -64,7 +69,7 @@ describe('generateSafeLinkPreview', () => {
         delete process.env.SESSION_PROXY_URL_FETCH;
       }
 
-      expect((withSafeFetch.mock.calls[0] as unknown[])[3]).toEqual({ proxyUrl: undefined });
+      expect((withSafeFetch.mock.calls[0] as unknown[])[3]).toEqual({ proxyUrl: undefined, followRedirects: true });
     });
 
     // The guard rejects a blocked destination by throwing. That must surface as "no preview", never
@@ -105,6 +110,46 @@ describe('generateSafeLinkPreview', () => {
       await generateSafeLinkPreview('example.com/path');
 
       expect((withSafeFetch.mock.calls[0] as unknown[])[0]).toBe('https://example.com/path');
+    });
+  });
+
+  // A bare domain that answers with its www host, an http link moved to https and every short link
+  // arrive as a redirect. Each hop is checked by the guard again before it is fetched.
+  describe('follows a redirect through the guard', () => {
+    let server: Server;
+    let origin: string;
+    const allowed = process.env.SSRF_ALLOWED_HOSTS;
+
+    beforeAll(async () => {
+      server = createServer((req, res) => {
+        if (req.url === '/short') res.writeHead(301, { location: '/page' }).end();
+        // Reachable but not allowlisted: the same server under a hostname the guard refuses, so a hop
+        // followed without the guard would land on the page and produce a preview.
+        else if (req.url === '/internal')
+          res.writeHead(302, { location: `http://localhost:${(server.address() as AddressInfo).port}/page` }).end();
+        else res.writeHead(200, { 'content-type': 'text/html' }).end('<title>Landing</title>');
+      });
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      process.env.SSRF_ALLOWED_HOSTS = '127.0.0.1';
+    });
+
+    afterAll(async () => {
+      if (allowed === undefined) delete process.env.SSRF_ALLOWED_HOSTS;
+      else process.env.SSRF_ALLOWED_HOSTS = allowed;
+      await new Promise(resolve => server.close(resolve));
+    });
+
+    it('previews the page a redirect lands on, under the URL that was sent', async () => {
+      await expect(generateSafeLinkPreview(`${origin}/short`)).resolves.toEqual({
+        'matched-text': `${origin}/short`,
+        'canonical-url': `${origin}/short`,
+        title: 'Landing',
+      });
+    });
+
+    it('returns nothing when a hop points at a blocked address', async () => {
+      await expect(generateSafeLinkPreview(`${origin}/internal`)).resolves.toBeUndefined();
     });
   });
 
@@ -161,6 +206,39 @@ describe('generateSafeLinkPreview', () => {
       });
     });
 
+    // WordPress and most CMSs write curly quotes, dashes and ellipses as numeric references, and older
+    // pages write accents by name: left as written they reach the recipient as literal text.
+    it('decodes numeric references, decimal and hexadecimal, and the common named ones', async () => {
+      respondWith(
+        '<meta property="og:title" content="Don&#8217;t panic &#8211; a guide &amp; more">' +
+          '<meta property="og:description" content="Caf&eacute; &#x2014; 5 min read &hellip; &copy; 2026">',
+      );
+      // Code points rather than the characters, so the expectation reads the same in any editor.
+      const text = (...parts: Array<string | number>): string =>
+        parts.map(part => (typeof part === 'number' ? String.fromCodePoint(part) : part)).join('');
+
+      await expect(generateSafeLinkPreview('https://example.com')).resolves.toMatchObject({
+        title: text('Don', 0x2019, 't panic ', 0x2013, ' a guide & more'),
+        description: text('Caf', 0xe9, ' ', 0x2014, ' 5 min read ', 0x2026, ' ', 0xa9, ' 2026'),
+      });
+    });
+
+    it('leaves a reference that names no character, or one it does not know, as written', async () => {
+      respondWith('<meta property="og:title" content="&#0; &#xD800; &#1114112; &#9; &#150; &notanentity; &#x;">');
+
+      await expect(generateSafeLinkPreview('https://example.com')).resolves.toMatchObject({
+        title: '&#0; &#xD800; &#1114112; &#9; &#150; &notanentity; &#x;',
+      });
+    });
+
+    it('does not decode a numeric reference twice', async () => {
+      respondWith('<meta property="og:title" content="&amp;#39; &amp;#x41;">');
+
+      await expect(generateSafeLinkPreview('https://example.com')).resolves.toMatchObject({
+        title: '&#39; &#x41;',
+      });
+    });
+
     // Decoding the ampersand first would turn `&amp;lt;` into `<`.
     it('does not double-decode', async () => {
       respondWith('<meta property="og:title" content="&amp;lt;script&amp;gt;">');
@@ -168,6 +246,40 @@ describe('generateSafeLinkPreview', () => {
       await expect(generateSafeLinkPreview('https://example.com')).resolves.toMatchObject({
         title: '&lt;script&gt;',
       });
+    });
+
+    it('reads content written before property, and a ">" inside a value', async () => {
+      respondWith('<meta content="Shop > Shoes" property="og:title"/><meta name="description" content="Size 42 > 41">');
+
+      await expect(generateSafeLinkPreview('https://example.com')).resolves.toMatchObject({
+        title: 'Shop > Shoes',
+        description: 'Size 42 > 41',
+      });
+    });
+
+    it('keeps a quote of the other kind inside a value', async () => {
+      respondWith(`<meta property="og:title" content="Don't Panic"><meta name='description' content='say "hi"'>`);
+
+      await expect(generateSafeLinkPreview('https://example.com')).resolves.toMatchObject({
+        title: "Don't Panic",
+        description: 'say "hi"',
+      });
+    });
+  });
+
+  // The scan runs on the event loop, where the fetch timeout cannot interrupt it. A page of unclosed
+  // tags made the old attribute patterns backtrack from every tag to the end of the body.
+  describe('a hostile page cannot stall the process', () => {
+    it.each([
+      ['unclosed <meta tags', '<meta '],
+      ['unclosed <title tags', '<title'],
+    ])('scans a body of %s in linear time', async (_label, unit) => {
+      respondWith(unit.repeat((128 * 1024) / unit.length));
+
+      const started = Date.now();
+      await expect(generateSafeLinkPreview('https://example.com')).resolves.toBeUndefined();
+
+      expect(Date.now() - started).toBeLessThan(500);
     });
   });
 

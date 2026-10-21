@@ -119,6 +119,26 @@ export function correctionForMediaGrowth(
   return grewAboveReadingPosition(mediaBottom - grew, containerTop) ? grew : null;
 }
 
+/** Marks the direct children of the scroll container a reader can be held in place by. */
+export const SCROLL_ANCHOR_ATTRIBUTE = 'data-scroll-anchor';
+
+/**
+ * The first anchor element the reader can see, with its offset inside the thread's content (from the
+ * top of what scrolls, not from the visible top edge): the thing an older page landing above must hold
+ * still, whatever grew elsewhere in the thread meanwhile. In content coordinates the element's offset
+ * changes only when something above it grew, so a reader who scrolls while the page is in flight is not
+ * counted as the content moving.
+ */
+function firstVisibleAnchor(container: HTMLElement): { node: Element; top: number } | null {
+  const containerTop = container.getBoundingClientRect().top;
+  for (const child of Array.from(container.children)) {
+    if (!child.hasAttribute(SCROLL_ANCHOR_ATTRIBUTE)) continue;
+    const rect = child.getBoundingClientRect();
+    if (rect.bottom > containerTop) return { node: child, top: rect.top - containerTop + container.scrollTop };
+  }
+  return null;
+}
+
 export function useChatScrollPosition(
   activeChatId: string | null,
   isLoaded: boolean,
@@ -137,6 +157,10 @@ export function useChatScrollPosition(
   const scrollMap = useRef<Map<string, number>>(new Map());
   const prevChatIdRef = useRef<string | null>(null);
   const pinnedRef = useRef<boolean>(true);
+  // Whether the visible chat's messages have rendered. While a chat loads, the container shows only a
+  // spinner and the browser clamps scrollTop to it; that clamp arrives as a scroll event and is not a
+  // position to remember.
+  const loadedRef = useRef<boolean>(false);
   // A 'saved' restore writes scrollTop BEFORE media decodes — the browser clamps the write to the
   // still-short scrollHeight and the thread lands at the top. The saved value lives here and is
   // re-applied on every media decode until the user scrolls (any genuine scroll cancels it).
@@ -148,6 +172,8 @@ export function useChatScrollPosition(
   const prevScrollHeightRef = useRef<number>(0);
   const awaitingOlderPageRef = useRef<boolean>(false);
   const wasFetchingOlderRef = useRef<boolean>(false);
+  // The element the reader was on when the older page was requested; see the landing effect.
+  const olderAnchorRef = useRef<{ node: Element; top: number } | null>(null);
   // Box height of each mounted media element, recorded at DOM insertion: the one moment a browser
   // guarantees is before the decode. A WeakMap so entries die with the nodes on a chat switch.
   const mediaHeights = useRef(new WeakMap<Element, number>());
@@ -188,7 +214,7 @@ export function useChatScrollPosition(
       pendingRestoreRef.current = null;
       pinnedRef.current = isNearBottom(el.scrollTop, el.scrollHeight, el.clientHeight);
       const visibleChatId = prevChatIdRef.current;
-      if (visibleChatId) scrollMap.current.set(visibleChatId, el.scrollTop);
+      if (visibleChatId && loadedRef.current) scrollMap.current.set(visibleChatId, el.scrollTop);
     };
     el.addEventListener('scroll', onScroll, { passive: true });
     return () => el.removeEventListener('scroll', onScroll);
@@ -219,18 +245,20 @@ export function useChatScrollPosition(
     }
 
     prevChatIdRef.current = next;
+    loadedRef.current = isLoaded;
   }, [activeChatId, isLoaded, pinToBottom, writeScrollTop]);
 
   // Older messages are prepended ABOVE the viewport, so the thread grows upward and what the user
   // was reading is pushed down by however much taller it just got. Left alone the view jumps
   // backwards at the exact moment they asked for more.
   //
-  // The height is read when the page is REQUESTED and the delta applied on the commit where the
-  // in-flight flag falls — not on the first commit whose height changed, because the older-page
-  // spinner is an in-flow child of this same container (ChatThread) and its own ~46px arrives one
-  // commit earlier. Only `scrollHeight` is held; `scrollTop` is read live at apply time, so a
-  // deliberate reposition made during the fetch survives. The pin/restore machinery above is not
-  // reused: it writes an ABSOLUTE target, which is unknowable here.
+  // The reader's element and its offset are read when the page is REQUESTED and the delta applied on
+  // the commit where the in-flight flag falls, not on the first commit whose height changed, which
+  // may be a live message or a preview decoding while the page is out. The older-page indicator is not
+  // one of those: it takes no room in the thread (Chats.css), so it moves nothing when it appears and
+  // the request-time position is still the reader's when the page lands. `scrollTop` is read live at
+  // apply time, so a deliberate reposition made during the fetch survives. The pin/restore machinery
+  // above is not reused: it writes an ABSOLUTE target, which is unknowable here.
   useLayoutEffect(() => {
     const el = containerRef.current;
     const wasFetching = wasFetchingOlderRef.current;
@@ -240,10 +268,17 @@ export function useChatScrollPosition(
     // a media decode, another query resolving — would otherwise consume the pending correction.
     if (!el || isFetchingOlderMessages || !wasFetching || !awaitingOlderPageRef.current) return;
     awaitingOlderPageRef.current = false;
-    // A live message landing mid-fetch is inside this delta too, and it grew the thread at the
-    // BOTTOM where no correction is wanted — one bubble of overshoot in that race, against a whole
-    // page of it if the prepend went uncorrected.
-    const grew = el.scrollHeight - prevScrollHeightRef.current;
+    // How far the element the reader was on moved down. Measured on the element, not as a change of the
+    // whole thread's height: a preview that swapped in below the reader, or a live message at the
+    // bottom, while the page was in flight is inside that height delta and moves nothing on screen, so
+    // adding it dragged the reader down the thread. Without a surviving anchor (a chat that had no
+    // visible message, or one re-rendered under another key) the height delta is all there is.
+    const anchor = olderAnchorRef.current;
+    olderAnchorRef.current = null;
+    const grew =
+      anchor && el.contains(anchor.node)
+        ? anchor.node.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop - anchor.top
+        : el.scrollHeight - prevScrollHeightRef.current;
     if (grew > 0) {
       const corrected = el.scrollTop + grew;
       writeScrollTop(el, corrected);
@@ -260,6 +295,7 @@ export function useChatScrollPosition(
     const el = containerRef.current;
     if (!el) return;
     prevScrollHeightRef.current = el.scrollHeight;
+    olderAnchorRef.current = firstVisibleAnchor(el);
     awaitingOlderPageRef.current = true;
   }, []);
 

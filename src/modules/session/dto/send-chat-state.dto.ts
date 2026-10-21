@@ -1,9 +1,11 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsIn, IsNotEmpty, IsString } from 'class-validator';
+import { IsIn, IsNotEmpty, IsString, MaxLength } from 'class-validator';
 import type { ChatState } from '../../../engine/interfaces/whatsapp-engine.interface';
+import { CHAT_ID_MAX_LENGTH } from '../../message/dto/send-message.dto';
 
 export class SendChatStateDto {
   @ApiProperty({
+    maxLength: CHAT_ID_MAX_LENGTH,
     // Engine-neutral on purpose: the chat id is whatever the active engine uses
     // (e.g. <number>@c.us on whatsapp-web.js, <number>@s.whatsapp.net on Baileys).
     // The adapter validates/normalises it — we only require a non-empty string here.
@@ -12,6 +14,7 @@ export class SendChatStateDto {
   })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   chatId!: string;
 
   @ApiProperty({

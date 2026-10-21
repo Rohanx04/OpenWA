@@ -105,7 +105,8 @@ class GroupsResource
 
     /**
      * Get group settings. Only the settings the active engine supports are
-     * present — any of {announce, locked, ephemeralSeconds} may be absent.
+     * present: any of {announce, locked, ephemeralSeconds, memberAddMode} may
+     * be absent. memberAddMode is 'all' or 'admins'.
      *
      * @return array<string,mixed>
      */
@@ -200,7 +201,8 @@ class GroupsResource
      */
     public function approveMembershipRequests(string $sessionId, string $groupId, ?array $participants = null): array
     {
-        $body = $participants === null ? [] : ['participants' => $participants];
+        // An omitted list is an empty object on the wire, as the other SDKs send, not an empty array.
+        $body = $participants === null ? new \stdClass() : ['participants' => $participants];
 
         return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/membership-requests/approve", [], $body);
     }
@@ -213,7 +215,8 @@ class GroupsResource
      */
     public function rejectMembershipRequests(string $sessionId, string $groupId, ?array $participants = null): array
     {
-        $body = $participants === null ? [] : ['participants' => $participants];
+        // An omitted list is an empty object on the wire, as the other SDKs send, not an empty array.
+        $body = $participants === null ? new \stdClass() : ['participants' => $participants];
 
         return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($sessionId)}/groups/{$this->http->encodeSegment($groupId)}/membership-requests/reject", [], $body);
     }

@@ -14,7 +14,12 @@ import { PluginInstance, PluginStatus, PluginType } from './plugin.interfaces';
  * uninstallPlugin actually reads. The unload seam is the callback the lifecycle would provide; every
  * assertion is unchanged.
  */
-const makeUninstaller = (config: ConfigService, storage: PluginStorageService, pluginsDir: string) => {
+const makeUninstaller = (
+  config: ConfigService,
+  storage: PluginStorageService,
+  pluginsDir: string,
+  releaseTakeovers?: (pluginId: string) => Promise<void>,
+) => {
   const plugins = new Map<string, PluginInstance>();
   const uninstaller = new PluginUninstaller(
     createLogger('PluginLoaderService'),
@@ -26,6 +31,8 @@ const makeUninstaller = (config: ConfigService, storage: PluginStorageService, p
       plugins.delete(pluginId);
       return Promise.resolve();
     },
+    null,
+    releaseTakeovers,
   );
   return { uninstaller, plugins };
 };
@@ -98,10 +105,136 @@ describe('PluginUninstaller — uninstall', () => {
     expect(plugins.get('user-plg')).toBeUndefined();
   });
 
+  it('removes a legacy-directory package that failed to load (registry entry only)', async () => {
+    // A load failure keeps the registry entry but records no runtime instance, so no packageDir either.
+    const legacyDir = path.join(tmpDir, 'legacy-plugins');
+    const pkg = path.join(legacyDir, 'old-plg');
+    fs.mkdirSync(pkg, { recursive: true });
+    fs.writeFileSync(path.join(pkg, 'manifest.json'), '{}');
+    const stray = path.join(legacyDir, 'not-a-plugin');
+    fs.mkdirSync(stray, { recursive: true });
+    seedEntry(storage, 'old-plg');
+    seedEntry(storage, 'not-a-plugin');
+    const withLegacy = new PluginUninstaller(
+      createLogger('PluginLoaderService'),
+      plugins,
+      storage,
+      pluginsDir,
+      () => Promise.resolve(),
+      legacyDir,
+    );
+
+    await withLegacy.uninstallPlugin('old-plg');
+    await withLegacy.uninstallPlugin('not-a-plugin');
+
+    expect(fs.existsSync(pkg)).toBe(false);
+    expect(storage.getPluginEntry('old-plg')).toBeUndefined();
+    // Only a real package directory (one holding a manifest.json) is removed from the legacy tree.
+    expect(fs.existsSync(stray)).toBe(true);
+  });
+
+  it('also removes a legacy copy of a plugin that loaded from the configured tree', async () => {
+    // The boot scan skips the legacy copy as a duplicate, so the runtime record points at the configured
+    // copy. Left behind, the legacy copy would load again on the next boot as a new plugin.
+    const dir = writeUserPlugin('dup-plg');
+    const legacyDir = path.join(tmpDir, 'legacy-plugins');
+    const legacyPkg = path.join(legacyDir, 'dup-plg');
+    fs.mkdirSync(legacyPkg, { recursive: true });
+    fs.writeFileSync(path.join(legacyPkg, 'manifest.json'), '{}');
+    plugins.set('dup-plg', loadedUserPlugin('dup-plg', dir));
+    seedEntry(storage, 'dup-plg');
+    const withLegacy = new PluginUninstaller(
+      createLogger('PluginLoaderService'),
+      plugins,
+      storage,
+      pluginsDir,
+      pluginId => {
+        plugins.delete(pluginId);
+        return Promise.resolve();
+      },
+      legacyDir,
+    );
+
+    await withLegacy.uninstallPlugin('dup-plg');
+
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(fs.existsSync(legacyPkg)).toBe(false);
+  });
+
   it('refuses to uninstall a built-in plugin', async () => {
     plugins.set('core-engine', { ...loadedUserPlugin('core-engine', pluginsDir), builtIn: true });
     seedEntry(storage, 'core-engine', true);
     await expect(uninstaller.uninstallPlugin('core-engine')).rejects.toThrow(/built-in/i);
+  });
+
+  // A takeover the plugin held would keep every other plugin silent on that chat for good.
+  it('hands the takeovers of the plugin back once it no longer runs, before it removes anything', async () => {
+    const dir = writeUserPlugin('relay');
+    seedEntry(storage, 'relay');
+    const config = { get: (k: string) => (k === 'plugins.dir' ? pluginsDir : tmpDir) } as unknown as ConfigService;
+    const seen: Array<{ onDisk: boolean; running: boolean }> = [];
+    const withRelease: ReturnType<typeof makeUninstaller> = makeUninstaller(config, storage, pluginsDir, () => {
+      seen.push({
+        onDisk: fs.existsSync(dir) && storage.getPluginEntry('relay') !== undefined,
+        running: withRelease.plugins.has('relay'),
+      });
+      return Promise.resolve();
+    });
+    withRelease.plugins.set('relay', loadedUserPlugin('relay', dir));
+
+    await withRelease.uninstaller.uninstallPlugin('relay');
+
+    // Still running at the release would let it take a chat over again before its worker ends.
+    expect(seen).toEqual([{ onDisk: true, running: false }]);
+    expect(fs.existsSync(dir)).toBe(false);
+  });
+
+  it('keeps the plugin installed when its takeovers cannot be handed back, so the call can be repeated', async () => {
+    const dir = writeUserPlugin('relay');
+    seedEntry(storage, 'relay');
+    const config = { get: (k: string) => (k === 'plugins.dir' ? pluginsDir : tmpDir) } as unknown as ConfigService;
+    let storeUp = false;
+    const flaky = makeUninstaller(config, storage, pluginsDir, () =>
+      storeUp ? Promise.resolve() : Promise.reject(new Error('mapping store unavailable')),
+    );
+    flaky.plugins.set('relay', loadedUserPlugin('relay', dir));
+
+    await expect(flaky.uninstaller.uninstallPlugin('relay')).rejects.toThrow('mapping store unavailable');
+
+    // Nothing of the plugin was removed, though it no longer runs.
+    expect(fs.existsSync(dir)).toBe(true);
+    expect(storage.getPluginEntry('relay')).toBeDefined();
+    expect(flaky.plugins.has('relay')).toBe(false);
+
+    // The repeat finds no runtime, retries the release and removes the plugin.
+    storeUp = true;
+    await flaky.uninstaller.uninstallPlugin('relay');
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(storage.getPluginEntry('relay')).toBeUndefined();
+  });
+
+  // The boot scan loads a folder by its manifest id, whatever the folder is called. The repeat of a
+  // failed uninstall has no runtime record left to read the folder from.
+  it('removes the package folder on the repeat of a failed uninstall when the folder is not the plugin id', async () => {
+    const dir = path.join(pluginsDir, 'relay-v2-copy');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify({ id: 'relay' }));
+    seedEntry(storage, 'relay');
+    const config = { get: (k: string) => (k === 'plugins.dir' ? pluginsDir : tmpDir) } as unknown as ConfigService;
+    let storeUp = false;
+    const flaky = makeUninstaller(config, storage, pluginsDir, () =>
+      storeUp ? Promise.resolve() : Promise.reject(new Error('mapping store unavailable')),
+    );
+    flaky.plugins.set('relay', loadedUserPlugin('relay', dir));
+
+    await expect(flaky.uninstaller.uninstallPlugin('relay')).rejects.toThrow('mapping store unavailable');
+    expect(fs.existsSync(dir)).toBe(true);
+
+    storeUp = true;
+    await flaky.uninstaller.uninstallPlugin('relay');
+
+    expect(fs.existsSync(dir)).toBe(false);
+    expect(storage.getPluginEntry('relay')).toBeUndefined();
   });
 });
 

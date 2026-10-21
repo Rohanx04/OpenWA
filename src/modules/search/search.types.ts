@@ -9,7 +9,7 @@ export interface SearchProvider {
   /** Human label for dashboard/config. */
   readonly label: string;
   search(query: SearchQuery): Promise<SearchResults>;
-  /** Registry/route use this; 503 when not ok. */
+  /** Provider liveness. Not yet consumed by the route, the registry or /health. */
   health(): Promise<SearchHealth>;
 }
 
@@ -22,11 +22,21 @@ export interface SearchQuery {
   q: string;
   /** Scoped by SearchService from the caller's API-key allowedSessions (not user-supplied). */
   sessionIds?: string[];
+  /** Host-set, lid-expanded chat scope: undefined is unrestricted, [] denies every chat. */
+  chatIds?: string[];
   sessionId?: string;
   chatId?: string;
+  /**
+   * Host-set: every stored form of `chatId` (both user dialects and the lids mapped to the phone), so the
+   * built-in filter finds the chat the message list does. Not part of the plugin provider contract: it is
+   * stripped before a plugin sees the query.
+   */
+  chatIdAliases?: string[];
   direction?: MessageDirection;
   type?: MessageType | MessageType[];
   from?: string;
+  /** Host-set, like `chatIdAliases`: every stored form of `from`, matched against the sender and the author. */
+  fromAliases?: string[];
   dateFrom?: number; // epoch ms
   dateTo?: number; // epoch ms
   limit?: number;

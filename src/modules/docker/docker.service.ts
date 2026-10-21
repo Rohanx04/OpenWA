@@ -1,5 +1,8 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
+import { createLogger } from '../../common/services/logger.service';
 import Docker from 'dockerode';
+import { isEnvPinned, isOsProvidedEnv } from '../../config/env-precedence';
+import { readGeneratedEnv } from '../infra/generated-env';
 
 /**
  * The only Docker profiles OpenWA manages (and may start/stop). Used to bound teardown so a
@@ -24,12 +27,52 @@ interface OrchestrationResult {
   estimatedTime: number; // Estimated restart time in seconds
 }
 
+/** How long a reachability or listing call may take before the daemon is read as unavailable. */
+const DOCKER_CALL_TIMEOUT_MS = 10_000;
+
 @Injectable()
 export class DockerService implements OnModuleInit {
-  private readonly logger = new Logger(DockerService.name);
+  private readonly logger = createLogger(DockerService.name);
   private docker: Docker | null = null;
   private isAvailable = false;
   private reinitInFlight = false;
+  /** Visible for testing. */
+  callTimeoutMs = DOCKER_CALL_TIMEOUT_MS;
+
+  /**
+   * dockerode sets no timeout, so a daemon or socket proxy that accepts the connection and never
+   * answers (a dropped SYN, a wedged upstream) would hold the caller, boot included, until the OS or
+   * the proxy gave up. Short calls are bounded here; image pulls and container starts are not.
+   *
+   * The call is aborted when the deadline passes, not only raced: a call left running keeps its request
+   * and its socket open, and every later availability check would add one more.
+   */
+  private async answered<T>(call: (signal: AbortSignal) => Promise<T>, what: string): Promise<T> {
+    const controller = new AbortController();
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`Docker did not answer ${what} within ${this.callTimeoutMs}ms`));
+        controller.abort();
+      }, this.callTimeoutMs);
+    });
+    try {
+      return await Promise.race([call(controller.signal), deadline]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * dockerode's runtime takes an options object with `abortSignal` on every call, which its typings
+   * declare only for some of them.
+   */
+  private abortable<T>(method: 'ping', abortSignal: AbortSignal): Promise<T> {
+    const call = this.docker![method].bind(this.docker) as unknown as (options: {
+      abortSignal: AbortSignal;
+    }) => Promise<T>;
+    return call({ abortSignal });
+  }
 
   async onModuleInit() {
     await this.initializeDocker();
@@ -38,8 +81,11 @@ export class DockerService implements OnModuleInit {
   }
 
   /**
-   * Bootstrap orchestration: start built-in containers based on saved config
-   * This runs on application startup to ensure containers match saved configuration
+   * Bootstrap orchestration: start built-in containers based on saved config.
+   * Runs from onModuleInit, which Nest calls only after the data connection is up. When that
+   * connection is the built-in database (DATABASE_TYPE=postgres), the postgres profile is a no-op
+   * here: a stopped container was already started by prestartBuiltinDatabase in main.ts. With
+   * POSTGRES_BUILTIN=true on any other DATABASE_TYPE, this is what starts or creates it.
    */
   private async bootstrapOrchestration(): Promise<void> {
     if (!this.isAvailable) {
@@ -75,17 +121,22 @@ export class DockerService implements OnModuleInit {
     }
   }
 
+  /** Start the built-in PostgreSQL container, creating it if absent. Never throws. */
+  async startBuiltinDatabase(): Promise<void> {
+    await this.initializeDocker();
+    if (this.isAvailable) await this.startService('database');
+  }
+
   private async initializeDocker(): Promise<void> {
     try {
       this.docker = new Docker(this.buildDockerOptions());
-      await this.docker.ping();
+      await this.answered(abortSignal => this.abortable<unknown>('ping', abortSignal), 'a ping');
       this.isAvailable = true;
       this.logger.log('Docker API connected successfully');
     } catch (error) {
-      this.logger.warn(
-        'Docker not available. Container orchestration disabled.',
-        error instanceof Error ? error.message : error,
-      );
+      this.logger.warn('Docker not available. Container orchestration disabled.', {
+        error: error instanceof Error ? error.message : String(error),
+      });
       this.isAvailable = false;
     }
   }
@@ -131,7 +182,10 @@ export class DockerService implements OnModuleInit {
     }
 
     try {
-      const containers = await this.docker.listContainers({ all: true });
+      const containers = await this.answered(
+        abortSignal => this.docker!.listContainers({ all: true, abortSignal }),
+        'a container list',
+      );
       return containers
         .filter(c => {
           // Filter by OpenWA labels or name prefix
@@ -175,12 +229,17 @@ export class DockerService implements OnModuleInit {
     }
 
     try {
-      const containers = await this.docker.listContainers({
-        all: true,
-        filters: {
-          label: [`com.openwa.service=${service}`],
-        },
-      });
+      const containers = await this.answered(
+        abortSignal =>
+          this.docker!.listContainers({
+            all: true,
+            filters: {
+              label: [`com.openwa.service=${service}`],
+            },
+            abortSignal,
+          }),
+        'a container list',
+      );
 
       if (containers.length > 0) {
         return this.docker.getContainer(containers[0].Id);
@@ -189,7 +248,10 @@ export class DockerService implements OnModuleInit {
       // Fallback: try by EXACT name (never a substring — a substring, and especially the empty
       // string, would resolve an arbitrary container). OpenWA-managed containers are `openwa-<service>`.
       const target = `openwa-${service}`;
-      const allContainers = await this.docker.listContainers({ all: true });
+      const allContainers = await this.answered(
+        abortSignal => this.docker!.listContainers({ all: true, abortSignal }),
+        'a container list',
+      );
       const match = allContainers.find(c => c.Names?.some(n => n === target || n === `/${target}`));
 
       if (match) {
@@ -211,15 +273,20 @@ export class DockerService implements OnModuleInit {
    *
    * Deliberate differences from the compose services — do not "fix" these:
    *  - Credentials: the compose services are the MANUAL operator path and deliberately ship no
-   *    default secret (empty POSTGRES_PASSWORD / MINIO_ROOT_* fail fast on boot). The specs below
-   *    are the dashboard built-in path: they provision the fixed built-in credentials
-   *    (openwa/openwa, minioadmin/minioadmin) that infra-config.controller writes to data/.env.generated
+   *    default secret (an empty POSTGRES_PASSWORD fails when the volume is first initialized; a
+   *    MINIO_ROOT_PASSWORD left on its sub-minimum placeholder fails at every start). The specs below
+   *    are the dashboard built-in path: they provision the built-in credentials, by default
+   *    (openwa/openwa, minioadmin/minioadmin), that infra-config.controller writes to data/.env.generated
    *    and that the production boot guard (bootstrap-security.ts) exempts only while the
    *    *_BUILTIN flag is set AND the datastore host resolves to the internal-only container.
    *  - Postgres init script: compose bind-mounts scripts/postgres-init-schema.sh from the host
    *    checkout to support a custom POSTGRES_SCHEMA. The Docker-API path cannot know a host path
    *    to mount, and the built-in flow always pins POSTGRES_SCHEMA=public, so no init script (or
    *    POSTGRES_SCHEMA env) is set here.
+   *  - Host ports: compose's minio (the manual path, operator-set credentials) publishes
+   *    127.0.0.1:9000/9001. The specs below publish nothing, like postgres and redis: they run the
+   *    fixed built-in credentials, which the boot guard exempts only because the container is
+   *    reachable on the internal network alone. The app reaches it by its `minio` alias.
    *  - Resource limits: neither path sets CPU/memory/PID limits on the datastore containers;
    *    only openwa-api carries mem_limit/pids_limit (in compose).
    */
@@ -232,9 +299,15 @@ export class DockerService implements OnModuleInit {
     volumes?: { name: string; path: string }[];
     healthcheck?: { test: string[]; interval: number; timeout: number; retries: number };
     labels: Record<string, string>;
-    ports?: { container: number; host: number }[];
     securityOpt: string[];
   } | null {
+    // A container outlives the process that creates it, and after a dashboard save the restart that
+    // creates it runs in the OLD process, whose env still holds the values the save just replaced.
+    // Resolve what the next boot reads instead: a host or project .env value pins, the saved file
+    // supplies the rest. With no boot snapshot (unit tests) process.env is the only source there is.
+    let saved: Record<string, string> | undefined;
+    const nextBoot = (key: string): string | undefined =>
+      isEnvPinned(key) || isOsProvidedEnv(key) ? process.env[key] : (saved ??= readGeneratedEnv())[key];
     const specs: Record<string, ReturnType<typeof this.getContainerSpec>> = {
       redis: {
         image: 'redis:7-alpine',
@@ -260,10 +333,17 @@ export class DockerService implements OnModuleInit {
         image: 'postgres:16-alpine',
         name: 'openwa-postgres',
         alias: 'postgres',
-        // Fixed built-in credentials — the dashboard saves these same values to
-        // data/.env.generated (infra-config.controller) and the production boot guard exempts them only
-        // for the built-in, internal-host deployment (see the getContainerSpec docblock).
-        env: ['POSTGRES_USER=openwa', 'POSTGRES_PASSWORD=openwa', 'POSTGRES_DB=openwa'],
+        // The built-in credentials — the dashboard saves them to data/.env.generated
+        // (infra-config.controller) and the production boot guard exempts the default pair only for the
+        // built-in, internal-host deployment (see the getContainerSpec docblock). The password is the
+        // one the next boot dials with, like the MinIO keys below: a custom one saved with the built-in
+        // database would otherwise never match the role this container initializes, and the app would
+        // exit on its first connection.
+        env: [
+          'POSTGRES_USER=openwa',
+          `POSTGRES_PASSWORD=${nextBoot('DATABASE_PASSWORD') || 'openwa'}`,
+          'POSTGRES_DB=openwa',
+        ],
         volumes: [{ name: 'openwa_postgres-data', path: '/var/lib/postgresql/data' }],
         healthcheck: {
           test: ['CMD-SHELL', 'pg_isready -U openwa'],
@@ -278,22 +358,19 @@ export class DockerService implements OnModuleInit {
         securityOpt: ['no-new-privileges:true'],
       },
       minio: {
-        // Same pin as the compose minio service — never track the floating `latest` tag.
-        image: 'minio/minio:RELEASE.2025-09-07T16-13-09Z',
+        // Same pin (release tag and digest) as the compose minio service; never a floating tag.
+        image:
+          'pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46',
         name: 'openwa-minio',
         alias: 'minio',
         cmd: ['server', '/data', '--console-address', ':9001'],
         env: [
           // Prefer the canonical names the app/dashboard use; fall back to the legacy ones, then the
           // built-in default, so the bundled MinIO and the app share credentials.
-          `MINIO_ROOT_USER=${process.env.S3_ACCESS_KEY_ID || process.env.S3_ACCESS_KEY || 'minioadmin'}`,
-          `MINIO_ROOT_PASSWORD=${process.env.S3_SECRET_ACCESS_KEY || process.env.S3_SECRET_KEY || 'minioadmin'}`,
+          `MINIO_ROOT_USER=${nextBoot('S3_ACCESS_KEY_ID') || nextBoot('S3_ACCESS_KEY') || 'minioadmin'}`,
+          `MINIO_ROOT_PASSWORD=${nextBoot('S3_SECRET_ACCESS_KEY') || nextBoot('S3_SECRET_KEY') || 'minioadmin'}`,
         ],
         volumes: [{ name: 'openwa_minio-data', path: '/data' }],
-        ports: [
-          { container: 9000, host: 9000 },
-          { container: 9001, host: 9001 },
-        ],
         healthcheck: {
           test: ['CMD', 'curl', '-f', 'http://localhost:9000/minio/health/live'],
           interval: 10000000000,
@@ -332,6 +409,7 @@ export class DockerService implements OnModuleInit {
       const existing = await this.getContainerByService(profile);
       if (existing) {
         const info = await existing.inspect();
+        this.warnOnImageDrift(profile, spec.name, info);
         if (info.State.Running) {
           this.logger.log(`Container ${spec.name} already running`);
           return true;
@@ -342,17 +420,29 @@ export class DockerService implements OnModuleInit {
         return true;
       }
 
-      // Pull image first
-      this.logger.log(`Pulling image: ${spec.image}`);
-      await new Promise<void>((resolve, reject) => {
-        void this.docker!.pull(spec.image, (err: Error | null, stream: NodeJS.ReadableStream) => {
-          if (err) return reject(err);
-          this.docker!.modem.followProgress(stream, (err2: Error | null) => {
-            if (err2) return reject(err2);
-            resolve();
+      // Pull only when the image is not already on the host, as compose's default
+      // `pull_policy: missing` does: a host that has the image keeps working when the registry is
+      // unreachable or has withdrawn it. As with compose, a cached floating tag is not refreshed
+      // here. Any inspect failure falls back to pulling.
+      const cached = await this.docker
+        .getImage(spec.image)
+        .inspect()
+        .then(
+          () => true,
+          () => false,
+        );
+      if (!cached) {
+        this.logger.log(`Pulling image: ${spec.image}`);
+        await new Promise<void>((resolve, reject) => {
+          void this.docker!.pull(spec.image, (err: Error | null, stream: NodeJS.ReadableStream) => {
+            if (err) return reject(err);
+            this.docker!.modem.followProgress(stream, (err2: Error | null) => {
+              if (err2) return reject(err2);
+              resolve();
+            });
           });
         });
-      });
+      }
 
       // Create volume if needed
       if (spec.volumes) {
@@ -378,10 +468,6 @@ export class DockerService implements OnModuleInit {
           RestartPolicy: { Name: 'unless-stopped' },
           Binds: spec.volumes?.map(v => `${v.name}:${v.path}`),
           SecurityOpt: spec.securityOpt,
-          PortBindings: spec.ports?.reduce<Record<string, { HostIp: string; HostPort: string }[]>>((acc, p) => {
-            acc[`${p.container}/tcp`] = [{ HostIp: '127.0.0.1', HostPort: p.host.toString() }];
-            return acc;
-          }, {}),
         },
         Healthcheck: spec.healthcheck
           ? {
@@ -418,26 +504,26 @@ export class DockerService implements OnModuleInit {
   async startService(service: string): Promise<boolean> {
     const container = await this.getContainerByService(service);
 
+    // Map service names to docker-compose profiles
+    const serviceToProfile: Record<string, string> = {
+      database: 'postgres',
+      cache: 'redis',
+      storage: 'minio',
+      postgres: 'postgres',
+      redis: 'redis',
+      minio: 'minio',
+    };
+    const profile = serviceToProfile[service] || service;
+
     if (!container) {
-      // Container doesn't exist - create it using docker-compose
+      // Container doesn't exist - create it from the managed spec
       this.logger.log(`Container for service '${service}' not found, creating...`);
-
-      // Map service names to docker-compose profiles
-      const serviceToProfile: Record<string, string> = {
-        database: 'postgres',
-        cache: 'redis',
-        storage: 'minio',
-        postgres: 'postgres',
-        redis: 'redis',
-        minio: 'minio',
-      };
-
-      const profile = serviceToProfile[service] || service;
       return this.createService(profile);
     }
 
     try {
       const info = await container.inspect();
+      this.warnOnImageDrift(profile, info.Name?.replace(/^\//, '') || service, info);
       if (info.State.Running) {
         this.logger.log(`Service '${service}' is already running`);
         return true;
@@ -453,10 +539,27 @@ export class DockerService implements OnModuleInit {
   }
 
   /**
+   * A retained container is only ever restarted, never recreated (see stopManagedService), so it
+   * keeps the image it was created from after the pin moves. Warn with the way out; start and stop
+   * behaviour stay as they are.
+   */
+  private warnOnImageDrift(profile: string, name: string, info: Docker.ContainerInspectInfo): void {
+    const pinned = this.getContainerSpec(profile)?.image;
+    const running = info.Config?.Image;
+    if (!pinned || !running || running === pinned) return;
+    this.logger.warn(
+      `Container ${name} runs image ${running}, but this release pins ${pinned}. Remove it with ` +
+        `\`docker rm -f ${name}\` (its named data volume is kept) and restart OpenWA or re-enable the ` +
+        `service so it is recreated from the pin.` +
+        (profile === 'postgres' ? ' A PostgreSQL major version change needs a data migration first.' : ''),
+    );
+  }
+
+  /**
    * Stop a managed profile's container and RETAIN it for a later re-enable.
    *
    * Deliberately stop-only — no `container.remove()`. The bundled docker-socket-proxy
-   * (tecnativa/docker-socket-proxy, pinned v0.4.2) never reads its `DELETE` env flag: its
+   * (tecnativa/docker-socket-proxy, pinned v0.5.0) never reads its `DELETE` env flag: its
    * haproxy.cfg method gate is `deny unless METH_GET || env(POST)`, so container deletion is
    * admitted only as an undocumented side effect of POST being enabled — a contract any proxy
    * upgrade may withdraw. Stopping needs nothing beyond POST /containers/{id}/stop, which the
@@ -550,9 +653,9 @@ export class DockerService implements OnModuleInit {
         if (started) {
           result.containersStarted.push(profile);
         } else {
-          // Container might not exist yet - this is expected for first-time setup
+          // startService creates a missing container, so false means the pull, create or start failed.
           result.errors.push(
-            `Service '${profile}' container not found. It may need to be created first with docker-compose.`,
+            `Failed to create or start the '${profile}' container; see the server log for the Docker error.`,
           );
         }
       } catch (error) {
@@ -569,42 +672,34 @@ export class DockerService implements OnModuleInit {
 
     return result;
   }
+}
 
-  /**
-   * Get Docker system info
-   */
-  async getSystemInfo(): Promise<{ available: boolean; info?: Record<string, unknown> }> {
-    if (!this.docker || !this.isAvailable) {
-      return { available: false };
-    }
-
-    try {
-      const info = (await this.docker.info()) as {
-        Containers: number;
-        ContainersRunning: number;
-        ContainersPaused: number;
-        ContainersStopped: number;
-        Images: number;
-        ServerVersion: string;
-        OperatingSystem: string;
-        Architecture: string;
-      };
-      return {
-        available: true,
-        info: {
-          containers: info.Containers,
-          containersRunning: info.ContainersRunning,
-          containersPaused: info.ContainersPaused,
-          containersStopped: info.ContainersStopped,
-          images: info.Images,
-          serverVersion: info.ServerVersion,
-          operatingSystem: info.OperatingSystem,
-          architecture: info.Architecture,
-        },
-      };
-    } catch (error) {
-      this.logger.error('Failed to get Docker info', error);
-      return { available: false };
-    }
+/**
+ * Start the built-in PostgreSQL container before Nest builds the module graph. The data connection
+ * dials the database while providers are instantiated, before any onModuleInit runs, so a stopped
+ * openwa-postgres would otherwise fail every boot before DockerService could start it. Bounded
+ * because dockerode sets no connect timeout; never throws, so on any failure boot proceeds as it
+ * would without it and the data connection's retries decide.
+ */
+export async function prestartBuiltinDatabase(
+  env: NodeJS.ProcessEnv = process.env,
+  service: Pick<DockerService, 'startBuiltinDatabase'> = new DockerService(),
+  timeoutMs = 15_000,
+): Promise<void> {
+  if (env.DATABASE_TYPE !== 'postgres' || env.POSTGRES_BUILTIN !== 'true') return;
+  const logger = createLogger('DockerService');
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<void>(resolve => {
+    timer = setTimeout(() => {
+      logger.warn(`Built-in PostgreSQL start did not finish within ${timeoutMs}ms; continuing boot`);
+      resolve();
+    }, timeoutMs);
+  });
+  try {
+    await Promise.race([service.startBuiltinDatabase(), deadline]);
+  } catch (error) {
+    logger.warn(`Could not start built-in PostgreSQL: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    clearTimeout(timer);
   }
 }

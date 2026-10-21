@@ -12,8 +12,11 @@ import {
   HttpStatus,
   ParseUUIDPipe,
   BadRequestException,
+  ForbiddenException,
+  Res,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiQuery } from '@nestjs/swagger';
+import type { Response } from 'express';
+import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiQuery, ApiExtraModels, getSchemaPath } from '@nestjs/swagger';
 import { SessionService } from './session.service';
 import {
   CreateSessionDto,
@@ -42,14 +45,23 @@ import {
 } from './dto';
 import { Session } from './entities/session.entity';
 import { ChatSummary } from '../../engine/interfaces/whatsapp-engine.interface';
+import { paginate } from '../../common/utils/paginate';
 import { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
-import { RequireRole, CurrentApiKey, SessionScoped, RequireUnscopedKey } from '../auth/decorators/auth.decorators';
+import {
+  ChatScoped,
+  CurrentApiKey,
+  RequireRole,
+  RequireUnscopedKey,
+  SessionScoped,
+} from '../auth/decorators/auth.decorators';
+import { ChatScopeService } from '../auth/chat-scope.service';
 import { ApiKey, ApiKeyRole } from '../auth/entities/api-key.entity';
 import {
   ENGINE_NOT_READY_409,
   PAIRING_NOT_READY_409,
   PAIRING_TRANSPORT_503,
+  RECIPIENT_LOOKUP_503,
 } from '../../common/openapi/engine-status-responses';
 
 @ApiTags('sessions')
@@ -61,12 +73,13 @@ export class SessionController {
   constructor(
     private readonly sessionService: SessionService,
     private readonly auditService: AuditService,
+    private readonly chatScope: ChatScopeService,
   ) {}
 
   private transformSession(session: Session): SessionResponseDto {
-    // isActive() is the engine map itself, so this is read at response time — a session that just
+    // engineLoaded() reads the engine map itself, so this is read at response time: a session that just
     // finished reconnecting reports the engine in the same response that reports its status.
-    return SessionResponseDto.fromEntity(session, this.sessionService.isActive(session.id));
+    return SessionResponseDto.fromEntity(session, this.sessionService.engineLoaded(session));
   }
 
   @Post()
@@ -81,8 +94,20 @@ export class SessionController {
     description: 'Session created',
     type: SessionResponseDto,
   })
+  @ApiResponse({
+    status: 403,
+    description:
+      'Key lacks the OPERATOR role, is restricted to specific sessions, or set proxyUrl without the ADMIN role',
+  })
+  @ApiResponse({ status: 400, description: 'Validation failed, or the body carries a field the DTO does not declare.' })
   @ApiResponse({ status: 409, description: 'Session name already exists' })
-  async create(@Body() dto: CreateSessionDto): Promise<SessionResponseDto> {
+  async create(@Body() dto: CreateSessionDto, @CurrentApiKey() apiKey?: ApiKey): Promise<SessionResponseDto> {
+    // A session proxy carries the session's egress, including the gateway's fetches of caller-supplied
+    // URLs, so choosing one is a deployment decision: ADMIN only, like PATCH :sessionId/proxy. The
+    // global guard always attaches the key, so a missing one is refused too.
+    if (dto.proxyUrl && apiKey?.role !== ApiKeyRole.ADMIN) {
+      throw new ForbiddenException('Setting proxyUrl requires an ADMIN key');
+    }
     const session = await this.sessionService.create(dto);
     await this.auditService.logInfo(AuditAction.SESSION_CREATED, {
       sessionId: session.id,
@@ -108,6 +133,7 @@ export class SessionController {
       'Return only the session with exactly this name (case-sensitive); no match returns an empty array. ' +
       'An empty value or a repeated key is rejected with 400.',
   })
+  @ApiResponse({ status: 400, description: '`name` is empty or repeated.' })
   async findAll(
     @CurrentApiKey() apiKey?: ApiKey,
     @Query('limit') limit?: string,
@@ -120,7 +146,7 @@ export class SessionController {
       throw new BadRequestException('name must be a single non-empty value');
     }
     // Scope to the key's allowedSessions so a session-restricted key cannot enumerate every
-    // session. A null/empty allowlist (e.g. ADMIN) still lists all.
+    // session. A null/empty allowlist lists all whatever the key's role; a scoped ADMIN key is filtered too.
     const sessions = await this.sessionService.findAll(apiKey?.allowedSessions, {
       limit: limit ? parseInt(limit, 10) : undefined,
       offset: offset ? parseInt(offset, 10) : undefined,
@@ -129,6 +155,7 @@ export class SessionController {
     return sessions.map(s => this.transformSession(s));
   }
 
+  @ChatScoped('agnostic')
   @Get(':sessionId')
   @ApiOperation({ summary: 'Get session by ID' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
@@ -137,6 +164,7 @@ export class SessionController {
     description: 'Session details',
     type: SessionResponseDto,
   })
+  @ApiResponse({ status: 400, description: 'The session id is not a UUID' })
   @ApiResponse({ status: 404, description: 'Session not found' })
   async findOne(@Param('sessionId', ParseUUIDPipe) id: string): Promise<SessionResponseDto> {
     const session = await this.sessionService.findOne(id);
@@ -151,6 +179,7 @@ export class SessionController {
     description: 'Effective session configuration',
     type: SessionConfigResponseDto,
   })
+  @ApiResponse({ status: 400, description: 'The session id is not a UUID' })
   @ApiResponse({ status: 404, description: 'Session not found' })
   async getConfig(@Param('sessionId', ParseUUIDPipe) id: string): Promise<SessionConfigResponseDto> {
     return this.sessionService.getConfig(id);
@@ -174,6 +203,7 @@ export class SessionController {
   })
   @ApiResponse({ status: 400, description: 'A supplied value is outside its accepted range' })
   @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({ status: 409, description: 'The session config kept changing under concurrent requests; retry' })
   async updateConfig(
     @Param('sessionId', ParseUUIDPipe) id: string,
     @Body() dto: UpdateSessionConfigDto,
@@ -196,17 +226,18 @@ export class SessionController {
     description: 'Effective proxy configuration',
     type: SessionProxyResponseDto,
   })
+  @ApiResponse({ status: 400, description: 'The session id is not a UUID' })
   @ApiResponse({ status: 404, description: 'Session not found' })
   async getProxy(@Param('sessionId', ParseUUIDPipe) id: string): Promise<SessionProxyResponseDto> {
     return this.sessionService.getProxy(id);
   }
 
   @Patch(':sessionId/proxy')
-  @RequireRole(ApiKeyRole.OPERATOR)
-  // Routing a session's whole egress through an attacker-chosen host is an instance-level decision,
-  // not a per-session one. Before this route existed, `proxyUrl` could only be set through POST
-  // /sessions, which is unscoped by the fence above, so a key restricted to specific sessions could
-  // never configure a proxy. Keep that reachability rather than widening it as a side effect.
+  // A session proxy carries all of the session's egress, including the gateway's fetches of
+  // caller-supplied URLs, and its host is not checked against internal addresses: it is trusted
+  // egress chosen by the deployment's administrator. Setting or clearing it is therefore ADMIN only,
+  // like proxyUrl on POST /sessions, and never open to a key restricted to specific sessions.
+  @RequireRole(ApiKeyRole.ADMIN)
   @RequireUnscopedKey()
   @ApiOperation({
     summary: 'Update the per-session egress proxy configuration',
@@ -221,6 +252,7 @@ export class SessionController {
     type: SessionProxyResponseDto,
   })
   @ApiResponse({ status: 400, description: 'Invalid proxyUrl' })
+  @ApiResponse({ status: 403, description: 'Key lacks the ADMIN role, or is restricted to specific sessions' })
   @ApiResponse({ status: 404, description: 'Session not found' })
   async updateProxy(
     @Param('sessionId', ParseUUIDPipe) id: string,
@@ -240,6 +272,7 @@ export class SessionController {
   @ApiOperation({ summary: 'Delete a session' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiResponse({ status: 204, description: 'Session deleted' })
+  @ApiResponse({ status: 400, description: 'The session id is not a UUID' })
   @ApiResponse({ status: 404, description: 'Session not found' })
   @ApiResponse({
     status: 409,
@@ -270,7 +303,14 @@ export class SessionController {
     description: 'Session started',
     type: SessionResponseDto,
   })
-  @ApiResponse({ status: 400, description: 'Session already started' })
+  @ApiResponse({
+    status: 400,
+    description:
+      'Session already started or already starting, or this node is at its MAX_CONCURRENT_SESSIONS cap ' +
+      '(`Maximum concurrent sessions reached (N)`), answered only after the 404 and the 409 for a ' +
+      'session running on another node; a start refused at the cap launches nothing and leaves a ' +
+      'stop in place.',
+  })
   @ApiResponse({ status: 404, description: 'Session not found' })
   @ApiResponse({
     status: 409,
@@ -280,10 +320,28 @@ export class SessionController {
       'SESSION_NAME_TEARDOWN_PENDING`; wait for it to settle and retry. No destructive side ' +
       'effect runs before this refusal. Also returned when another node currently holds this ' +
       "session's engine: only the owner may start it, and the claim is refused before any engine " +
-      'is launched, so no second connection to the account is opened.',
+      'is launched, so no second connection to the account is opened. Also returned, with no `code`, ' +
+      'when a stop, a force-kill that found a running engine to kill, or a data import (`stopOrphans`) ' +
+      'of this session began or finished while the start was waiting, or a delete of it was still ' +
+      'running: the start yields and launches nothing. After a stop or force-kill, a new POST /start ' +
+      'clears it and starts the session; after a delete, or an import that removed the session, the ' +
+      'retry answers 404.',
+  })
+  @ApiResponse({
+    status: 503,
+    description:
+      "The gateway is shutting down, or the engine's browser or socket connection died during launch and " +
+      'the one automatic retry failed too; no engine is left running, so the start can be retried.',
+  })
+  @ApiResponse({
+    status: 504,
+    description:
+      'The engine did not finish starting within its timeout (WhatsApp Web or the network unreachable, ' +
+      'a stalled browser or resource limit, or, on whatsapp-web.js, an unreachable proxyUrl or the auth ' +
+      'timeout); the engine is torn down and the start can be retried.',
   })
   async start(@Param('sessionId', ParseUUIDPipe) id: string): Promise<SessionResponseDto> {
-    const session = await this.sessionService.start(id);
+    const session = await this.sessionService.start(id, { explicit: true });
     await this.auditService.logInfo(AuditAction.SESSION_STARTED, {
       sessionId: session.id,
       sessionName: session.name,
@@ -301,6 +359,7 @@ export class SessionController {
     description: 'Session stopped',
     type: SessionResponseDto,
   })
+  @ApiResponse({ status: 400, description: 'The session id is not a UUID' })
   @ApiResponse({ status: 404, description: 'Session not found' })
   @ApiResponse({
     status: 409,
@@ -405,6 +464,14 @@ export class SessionController {
   })
   @ApiResponse({ status: 400, description: 'Session is not started' })
   @ApiResponse({ status: 404, description: 'Session not found' })
+  @ApiResponse({
+    status: 502,
+    description:
+      'Session was stopped locally, but the engine force-kill did not complete (the force-destroy ' +
+      'threw or timed out, so the engine process may still be running). The body carries ' +
+      "`code: 'SESSION_FORCE_KILL_INCOMPLETE'`; the status is settled to `disconnected` and no " +
+      'success audit is written. Restart the node to reap a leaked process.',
+  })
   async forceKill(@Param('sessionId', ParseUUIDPipe) id: string): Promise<SessionResponseDto> {
     const session = await this.sessionService.forceKill(id);
     await this.auditService.logInfo(AuditAction.SESSION_FORCE_KILLED, {
@@ -438,7 +505,15 @@ export class SessionController {
 
   @Post(':sessionId/pairing-code')
   @RequireRole(ApiKeyRole.OPERATOR)
-  @ApiOperation({ summary: 'Request an 8-char pairing code to link via phone number (alternative to QR)' })
+  @ApiOperation({
+    summary: 'Request an 8-char pairing code to link via phone number (alternative to QR)',
+    description:
+      'On the whatsapp-web.js engine, only request a code for a number you are prepared to re-link. A request ' +
+      'for a number that already has a linked session has been observed to end with WhatsApp revoking that ' +
+      'device: the linked session logs out, its credentials are deleted and it falls back to `qr_ready`. ' +
+      'Nothing refuses such a request, because the guards check the session state and never the number. ' +
+      'Baileys was not affected in the same tests. Link by QR when a session of that number must stay up.',
+  })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiResponse({ status: 201, description: 'Pairing code generated', type: PairingCodeResponseDto })
   @ApiResponse({ status: 400, description: 'Session not started or already authenticated' })
@@ -454,6 +529,7 @@ export class SessionController {
 
   // Shares a Path Item with GroupController's POST on the same route — one parameter name for the
   // one positional segment, or the contract splits it into two entries.
+  @ChatScoped('filtered')
   @Get(':sessionId/groups')
   @ApiOperation({ summary: 'Get all groups for a session' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
@@ -469,22 +545,25 @@ export class SessionController {
     description:
       'WhatsApp did not answer the group-list query. Deliberately not reported as an empty list — ' +
       'the engine returns the same empty value for "you are in no groups", and a caller cannot tell ' +
-      'those apart from the body.',
+      'those apart from the body. On Baileys, also answered when WhatsApp rate-limits or times out the ' +
+      'request (code 429 or 408); retry after a pause.',
   })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   @ApiQuery({ name: 'limit', required: false, description: 'Max groups to return (1–1000, default 1000)' })
   @ApiQuery({ name: 'offset', required: false, description: 'Number of groups to skip (for paging)' })
   async getGroups(
     @Param('sessionId', ParseUUIDPipe) id: string,
+    @CurrentApiKey() apiKey?: ApiKey,
     @Query('limit') limit?: string,
     @Query('offset') offset?: string,
   ): Promise<{ id: string; name: string; linkedParentJID?: string | null }[]> {
-    return this.sessionService.getGroups(id, {
-      limit: limit ? parseInt(limit, 10) : undefined,
-      offset: offset ? parseInt(offset, 10) : undefined,
-    });
+    // Filtered before paging, as getChats is, so a chat-restricted key sees only its groups and
+    // never a short window while an allowed group sat just past it.
+    const visible = await this.chatScope.filter(apiKey, await this.sessionService.listGroups(id), g => g.id);
+    return paginate(visible, limit ? parseInt(limit, 10) : undefined, offset ? parseInt(offset, 10) : undefined);
   }
 
+  @ChatScoped('filtered')
   @Get(':sessionId/chats')
   @ApiOperation({ summary: 'Get active chats for a session' })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
@@ -495,22 +574,26 @@ export class SessionController {
   @ApiResponse({
     status: 503,
     description:
-      'The whatsapp-web.js page connection died mid-read, so nothing could be read. Deliberately not ' +
-      'reported as an empty list — a page that went away says nothing about the chats.',
+      'The whatsapp-web.js page connection died mid-read, or WhatsApp Web did not answer within the ' +
+      'protocol timeout, so nothing could be read. Deliberately not reported as an empty list: a page ' +
+      'that went away says nothing about the chats.',
   })
   @ApiQuery({ name: 'limit', required: false, description: 'Max chats to return (1–1000, default 1000)' })
   @ApiQuery({ name: 'offset', required: false, description: 'Number of chats to skip (for paging)' })
   async getChats(
     @Param('sessionId', ParseUUIDPipe) id: string,
+    @CurrentApiKey() apiKey?: ApiKey,
     @Query('limit') limit?: string,
     @Query('offset') offset?: string,
   ): Promise<ChatSummary[]> {
-    return this.sessionService.getChats(id, {
-      limit: limit ? parseInt(limit, 10) : undefined,
-      offset: offset ? parseInt(offset, 10) : undefined,
-    });
+    // This route is admitted to a chat-restricted key because it FILTERS to the key's chats rather
+    // than naming one in the path. Filter BEFORE paginating: filtering the page instead would give a
+    // restricted key a short or empty window while an allowed chat sat just past it.
+    const visible = await this.chatScope.filter(apiKey, await this.sessionService.listChats(id), chat => chat.id);
+    return paginate(visible, limit ? parseInt(limit, 10) : undefined, offset ? parseInt(offset, 10) : undefined);
   }
 
+  @ChatScoped('fenced')
   @Post(':sessionId/chats/read')
   @RequireRole(ApiKeyRole.OPERATOR)
   @HttpCode(HttpStatus.OK)
@@ -520,9 +603,10 @@ export class SessionController {
     status: 200,
     description:
       'Returns `{ success }`. `false` means the engine declined to act: the Baileys engine sends the ' +
-      "read receipt against the chat's last known message, so a chat it has seen no message in is " +
-      'reported as declined rather than marked read. The whatsapp-web.js engine reads the chat from ' +
-      'the page and needs no local history.',
+      'read receipt against the newest message the chat received, so a chat it has received no ' +
+      "message in (one holding only the account's own sends included) is reported as declined " +
+      'rather than marked read. The whatsapp-web.js engine reads the chat from the page and needs no ' +
+      'local history.',
     type: SessionActionResponseDto,
   })
   @ApiResponse({ status: 400, description: 'Session not ready' })
@@ -542,6 +626,7 @@ export class SessionController {
     return { success };
   }
 
+  @ChatScoped('fenced')
   @Post(':sessionId/presence/subscribe')
   @RequireRole(ApiKeyRole.OPERATOR)
   @HttpCode(HttpStatus.OK)
@@ -567,6 +652,7 @@ export class SessionController {
   @ApiResponse({ status: 404, description: 'Session not found' })
   @ApiResponse({ status: 501, description: 'The active engine cannot observe presence (whatsapp-web.js)' })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  @ApiResponse({ status: 503, description: RECIPIENT_LOOKUP_503 })
   async subscribeToPresence(
     @Param('sessionId', ParseUUIDPipe) id: string,
     @Body() dto: SubscribePresenceDto,
@@ -583,15 +669,33 @@ export class SessionController {
       'Publishes whether this account appears online. WhatsApp routes notifications away from the ' +
       'phone while a linked device announces itself online, so a headless bot that never goes ' +
       "offline suppresses the phone's own alerts — set `available: false` to hand them back.\n\n" +
-      'The setting belongs to the connection: it does not survive a restart or reconnect and must ' +
-      'be re-issued after `session.status` reports one (on Baileys the socket re-announces itself ' +
-      'per its connect-time behaviour). Supported on both engines.',
+      'A successful call is remembered for the life of the running engine and re-applied once each ' +
+      'time that connection opens, including a Baileys transient reconnect: the socket announces ' +
+      'itself on connect (`available` unless `BAILEYS_MARK_ONLINE_ON_CONNECT=false`), which would ' +
+      "otherwise replace the caller's choice. The preference is dropped whenever the gateway replaces " +
+      'the engine: stop, restart, reconnect recovery, a watchdog recycle, or a takeover by another ' +
+      'node. Re-issue it after `session.status` reports `ready` again. On Baileys, typing, recording ' +
+      'and outbound sends do not publish global presence.\n\n' +
+      'On Baileys the call fails with 409 when the account push name has not synced yet — the ' +
+      'library would otherwise accept the request and send nothing. Supported on both engines.',
   })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiResponse({ status: 200, description: 'Presence published', type: SessionActionResponseDto })
   @ApiResponse({ status: 400, description: 'Session not started, or validation failed' })
   @ApiResponse({ status: 404, description: 'Session not found' })
-  @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
+  @ApiResponse({
+    status: 409,
+    description:
+      ENGINE_NOT_READY_409 +
+      ' On Baileys this route also answers `409` for a `ready` session whose account push name has ' +
+      'not synced yet. Nothing was sent, and a retry succeeds only once the name has synced.',
+  })
+  @ApiResponse({
+    status: 503,
+    description:
+      'The whatsapp-web.js page connection died, or WhatsApp Web did not answer within the protocol ' +
+      'timeout. Nothing was confirmed; setting presence converges when repeated, so a retry is safe.',
+  })
   async setOnlinePresence(
     @Param('sessionId', ParseUUIDPipe) id: string,
     @Body() dto: SetOwnPresenceDto,
@@ -600,6 +704,7 @@ export class SessionController {
     return { success: true };
   }
 
+  @ChatScoped('fenced')
   @Get(':sessionId/presence/:chatId')
   @RequireRole(ApiKeyRole.VIEWER)
   @ApiOperation({
@@ -614,16 +719,28 @@ export class SessionController {
   })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'chatId', description: 'Chat ID as subscribed' })
-  @ApiResponse({ status: 200, description: 'Last reported presence, or null', type: ChatPresenceResponseDto })
+  @ApiExtraModels(ChatPresenceResponseDto)
+  @ApiResponse({
+    status: 200,
+    description: 'Last reported presence, or null',
+    schema: { nullable: true, allOf: [{ $ref: getSchemaPath(ChatPresenceResponseDto) }] },
+  })
+  @ApiResponse({ status: 400, description: 'The session id is not a UUID' })
   @ApiResponse({ status: 404, description: 'Session not found' })
   async getPresence(
     @Param('sessionId', ParseUUIDPipe) id: string,
     @Param('chatId') chatId: string,
-  ): Promise<ChatPresenceResponseDto | null> {
+    @Res() res: Response,
+  ): Promise<void> {
     const presence = await this.sessionService.getPresence(id, chatId);
-    return presence ? { ...presence, observedAt: new Date(presence.observedAt) } : null;
+    const body: ChatPresenceResponseDto | null = presence
+      ? { ...presence, observedAt: new Date(presence.observedAt) }
+      : null;
+    // Written directly: Nest answers a returned null with an empty body, not the JSON `null` above.
+    res.json(body);
   }
 
+  @ChatScoped('fenced')
   @Post(':sessionId/chats/unread')
   @RequireRole(ApiKeyRole.OPERATOR)
   @HttpCode(HttpStatus.OK)
@@ -647,10 +764,16 @@ export class SessionController {
     return { success };
   }
 
+  @ChatScoped('fenced')
   @Delete(':sessionId/chats/:chatId/messages')
   @RequireRole(ApiKeyRole.OPERATOR)
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Delete every message in a chat, keeping the chat itself' })
+  @ApiOperation({
+    summary: 'Delete every message in a chat, keeping the chat itself',
+    description:
+      "On success the gateway also removes its stored copies of the chat's messages (rows, inline and archived " +
+      'media, search entries) and emits `message:deleted` for each. Changes made on the phone are not mirrored.',
+  })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiParam({ name: 'chatId', description: "Chat JID, e.g. 1234567890-123@g.us (URL-encode the '@')" })
   @ApiResponse({
@@ -677,6 +800,7 @@ export class SessionController {
     return { success };
   }
 
+  @ChatScoped('fenced')
   @Post(':sessionId/chats/archive')
   @RequireRole(ApiKeyRole.OPERATOR)
   @HttpCode(HttpStatus.OK)
@@ -706,6 +830,7 @@ export class SessionController {
     return { success };
   }
 
+  @ChatScoped('fenced')
   @Post(':sessionId/chats/mute')
   @RequireRole(ApiKeyRole.OPERATOR)
   @HttpCode(HttpStatus.OK)
@@ -742,6 +867,7 @@ export class SessionController {
     return { success: true };
   }
 
+  @ChatScoped('fenced')
   @Post(':sessionId/chats/pin')
   @RequireRole(ApiKeyRole.OPERATOR)
   @HttpCode(HttpStatus.OK)
@@ -776,10 +902,16 @@ export class SessionController {
     return { success };
   }
 
+  @ChatScoped('fenced')
   @Post(':sessionId/chats/delete')
   @RequireRole(ApiKeyRole.OPERATOR)
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Delete a chat from the chat list (e.g. a group you have left)' })
+  @ApiOperation({
+    summary: 'Delete a chat from the chat list (e.g. a group you have left)',
+    description:
+      "On success the gateway also removes its stored copies of the chat's messages (rows, inline and archived " +
+      'media, search entries) and emits `message:deleted` for each. Changes made on the phone are not mirrored.',
+  })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiResponse({ status: 200, description: 'Chat deleted successfully', type: SessionActionResponseDto })
   @ApiResponse({ status: 400, description: 'Session not ready' })
@@ -799,12 +931,19 @@ export class SessionController {
     return { success };
   }
 
+  @ChatScoped('fenced')
   @Post(':sessionId/chats/typing')
   @RequireRole(ApiKeyRole.OPERATOR)
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: "Send a typing/recording presence indicator to a chat (or clear it with 'paused')" })
   @ApiParam({ name: 'sessionId', description: 'Session ID' })
   @ApiResponse({ status: 200, description: 'Presence sent', type: SessionActionResponseDto })
+  @ApiResponse({
+    status: 400,
+    description:
+      'Session is not started, or validation failed (an empty chatId, a state other than typing, ' +
+      'recording or paused, or a body field the DTO does not declare).',
+  })
   @ApiResponse({ status: 404, description: 'Session not found' })
   @ApiResponse({ status: 409, description: ENGINE_NOT_READY_409 })
   async sendChatState(

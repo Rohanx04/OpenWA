@@ -1,5 +1,47 @@
-import { DeliveryStatus, IncomingMessage, MessageType } from '../interfaces/whatsapp-engine.interface';
+import type { proto } from '@whiskeysockets/baileys';
+import {
+  DeliveryStatus,
+  EventResponseKind,
+  IncomingMessage,
+  MessageType,
+} from '../interfaces/whatsapp-engine.interface';
 import { chatKind } from '../identity/wa-id';
+
+/**
+ * Content types that change or annotate another message and carry nothing of their own: a poll vote,
+ * an in-chat pin, a keep-in-chat toggle, an album header (its photos arrive as their own messages), an
+ * encrypted reaction, an event RSVP, an encrypted edit and an encrypted comment. Mapped, they would
+ * surface as a bodyless `unknown` message, so the live and history paths drop them instead. The live
+ * path first reads an encrypted edit or reaction it holds the secret for (baileys-secret-payload.ts),
+ * and drops only what it cannot read.
+ */
+export const BAILEYS_NON_CONTENT_TYPES: ReadonlySet<string> = new Set([
+  'pollUpdateMessage',
+  'pinInChatMessage',
+  'keepInChatMessage',
+  'albumMessage',
+  'encReactionMessage',
+  'encEventResponseMessage',
+  'secretEncryptedMessage',
+  'encCommentMessage',
+]);
+
+/**
+ * Map Baileys' `EventResponseMessage.EventResponseType` (UNKNOWN=0, GOING=1, NOT_GOING=2, MAYBE=3)
+ * to the neutral RSVP kind. Matched by number so the mapper needs no runtime proto import.
+ */
+export function mapBaileysEventResponseType(type: number | null | undefined): EventResponseKind {
+  switch (type) {
+    case 1:
+      return 'going';
+    case 2:
+      return 'not_going';
+    case 3:
+      return 'maybe';
+    default:
+      return 'unknown';
+  }
+}
 
 /**
  * Map a Baileys message content-type token (from `getContentType`) to the engine-neutral
@@ -23,6 +65,8 @@ export function mapBaileysMessageType(
     case 'imageMessage':
       return 'image';
     case 'videoMessage':
+    case 'ptvMessage':
+      // A round video note is a VideoMessage under its own content key.
       return 'video';
     case 'audioMessage':
       return isPtt ? 'voice' : 'audio';
@@ -166,6 +210,38 @@ export function extractBaileysBody(content: BaileysBodyContent): string {
 }
 
 /**
+ * Write edited text into the slot a message carries its text in, which is where
+ * {@link extractBaileysBody} reads it back: the text itself, or the caption of a photo, video or
+ * document. Everything else the content holds (media keys, thumbnail, link preview) is kept, as
+ * WhatsApp Web keeps it (an edit changes the message's body or caption in place), so the edited
+ * message is still a valid message of its original type when it is quoted or forwarded. Returns
+ * false, changing nothing, when the content has no such slot.
+ * Pass the NORMALIZED content: it is a reference into the message, so the write lands there.
+ */
+export function setBaileysText(
+  content: Pick<
+    BaileysBodyContent,
+    'conversation' | 'extendedTextMessage' | 'imageMessage' | 'videoMessage' | 'documentMessage'
+  >,
+  text: string,
+): boolean {
+  if (typeof content.conversation === 'string') {
+    content.conversation = text;
+    return true;
+  }
+  if (content.extendedTextMessage) {
+    content.extendedTextMessage.text = text;
+    return true;
+  }
+  const media = content.imageMessage ?? content.videoMessage ?? content.documentMessage;
+  if (media) {
+    media.caption = text;
+    return true;
+  }
+  return false;
+}
+
+/**
  * Joins the vCards of a `contactsArrayMessage` into one string, in the order they were shared.
  * Returns `undefined` (not `''`) when there are no vCards to join, so it composes with `??` in
  * {@link extractBaileysBody} the same way every other optional-field lookup there does.
@@ -268,7 +344,7 @@ export interface BaileysButtonReplyContent {
  * Extract the stable id (and visible label) when the sender tapped a business button, template
  * quick-reply, list row, or native-flow control. Returns `undefined` when the content is not a
  * reply shape, or when WhatsApp omitted the id a caller would act on. Pass the NORMALIZED content,
- * as the adapter does — a reply in a disappearing chat nests under `ephemeralMessage`.
+ * as the adapter does: a reply in a disappearing chat nests under `ephemeralMessage`.
  */
 export function extractBaileysButtonReply(
   content: BaileysButtonReplyContent,
@@ -309,7 +385,7 @@ export function extractBaileysButtonReply(
 
   if (contentType === 'interactiveResponseMessage') {
     const flow = content.interactiveResponseMessage?.nativeFlowResponseMessage;
-    // Replies must carry a stable id — a display-text-only params payload is not actionable.
+    // Replies must carry a stable id: a display-text-only params payload is not actionable.
     const fromParams = parseNativeFlowButtonParams(flow?.paramsJson, { requireId: true });
     if (fromParams) {
       return fromParams;
@@ -343,6 +419,12 @@ export interface BaileysButtonsPromptContent {
     buttons?: Array<{
       buttonId?: string | null;
       buttonText?: { displayText?: string | null } | null;
+      /**
+       * Present on a NATIVE_FLOW button. Only `name` is read, to decide whether the button can be
+       * answered at all; the params of a classic button's reply come from `buttonId`/`buttonText`
+       * beside it, not from this block.
+       */
+      nativeFlowInfo?: { name?: string | null } | null;
     } | null> | null;
   } | null;
   interactiveMessage?: {
@@ -385,14 +467,19 @@ const CLICKABLE_NATIVE_FLOW_NAMES = new Set(['quick_reply', 'button_click']);
 
 /**
  * One clickable choice, carrying the proto index a template reply must echo. Not published on
- * {@link IncomingMessage.buttons} — callers send `id` (and optional `text`) and the click path
+ * {@link IncomingMessage.buttons}: callers send `id` (and optional `text`) and the click path
  * looks the index up.
  */
 export interface BaileysClickableChoice {
   id: string;
   text: string;
-  /** `proto.IHydratedTemplateButton.index` when present; otherwise the choice's position. */
-  index: number;
+  /**
+   * `proto.IHydratedTemplateButton.index` when the prompt declares one, otherwise the choice's
+   * position. Undefined only for a hydrated template that numbers some of its buttons and not this
+   * one: the reply then omits `selectedIndex` rather than inventing a number that belongs to a
+   * different button. Every other prompt shape numbers by position, so it is always set there.
+   */
+  index?: number;
 }
 
 /**
@@ -422,8 +509,11 @@ export type BaileysButtonClickError = 'not_a_prompt' | 'unknown_button';
 export interface BaileysButtonClickPayload {
   id: string;
   text: string;
-  /** Index into template hydrated buttons when the prompt is a template; otherwise the choice's position. */
-  index: number;
+  /**
+   * Index into template hydrated buttons when the prompt is a template; otherwise the choice's
+   * position. Absent for a choice a numbered template left unnumbered, see {@link BaileysClickableChoice}.
+   */
+  index?: number;
   /** `AnyMessageContent` fragment: `{buttonReply,type}` or `{listReply}`. */
   content: Record<string, unknown>;
 }
@@ -431,7 +521,7 @@ export interface BaileysButtonClickPayload {
 /**
  * Resolve a click against a stored business prompt: validate the content type and button id, fill
  * in the display text when the caller omitted it, and build the `sendMessage` content WhatsApp
- * expects for that prompt shape. CTA url/call entries are not clickable — only quick-reply style
+ * expects for that prompt shape. CTA url/call entries are not clickable, only quick-reply style
  * choices and list rows. When several choices share an id, a caller-supplied `text` disambiguates
  * (a list reusing `rowId` across sections).
  */
@@ -479,7 +569,7 @@ export function resolveBaileysButtonClick(
 
 /**
  * Choices that can be answered with a structured reply. URL/call CTAs and other native-flow names
- * are excluded — the WhatsApp client opens CTAs locally and there is no reply shape to fake.
+ * are excluded: the WhatsApp client opens CTAs locally and there is no reply shape to fake.
  * {@link extractBaileysButtons} is a projection of this list, so the published `buttons[]` and the
  * click allowlist cannot disagree.
  */
@@ -492,6 +582,14 @@ export function extractBaileysClickableButtons(
       (content.buttonsMessage?.buttons ?? []).map((button, position) => {
         const text = button?.buttonText?.displayText?.trim();
         if (!text) return undefined;
+        // A button in this envelope can still be a native-flow CTA (open a URL, dial a number), and
+        // those cannot be answered with a reply. Keyed off the presence of nativeFlowInfo rather
+        // than the type enum, which reaches us as a number or as its string name depending on how
+        // the message was decoded, and which a CTA may omit entirely.
+        const flow = button?.nativeFlowInfo;
+        if (flow && !CLICKABLE_NATIVE_FLOW_NAMES.has(flow.name ?? '')) {
+          return undefined;
+        }
         const id = button?.buttonId?.trim() || text;
         return { id, text, index: position };
       }),
@@ -519,13 +617,30 @@ export function extractBaileysClickableButtons(
       content.templateMessage?.hydratedTemplate?.hydratedButtons ??
       content.templateMessage?.hydratedFourRowTemplate?.hydratedButtons ??
       [];
+    // One index namespace per prompt. `selectedIndex` goes back to the business bot verbatim, and a
+    // hydrated template numbers its buttons itself, so the array position is only a stand-in for a
+    // template that carries no numbering at all. Falling back per entry mixed the two inside one
+    // prompt, where a position can collide with another button's declared index and answer the bot
+    // with a number belonging to a different choice.
+    //
+    // An entry the template left unnumbered is still offered, with no index of its own: the field
+    // has explicit presence on the wire, so the reply carries the id and the label and simply omits
+    // `selectedIndex`. Dropping the choice instead would hide a button the user can see and tap in
+    // WhatsApp, and refuse it through the click route, which is a worse answer than one honest
+    // reply that names itself by id. The unnumbered case includes a template whose only numbered
+    // button is a url or call CTA, which is never offered here in the first place.
+    const numbered = hydrated.some(entry => typeof entry?.index === 'number');
     return collectChoices(
       hydrated.map((entry, position) => {
         const quick = entry?.quickReplyButton;
         if (!quick?.displayText?.trim()) return undefined;
         const label = quick.displayText.trim();
-        const protoIndex = typeof entry?.index === 'number' ? entry.index : position;
-        return { id: quick.id?.trim() || label, text: label, index: protoIndex };
+        const protoIndex = numbered ? entry?.index : position;
+        return {
+          id: quick.id?.trim() || label,
+          text: label,
+          index: typeof protoIndex === 'number' ? protoIndex : undefined,
+        };
       }),
     );
   }
@@ -568,7 +683,7 @@ export function toBaileysButtonClickContent(
   contentType: string,
   buttonId: string,
   text: string,
-  index: number,
+  index: number | undefined,
 ): Record<string, unknown> {
   switch (contentType) {
     case 'buttonsMessage':
@@ -720,6 +835,7 @@ export interface BaileysContextContent {
   extendedTextMessage?: (BaileysContextCarrier & { backgroundArgb?: number | null; font?: number | null }) | null;
   imageMessage?: BaileysContextCarrier | null;
   videoMessage?: BaileysContextCarrier | null;
+  ptvMessage?: BaileysContextCarrier | null;
   audioMessage?: BaileysContextCarrier | null;
   documentMessage?: BaileysContextCarrier | null;
   stickerMessage?: BaileysContextCarrier | null;
@@ -758,6 +874,7 @@ export function extractBaileysContext(content: BaileysContextContent): BaileysMe
     content.extendedTextMessage ??
     content.imageMessage ??
     content.videoMessage ??
+    content.ptvMessage ??
     content.audioMessage ??
     content.documentMessage ??
     content.stickerMessage ??
@@ -770,9 +887,16 @@ export function extractBaileysContext(content: BaileysContextContent): BaileysMe
   // surface it so the store/viewer can render the story the way it was posted.
   const extText = content.extendedTextMessage;
   const contextInfo = subForContext?.contextInfo;
+  // WhatsApp stamps the timer on every message in a disappearing chat, a product, poll, contact card, live
+  // location, order or event included, so any content node answers when the carriers above have none.
+  const expiration =
+    contextInfo?.expiration ??
+    Object.values(content)
+      .map(node => (node as BaileysContextCarrier | null | undefined)?.contextInfo?.expiration)
+      .find((e): e is number => typeof e === 'number' && e > 0);
 
   const context: BaileysMessageContext = {
-    ephemeralDuration: contextInfo?.expiration ?? undefined,
+    ephemeralDuration: expiration ?? undefined,
     mentionedJids: contextInfo?.mentionedJid ?? undefined,
     backgroundArgb: typeof extText?.backgroundArgb === 'number' ? extText.backgroundArgb : undefined,
     font: typeof extText?.font === 'number' ? extText.font : undefined,
@@ -813,6 +937,17 @@ export function mapBaileysStatus(status: number | null | undefined): DeliverySta
   }
 }
 
+/** Extract native poll versions from content already normalized by Baileys. */
+export function extractBaileysPoll(content: proto.IMessage): IncomingMessage['poll'] {
+  const poll = content.pollCreationMessage ?? content.pollCreationMessageV2 ?? content.pollCreationMessageV3;
+  if (!poll) return undefined;
+  const options = (poll.options ?? [])
+    .map(option => option.optionName)
+    .filter((option): option is string => typeof option === 'string');
+  if (!options.length) return undefined;
+  return { name: poll.name ?? '', options, allowMultipleAnswers: poll.selectableOptionsCount !== 1 };
+}
+
 /**
  * The subset of a Baileys `WAMessage` the adapter reads (after proto extraction) to build the
  * base of an {@link IncomingMessage}. Declared explicitly so the neutral-shape logic is
@@ -820,10 +955,10 @@ export function mapBaileysStatus(status: number | null | undefined): DeliverySta
  */
 export interface BaileysIncomingFields {
   id: string;
-  /** The chat JID (`key.remoteJid`): a contact, a `@g.us` group, or `status@broadcast`. */
+  /** The chat JID (`key.remoteJid`): a contact, a `@g.us` group, `status@broadcast`, or a broadcast list. */
   remoteJid: string;
   fromMe: boolean;
-  /** Group sender (`key.participant`); `remoteJid` is the group JID for group messages. */
+  /** Sender in a group, status or broadcast list (`key.participant`); `remoteJid` names the chat. */
   participant?: string;
   body: string;
   /** Result of `getContentType(msg.message)`. */
@@ -843,6 +978,7 @@ export interface BaileysIncomingFields {
   /** Pre-extracted commerce ids. Populated by the adapter for `orderMessage` / `productMessage`. */
   order?: IncomingMessage['order'];
   product?: IncomingMessage['product'];
+  poll?: IncomingMessage['poll'];
   /** Pre-extracted button/list reply. Populated by the adapter when the user tapped a control. */
   button?: IncomingMessage['button'];
   /** Pre-extracted prompt choices. Populated by the adapter for business button/list prompts. */
@@ -860,10 +996,46 @@ export interface BaileysIncomingFields {
 }
 
 /**
- * Build a neutral {@link IncomingMessage} from extracted Baileys fields. The chat is always
- * `remoteJid` (Baileys reports the conversation directly); `fromMe` only flips from/to. The group
- * sender — and likewise the poster of a status broadcast — lives in `participant` (exposed as
- * `author`), matching the wwjs convention where `from` is the group JID / broadcast channel.
+ * The chat a message belongs to, from its raw key: `remoteJid`, except for a broadcast-list message
+ * the account received, which belongs to the 1:1 chat with its sender (`participant`). Mirrors
+ * Baileys' own `getChatId` (Utils/process-message.js), which files the chat list the same way, but
+ * falls back to the list instead of throwing when the key names no participant.
+ */
+export function baileysChatJid(remoteJid: string, participant: string | null | undefined, fromMe: boolean): string {
+  const isList = remoteJid.endsWith('@broadcast') && remoteJid !== 'status@broadcast';
+  return isList && !fromMe && participant ? participant : remoteJid;
+}
+
+/**
+ * Whether a stored key belongs to the chat `chatId` names: the chat the message is reported under
+ * ({@link baileysChatJid}), or the raw `remoteJid`, which a client may still hold for a list message.
+ * Both sides go through `neutral`, so the dialects of one chat compare equal.
+ */
+export function storedKeyInChat(
+  key: { remoteJid?: string | null; participant?: string | null; fromMe?: boolean | null },
+  chatId: string,
+  neutral: (jid: string) => string,
+): boolean {
+  const raw = key.remoteJid ?? '';
+  const want = neutral(chatId);
+  return neutral(raw) === want || neutral(baileysChatJid(raw, key.participant, key.fromMe === true)) === want;
+}
+
+/**
+ * The participant a live key names, or undefined when it names none. Baileys passes every live key
+ * through cleanMessage, which writes jidNormalizedUser(participant) back, and that is '' for the absent
+ * participant of a 1:1 chat. `??` keeps the empty string, which then reads as a sender that is nobody.
+ */
+export function keyParticipant(key: { participant?: string | null }): string | undefined {
+  return key.participant ? key.participant : undefined;
+}
+
+/**
+ * Build a neutral {@link IncomingMessage} from extracted Baileys fields. The chat is `remoteJid`
+ * (Baileys reports the conversation directly), except that a received broadcast-list message is filed
+ * under its sender's chat (see {@link baileysChatJid}); `fromMe` only flips from/to. The group sender,
+ * the poster of a status broadcast and the sender of a broadcast-list message all live in
+ * `participant` (exposed as `author`).
  */
 export function buildIncomingMessageFromBaileys(
   fields: BaileysIncomingFields,
@@ -875,7 +1047,7 @@ export function buildIncomingMessageFromBaileys(
   const rawChatId = fields.remoteJid;
   const isGroup = rawChatId.endsWith('@g.us');
   const isStatusBroadcast = rawChatId === 'status@broadcast';
-  const chatId = normalizeJid(rawChatId);
+  const chatId = normalizeJid(baileysChatJid(rawChatId, fields.participant, fields.fromMe));
   const self = normalizeJid(fields.selfJid ?? '');
 
   const incoming: IncomingMessage = {
@@ -884,7 +1056,7 @@ export function buildIncomingMessageFromBaileys(
     to: fields.fromMe ? chatId : self,
     chatId,
     // Native-flow replies sometimes put the visible label only in paramsJson (surfaced on `button`),
-    // not in `interactiveResponseMessage.body` — prefer an explicit body, else the button label.
+    // not in `interactiveResponseMessage.body`, so prefer an explicit body, else the button label.
     body: fields.body || fields.button?.text || '',
     type: mapBaileysMessageType(fields.contentType, fields.isPtt, fields.isCatalogShare),
     timestamp: fields.timestamp,
@@ -894,16 +1066,17 @@ export function buildIncomingMessageFromBaileys(
     isStatusBroadcast,
   };
 
-  // The sender behind a group message — or the poster behind a status broadcast — lives in
-  // `participant` (exposed as `author`), matching the wwjs convention where `from` is the group JID
-  // (or the shared status@broadcast channel). Without the status arm, buildIncomingStatus can only
-  // resolve the poster to the pseudo-JID itself and drops every Baileys status.
-  if ((isGroup || isStatusBroadcast) && fields.participant) {
+  // The sender behind a group message, the poster behind a status broadcast and the sender behind a
+  // broadcast-list message all live in `participant` (exposed as `author`). Without the status arm,
+  // buildIncomingStatus can only resolve the poster to the pseudo-JID itself and drops every Baileys
+  // status; the list arm keeps `author` on a list message too, where it repeats the chat's sender
+  // (or names the account, for a list message it sent).
+  if ((isGroup || rawChatId.endsWith('@broadcast')) && fields.participant) {
     incoming.author = normalizeJid(fields.participant);
   }
 
   // The lid check uses the RAW sender (participant in a group, else the chat JID) before normalization.
-  const senderJid = fields.participant ?? rawChatId;
+  const senderJid = fields.participant ? fields.participant : rawChatId;
   if (senderJid.endsWith('@lid')) {
     incoming.isLidSender = true;
   }
@@ -923,6 +1096,8 @@ export function buildIncomingMessageFromBaileys(
   if (fields.media) {
     incoming.media = fields.media;
   }
+
+  if (fields.poll) incoming.poll = fields.poll;
 
   if (fields.location) {
     incoming.location = fields.location;

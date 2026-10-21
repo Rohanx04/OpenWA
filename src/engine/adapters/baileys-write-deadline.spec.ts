@@ -45,7 +45,14 @@ function contacts(sock: Record<string, jest.Mock>, budgetMs: number): BaileysCon
   return new BaileysContacts(host, budgetMs);
 }
 
-const PNG = { mimetype: 'image/png', data: Buffer.from('x') };
+// A real 1x1 PNG: a picture write reads the header of its bytes before it reaches the socket.
+const PNG = {
+  mimetype: 'image/png',
+  data: Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64',
+  ),
+};
 
 describe('group writes report an unconfirmed write rather than success', () => {
   it.each([
@@ -74,6 +81,12 @@ describe('group writes report an unconfirmed write rather than success', () => {
     const groupLeave = jest.fn().mockResolvedValue(undefined);
     await expect(groups({ groupLeave }, 500).leaveGroup('123@g.us')).resolves.toBeUndefined();
     expect(groupLeave).toHaveBeenCalledWith('123@g.us');
+  });
+
+  it('names the operation that was not confirmed', async () => {
+    await expect(groups({ groupLeave: stub() }, 15).leaveGroup('123@g.us')).rejects.toThrow(
+      'WhatsApp did not confirm leaving the group in time',
+    );
   });
 });
 

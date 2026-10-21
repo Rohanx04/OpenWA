@@ -1,4 +1,4 @@
-import { BadRequestException, HttpException, Injectable, ServiceUnavailableException } from '@nestjs/common';
+import { BadRequestException, Injectable, OnApplicationShutdown, ServiceUnavailableException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { isUUID } from 'class-validator';
@@ -10,7 +10,15 @@ import { loadRemoteMediaBuffer } from '../../common/media/load-remote-media';
 import { SsrfBlockedError, SSRF_BLOCKED_CLIENT_MESSAGE } from '../../common/security/ssrf-guard';
 import { ConcurrencyLimiter } from '../../common/utils/concurrency-limiter';
 import { assertBase64WithinMediaCap, stripBase64DataUri } from '../message/media-cap.util';
-import { FfmpegConversionError, probeFfmpeg, runFfmpeg, videoEncodeArgs, voiceEncodeArgs } from './ffmpeg';
+import {
+  FfmpegConversionError,
+  FfmpegSpawnError,
+  killRunningConversions,
+  probeFfmpeg,
+  runFfmpeg,
+  videoEncodeArgs,
+  voiceEncodeArgs,
+} from './ffmpeg';
 import type { ConvertMediaDto } from './dto/convert-media.dto';
 
 /** What a conversion produced, in the same url-or-base64 vocabulary the send endpoints speak. */
@@ -24,15 +32,18 @@ export interface ConvertedMedia {
 }
 
 @Injectable()
-export class MediaConversionService {
+export class MediaConversionService implements OnApplicationShutdown {
   private readonly logger = createLogger('MediaConversionService');
-  /** Result of the binary probe. Cached because it cannot change without a restart. */
+  /**
+   * Result of the binary probe. Only a successful probe is kept: a failure can be a timeout or a
+   * transient spawn error on a loaded host, so the next request probes again.
+   */
   private binaryAvailable?: Promise<boolean>;
   /**
-   * Bounds concurrent ffmpeg processes (the rate limiter caps admission per second, not how many
-   * long-running processes stack up while each runs toward its timeout). Queue depth is a small
-   * multiple of the cap: each parked task holds its input buffer in heap, so anything beyond it
-   * answers 503 instead of accumulating.
+   * Bounds concurrent conversions, input load included (the rate limiter caps admission per second,
+   * not how many long-running processes stack up while each runs toward its timeout). Queue depth is
+   * a small multiple of the cap, so anything beyond it answers 503 instead of accumulating; a parked
+   * request holds only its own body, and at most the cap's worth of inputs sit in heap at once.
    */
   private readonly ffmpegGate: ConcurrencyLimiter;
 
@@ -44,6 +55,15 @@ export class MediaConversionService {
   ) {
     const concurrency = this.configService.get<number>('mediaConversion.concurrency', 2);
     this.ffmpegGate = new ConcurrencyLimiter(concurrency, concurrency * 4);
+  }
+
+  /**
+   * Kill the detached ffmpeg groups still running. Nest's own signal handler re-raises the signal
+   * once its hooks finish, so the process dies from it without ever emitting `exit`; this hook runs
+   * on that path and on `app.close()`.
+   */
+  onApplicationShutdown(): void {
+    killRunningConversions();
   }
 
   /**
@@ -77,26 +97,39 @@ export class MediaConversionService {
     outputMimetype: string,
   ): Promise<ConvertedMedia> {
     await this.assertAvailable();
-    const input = await this.resolveInput(sessionId, dto);
 
     try {
-      const output = await this.ffmpegGate.run(() =>
-        runFfmpeg(input, 'bin', outputExtension, encodeArgs, {
+      // The input is loaded inside the gate: a download of up to MEDIA_DOWNLOAD_MAX_BYTES, or a decoded
+      // base64 body, held for each request that had not yet reached a slot, would stack 50 MiB a request
+      // in heap while the gate answers 503 only after the downloads finished.
+      const { input, output } = await this.ffmpegGate.run(async () => {
+        const loaded = await this.resolveInput(sessionId, dto);
+        const converted = await runFfmpeg(loaded, 'bin', outputExtension, encodeArgs, {
           ffmpegPath: this.configService.get<string>('mediaConversion.ffmpegPath', 'ffmpeg'),
           timeoutMs: this.configService.get<number>('mediaConversion.timeoutMs', 60_000),
           maxOutputBytes: this.configService.get<number>('mediaConversion.maxOutputBytes', 50 * 1024 * 1024),
-        }),
-      );
+        });
+        return { input: loaded, output: converted };
+      });
       this.logger.log('Media converted', { inputBytes: input.length, outputBytes: output.length, outputMimetype });
       return { base64: output.toString('base64'), mimetype: outputMimetype, bytes: output.length };
     } catch (error) {
       if (error instanceof Error && error.message === 'ConcurrencyLimiter queue full') {
         throw new ServiceUnavailableException('Media conversion is busy — retry shortly');
       }
+      if (error instanceof FfmpegSpawnError) {
+        // The host could not start ffmpeg (a binary removed since the probe, or a process, memory or
+        // descriptor limit), which is no fault of the input. Probe again on the next call.
+        this.binaryAvailable = undefined;
+        this.logger.warn('Media conversion could not start ffmpeg', { reason: error.message });
+        throw new ServiceUnavailableException(
+          'Media conversion could not start the ffmpeg binary. Retry shortly, or check FFMPEG_PATH.',
+        );
+      }
       if (error instanceof FfmpegConversionError) {
         // ffmpeg's stderr is about the caller's own bytes, so returning it is what makes a rejection
         // actionable. It never names a path the caller did not supply: the only paths in the command
-        // are the temp files this process created.
+        // are the temp files this process created, and runFfmpeg strips their directory.
         this.logger.warn('Media conversion failed', { reason: error.message, detail: error.detail });
         throw new BadRequestException(error.detail ? `${error.message}: ${error.detail}` : error.message);
       }
@@ -147,15 +180,16 @@ export class MediaConversionService {
         const { data } = await loadRemoteMediaBuffer(dto.url, proxyUrl);
         return data;
       } catch (error) {
-        // The fetch layer throws plain Errors (bad status, over the byte cap) and SsrfBlockedError,
-        // none of them HttpExceptions — unmapped they leave as a 500 for what is squarely a bad
-        // input, while the send path answers 400 for the very same URL. An SSRF block is reported
-        // generically: its raw message names the resolved internal address.
+        // The fetch layer already answers 400/413 for a bad status, a timeout, a failed connection
+        // or a body over the cap (503 when the session proxy fails before any response), exactly
+        // as on the send path. An SSRF block is reported
+        // generically: its raw message names the resolved internal address. Anything else (a
+        // malformed session proxy, say) is a server fault and stays a 500, as it does on a send,
+        // rather than a 400 carrying a message that can name the proxy.
         if (error instanceof SsrfBlockedError) {
           throw new BadRequestException(SSRF_BLOCKED_CLIENT_MESSAGE);
         }
-        if (error instanceof HttpException) throw error;
-        throw new BadRequestException(error instanceof Error ? error.message : String(error));
+        throw error;
       }
     }
     throw new BadRequestException('Either url or base64 must be provided');
@@ -175,13 +209,16 @@ export class MediaConversionService {
   }
 
   /**
-   * Probe once per process. The promise itself is memoised rather than its result, so concurrent
+   * Probe until a probe succeeds. The promise itself is memoised rather than its result, so concurrent
    * first requests share one probe instead of each spawning their own.
    */
   private probeOnce(): Promise<boolean> {
     this.binaryAvailable ??= probeFfmpeg(this.configService.get<string>('mediaConversion.ffmpegPath', 'ffmpeg')).then(
       available => {
-        if (!available) this.logger.warn('Media conversion is enabled but ffmpeg could not be run');
+        if (!available) {
+          this.binaryAvailable = undefined;
+          this.logger.warn('Media conversion is enabled but ffmpeg could not be run');
+        }
         return available;
       },
     );

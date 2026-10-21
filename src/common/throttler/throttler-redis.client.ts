@@ -1,5 +1,5 @@
-import { ConfigService } from '@nestjs/config';
 import Redis, { RedisOptions } from 'ioredis';
+import { redisConnectionOptions } from '../../config/redis-options';
 
 /**
  * Upper bound for one throttler command. The storage fails OPEN on command error, so a bounded
@@ -8,6 +8,13 @@ import Redis, { RedisOptions } from 'ioredis';
  * which would otherwise never resolve.
  */
 export const THROTTLER_REDIS_COMMAND_TIMEOUT_MS = 2000;
+
+/**
+ * How long the throttler's socket may stay silent after a write before it is destroyed. Kept below the command
+ * timeout: with the two equal, the socket is torn down in the same millisecond the first command gives up, and
+ * the next tier's command is written to the still-open socket first, so a second request waits out its own timeout.
+ */
+export const THROTTLER_REDIS_SOCKET_TIMEOUT_MS = 1500;
 
 /**
  * Client options for the throttler's Redis backend, tuned so the fail-open posture of
@@ -25,22 +32,24 @@ export const THROTTLER_REDIS_COMMAND_TIMEOUT_MS = 2000;
  * - maxRetriesPerRequest: null — disables ioredis's periodic pending-queue flush; with the
  *   offline queue disabled there is nothing to flush, and per-command latency is bounded by
  *   commandTimeout instead of a retry counter.
+ * - socketTimeout: a peer that stays connected but stops answering never errors the socket, so
+ *   commandTimeout alone makes every guarded request wait one full timeout per throttler tier
+ *   (three tiers, 6 s in total) until TCP gives up. socketTimeout destroys the stalled socket before the
+ *   first command's own deadline, so the first request waits that one timeout and the tiers behind it, and
+ *   every later request, fail open at once while the client reconnects (the offline queue is off).
  */
-export function buildThrottlerRedisOptions(configService: ConfigService): RedisOptions {
+export function buildThrottlerRedisOptions(): RedisOptions {
   return {
-    host: configService.get<string>('redis.host', 'localhost'),
-    port: configService.get<number>('redis.port', 6379),
-    username: configService.get<string>('redis.username'),
-    password: configService.get<string>('redis.password'),
-    connectTimeout: configService.get<number>('redis.connectTimeoutMs', 5000),
+    ...redisConnectionOptions(),
     enableOfflineQueue: false,
     autoResendUnfulfilledCommands: false,
     commandTimeout: THROTTLER_REDIS_COMMAND_TIMEOUT_MS,
+    socketTimeout: THROTTLER_REDIS_SOCKET_TIMEOUT_MS,
     maxRetriesPerRequest: null,
   };
 }
 
 /** Dedicated client for throttler hit-count storage — separate from cache/queue clients. */
-export function createThrottlerRedisClient(configService: ConfigService): Redis {
-  return new Redis(buildThrottlerRedisOptions(configService));
+export function createThrottlerRedisClient(): Redis {
+  return new Redis(buildThrottlerRedisOptions());
 }

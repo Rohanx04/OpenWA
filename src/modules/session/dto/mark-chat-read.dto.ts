@@ -1,5 +1,15 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { ArrayMaxSize, ArrayNotEmpty, IsArray, IsNotEmpty, IsString, Matches, ValidateIf } from 'class-validator';
+import {
+  ArrayMaxSize,
+  ArrayNotEmpty,
+  IsArray,
+  IsNotEmpty,
+  IsString,
+  Matches,
+  ValidateIf,
+  MaxLength,
+} from 'class-validator';
+import { CHAT_ID_MAX_LENGTH } from '../../message/dto/send-message.dto';
 
 /**
  * Ceiling on one request's receipt batch, so a single call cannot hand the engine an unbounded key
@@ -20,11 +30,13 @@ export const MARK_READ_MESSAGE_ID_MESSAGE = 'each messageIds entry must be a non
 
 export class MarkChatReadDto {
   @ApiProperty({
+    maxLength: CHAT_ID_MAX_LENGTH,
     description: "Chat ID in the active engine's native format (e.g. 1234567890@c.us on whatsapp-web.js)",
     example: '1234567890@c.us',
   })
   @IsString()
   @IsNotEmpty()
+  @MaxLength(CHAT_ID_MAX_LENGTH)
   // Engine-neutral structural check (localpart@host, no whitespace) so a different engine's JID
   // scheme (e.g. Baileys 1234@s.whatsapp.net) is accepted too; the adapter validates/normalises
   // further for its own engine. Keeps the early-400 on obvious garbage without coupling to wwebjs.
@@ -36,7 +48,7 @@ export class MarkChatReadDto {
   @ApiPropertyOptional({
     description:
       'Specific message IDs to mark read. Baileys acknowledges individual messages, so without this ' +
-      'only the newest message the engine still holds in memory gets a receipt — a burst leaves its ' +
+      'only the newest received message the engine still holds in memory gets a receipt — a burst leaves its ' +
       'earlier messages unread forever, and a restarted session has no message to acknowledge at all. ' +
       'Callers that persist inbound message IDs should send them here. Ignored by whatsapp-web.js, ' +
       'whose own sendSeen is chat-level.',

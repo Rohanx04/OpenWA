@@ -1,8 +1,15 @@
-import { Injectable, NotFoundException, BadRequestException, ConflictException, HttpException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  ConflictException,
+  HttpException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
-import { PluginLoaderService, PluginStatus, resolvePluginEntryPath } from '../../core/plugins';
+import { PluginLoaderService, PluginStatus, PluginType, resolvePluginEntryPath } from '../../core/plugins';
 import { pluginUpdateBackupDirName, pluginUpdateStagingDirName } from '../../core/plugins';
 import type { PluginConfigSchema } from '../../core/plugins';
 import { PluginDto } from './dto/plugin.dto';
@@ -42,6 +49,13 @@ export class PluginsService {
   private readonly opChains = new Map<string, Promise<unknown>>();
 
   private serialize<T>(id: string, op: () => Promise<T>): Promise<T> {
+    // A boot restore that outlasted the boot wait enables plugins in the background, outside this chain, so a
+    // change to a plugin it has not finished with would interleave with its enable (see isRestorePending).
+    if (this.pluginLoader.isRestorePending(id)) {
+      return Promise.reject(
+        new ConflictException(`Plugin ${id} is still being restored after startup. Retry in a moment.`),
+      );
+    }
     const prior = this.opChains.get(id) ?? Promise.resolve();
     const next = prior.catch(() => undefined).then(op);
     this.opChains.set(id, next);
@@ -165,6 +179,21 @@ export class PluginsService {
       return { success: true, message: `Plugin ${id} is not loaded; it will not be enabled on boot` };
     }
 
+    if (
+      plugin.manifest.type === PluginType.ENGINE &&
+      id === (this.configService.get<string>('engine.type') ?? 'whatsapp-web.js')
+    ) {
+      // The engine factory is pinned to engine.type and never reads plugin status, and boot re-enables
+      // that engine regardless: "disabling" it here reported success while sessions kept starting on
+      // it. Refuse it in the same shape enable uses for a non-active engine. Kept at this layer, not in
+      // the lifecycle, because shutdown and unload must still tear engines down. An engine that is not
+      // engine.type runs nothing, so it takes the ordinary path below.
+      return {
+        success: false,
+        message: `Engine "${id}" cannot be disabled at runtime. Set engine.type and restart to switch engines.`,
+      };
+    }
+
     if (plugin.status !== PluginStatus.ENABLED) {
       // Clear the decision here too: a plugin sitting in ERROR after a failed restore is not ENABLED,
       // and disabling it must stop the gateway retrying it on every boot.
@@ -210,7 +239,9 @@ export class PluginsService {
     try {
       // The dashboard PUTs the whole (redacted) config back, so a sentinel secret means "unchanged":
       // restore the stored value instead of overwriting the real secret with the mask.
-      const merged = restoreSecretConfig(config, plugin.config, plugin.manifest.configSchema);
+      const merged = restoreSecretConfig(config, plugin.config, plugin.manifest.configSchema, {
+        mergedOverStored: true,
+      });
       this.pluginLoader.updatePluginConfig(id, merged);
       return { success: true, message: `Plugin ${id} configuration updated` };
     } catch (error) {
@@ -383,11 +414,21 @@ export class PluginsService {
    * means the package was substituted in transit and the install fails closed.
    */
   async installFromUrl(url: string): Promise<PluginDto> {
-    const buffer = await this.downloadPackage(url);
-    // Peek the id (the SSRF download stays outside the lock) so the install — which writes the plugin
-    // directory — is serialized against any concurrent uninstall/update of the same id.
-    const { manifest } = parsePluginPackage(buffer);
-    return this.serialize(manifest.id, () => Promise.resolve(this.install({ buffer })));
+    // The SSRF download stays outside the lock; the install itself takes it.
+    return this.installPackage({ buffer: await this.downloadPackage(url) });
+  }
+
+  /**
+   * {@link install} under the same per-id lock as uninstall and update. The id is peeked from the package
+   * first, so an install (which writes the plugin directory) cannot interleave with a teardown of that
+   * plugin that is still awaiting its takeovers, and then remove the files the install just wrote.
+   */
+  async installPackage(file?: { buffer?: Buffer }): Promise<PluginDto> {
+    if (!file?.buffer?.length) {
+      throw new BadRequestException('No plugin file uploaded');
+    }
+    const { manifest } = parsePluginPackage(file.buffer);
+    return this.serialize(manifest.id, () => Promise.resolve(this.install(file)));
   }
 
   /**
@@ -443,6 +484,9 @@ export class PluginsService {
     try {
       const parsed: unknown = JSON.parse(raw.toString('utf8'));
       if (!Array.isArray(parsed)) throw new Error('catalog is not a JSON array');
+      if (!parsed.every(e => typeof e === 'object' && e !== null && !Array.isArray(e))) {
+        throw new Error('catalog entries must be JSON objects');
+      }
       entries = parsed as CatalogEntry[];
     } catch (error) {
       throw new BadRequestException(
@@ -465,7 +509,9 @@ export class PluginsService {
    * reconciled at boot by the loader's interrupted-update recovery, which restores the backup when
    * the live dir is missing — an interrupted update can no longer make the plugin silently vanish.
    * If loading/enabling the new version fails, the backup is restored and reloaded, so a bad update
-   * never leaves the plugin broken.
+   * never leaves the plugin broken. An update of a plugin the operator switched on that is still
+   * applying once shutdown has begun is refused or rolled back the same way (with a 503), since the
+   * new version cannot be enabled to prove it works.
    */
   updatePackage(id: string, buffer: Buffer): Promise<PluginDto> {
     return this.serialize(id, () => this.updatePackageInner(id, buffer));
@@ -487,6 +533,23 @@ export class PluginsService {
     }
 
     const wasEnabled = plugin.status === PluginStatus.ENABLED;
+    // Shutdown refuses new enables, so an update of a plugin meant to run cannot prove the new version
+    // starts. It is refused with a 503 and the previous version stays, so the next boot restores that
+    // one from the persisted operator decision. wasEnabled alone is not enough: once teardown has
+    // disabled the plugin, it reads false while enabledByOperator stays true. A plugin the operator
+    // switched off, or one in ERROR (which is not running either way), is never enabled after an
+    // update, so its update still applies.
+    const meantToRun =
+      wasEnabled ||
+      (plugin.status !== PluginStatus.ERROR && this.pluginLoader.getRegistryEntry(id)?.enabledByOperator === true);
+    const refuseDuringShutdown = (): void => {
+      if (meantToRun && this.pluginLoader.isShuttingDown()) {
+        throw new ServiceUnavailableException(`Plugin ${id} was not updated: the gateway is shutting down`);
+      }
+    };
+    // Already shutting down (a slow download or a queued operation): refuse before touching disk or
+    // running any plugin code.
+    refuseDuringShutdown();
     // The tree the package was loaded from, which is the legacy plugins directory for a host that
     // has not migrated. Updating in the configured root instead renames a directory that is not
     // there, after unloadPlugin has already dropped the plugin from the runtime.
@@ -559,12 +622,20 @@ export class PluginsService {
     });
 
     try {
-      // ctx.storage files share the package directory under shipped defaults. Restore service-owned
-      // state from the backup unless the new package explicitly supplied that exact path. Copy (rather
-      // than move) so the rollback below still has a complete original directory.
+      // ctx.storage files share the package directory under shipped defaults. Restore state from the
+      // backup unless the new package explicitly supplied that exact path: encoded key-* files and the
+      // legacy <key>.json files the storage service still reads (every top-level *.json except the
+      // package's manifest.json/package.json). Copy (rather than move) so the rollback below still has
+      // a complete original directory.
       const packagePaths = new Set(entries.map(entry => entry.relPath));
       for (const entry of fs.readdirSync(backup, { withFileTypes: true })) {
-        if (!entry.isFile() || !/^key-[A-Za-z0-9_-]+\.json$/.test(entry.name) || packagePaths.has(entry.name)) {
+        if (
+          !entry.isFile() ||
+          !entry.name.endsWith('.json') ||
+          entry.name === 'manifest.json' ||
+          entry.name === 'package.json' ||
+          packagePaths.has(entry.name)
+        ) {
           continue;
         }
         const stateFile = path.join(dir, entry.name);
@@ -572,9 +643,10 @@ export class PluginsService {
         fs.chmodSync(stateFile, 0o600);
       }
       this.pluginLoader.loadPlugin(dir);
-      if (wasEnabled) {
-        await this.pluginLoader.enablePlugin(id);
-      }
+      // Shutdown may have begun while the old version was being stopped: roll back below rather than
+      // keep the new version untested with its backup deleted.
+      refuseDuringShutdown();
+      if (wasEnabled) await this.pluginLoader.enablePlugin(id);
       fs.rmSync(backup, { recursive: true, force: true });
       logger.log(`Plugin updated: ${id} → v${manifest.version}`, {
         pluginId: id,

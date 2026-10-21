@@ -1,3 +1,4 @@
+import { In } from 'typeorm';
 import { WebhookOutboxService } from './webhook-outbox.service';
 import { WebhookOutboxEvent } from './entities/webhook-outbox-event.entity';
 
@@ -11,13 +12,12 @@ const base = {
 };
 
 describe('WebhookOutboxService', () => {
-  let repo: { save: jest.Mock; create: jest.Mock; update: jest.Mock; find: jest.Mock };
+  let repo: { insert: jest.Mock; update: jest.Mock; find: jest.Mock };
   let service: WebhookOutboxService;
 
   beforeEach(() => {
     repo = {
-      create: jest.fn((v: unknown) => v),
-      save: jest.fn().mockResolvedValue(undefined),
+      insert: jest.fn().mockResolvedValue(undefined),
       update: jest.fn().mockResolvedValue(undefined),
       find: jest.fn().mockResolvedValue([]),
     };
@@ -27,12 +27,12 @@ describe('WebhookOutboxService', () => {
   it('records the delivery as pending, carrying the payload a replay needs', async () => {
     await service.open(base);
 
-    expect(repo.save).toHaveBeenCalledWith(expect.objectContaining({ ...base, state: 'pending', attempts: 0 }));
+    expect(repo.insert).toHaveBeenCalledWith(expect.objectContaining({ ...base, state: 'pending', attempts: 0 }));
   });
 
   it('treats a duplicate as the replay it is, keeping the existing row', async () => {
     const conflict = Object.assign(new Error('UNIQUE constraint failed'), { code: 'SQLITE_CONSTRAINT_UNIQUE' });
-    repo.save.mockRejectedValue(conflict);
+    repo.insert.mockRejectedValue(conflict);
 
     // A conflict on (webhookId, idempotencyKey) means this delivery is already recorded. Throwing
     // would surface as an unhandled rejection on a fire-and-forget path.
@@ -40,7 +40,7 @@ describe('WebhookOutboxService', () => {
   });
 
   it('never lets a repository failure reach a fire-and-forget caller', async () => {
-    repo.save.mockRejectedValue(new Error('disk full'));
+    repo.insert.mockRejectedValue(new Error('disk full'));
     await expect(service.open(base)).resolves.toBeUndefined();
 
     repo.update.mockRejectedValue(new Error('disk full'));
@@ -56,6 +56,15 @@ describe('WebhookOutboxService', () => {
       { webhookId: 'wh-1', idempotencyKey: 'key_wh-1' },
       expect.objectContaining({ state: 'dispatched', payload: null }),
     );
+  });
+
+  it('keeps payload when marking queued and excludes already settled rows', async () => {
+    await service.markQueued('wh-1', 'key_wh-1', 'job-1');
+    expect(repo.update).toHaveBeenCalledWith(
+      expect.objectContaining({ state: In(['pending', 'queued']) }),
+      expect.objectContaining({ state: 'queued', deliveryId: 'job-1' }),
+    );
+    expect((repo.update.mock.calls as unknown[][])[0][1]).not.toHaveProperty('payload');
   });
 
   it('returns only rows that still carry a payload: a retired row is not replayable', async () => {
@@ -81,7 +90,7 @@ describe('WebhookOutboxService', () => {
     await expect(service.countAttempt('row-1', 2)).resolves.toBe(true);
 
     expect(repo.update).toHaveBeenCalledWith(
-      { id: 'row-1', state: 'pending' },
+      { id: 'row-1', state: In(['pending', 'queued']) },
       expect.objectContaining({ attempts: 3 }),
     );
   });
@@ -111,7 +120,7 @@ describe('WebhookOutboxService retention', () => {
     ];
     // Deleting a 'pending' row on age would discard the delivery this table exists to protect.
     expect(where.state.type).toBe('not');
-    expect(where.state.value).toBe('pending');
+    expect(where.state.value).toEqual(['pending', 'queued']);
     expect(where.createdAt.type).toBe('lessThan');
   });
 

@@ -153,6 +153,30 @@ describe('CacheService Redis-outage resilience', () => {
     expect(opts.enableOfflineQueue).toBe(false);
   });
 
+  it('uses the shared connection options and a numeric REDIS_CACHE_DB', async () => {
+    useClient(jest.fn().mockResolvedValue('PONG'));
+    const saved = { tls: process.env.REDIS_TLS, db: process.env.REDIS_CACHE_DB };
+    process.env.REDIS_TLS = 'true';
+    process.env.REDIS_CACHE_DB = '2';
+    try {
+      await new CacheService(enabledConfig()).isAvailable();
+      delete process.env.REDIS_CACHE_DB;
+      await new CacheService(enabledConfig()).isAvailable();
+    } finally {
+      for (const [key, value] of [
+        ['REDIS_TLS', saved.tls],
+        ['REDIS_CACHE_DB', saved.db],
+      ] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+
+    const calls = RedisMock.mock.calls as Array<[{ tls?: unknown; db?: unknown }]>;
+    expect(calls[0][0]).toMatchObject({ tls: {}, db: 2 });
+    expect(calls[1][0].db).toBe(1);
+  });
+
   it('does not construct a client when the cache is disabled', async () => {
     const disabled = { get: (_key: string, def?: unknown) => def } as unknown as ConfigService;
     const service = new CacheService(disabled);

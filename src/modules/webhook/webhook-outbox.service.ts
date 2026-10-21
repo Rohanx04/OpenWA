@@ -1,6 +1,6 @@
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { LessThan, Not, Repository } from 'typeorm';
+import { And, In, IsNull, LessThan, Not, QueryDeepPartialEntity, Raw, Repository } from 'typeorm';
 import { WebhookOutboxEvent, WebhookOutboxState } from './entities/webhook-outbox-event.entity';
 import { createLogger } from '../../common/services/logger.service';
 import { isUniqueViolation } from '../../common/utils/db-errors';
@@ -16,6 +16,8 @@ export interface ReplayableDelivery {
   idempotencyKey: string;
   payload: Record<string, unknown>;
   attempts: number;
+  deliveryId?: string;
+  state?: WebhookOutboxState | null;
 }
 
 /**
@@ -77,7 +79,7 @@ export class WebhookOutboxService implements OnModuleInit, OnModuleDestroy {
   async pruneSettled(olderThanDays: number): Promise<number> {
     const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - olderThanDays);
-    const result = await this.outbox.delete({ state: Not('pending'), createdAt: LessThan(cutoff) });
+    const result = await this.outbox.delete({ state: Not(In(['pending', 'queued'])), createdAt: LessThan(cutoff) });
     return result.affected || 0;
   }
 
@@ -90,18 +92,19 @@ export class WebhookOutboxService implements OnModuleInit, OnModuleDestroy {
    */
   async open(row: Omit<ReplayableDelivery, 'id' | 'attempts'> & { deliveryId: string }): Promise<void> {
     try {
-      await this.outbox.save(
-        this.outbox.create({
-          webhookId: row.webhookId,
-          sessionId: row.sessionId,
-          event: row.event,
-          idempotencyKey: row.idempotencyKey,
-          deliveryId: row.deliveryId,
-          payload: row.payload,
-          state: 'pending',
-          attempts: 0,
-        }),
-      );
+      // A bare INSERT, not save(): save() wraps it in a transaction, and on SQLite's single shared
+      // connection the rollback of the unique violation expected here would also discard any other
+      // write made while it was open.
+      await this.outbox.insert({
+        webhookId: row.webhookId,
+        sessionId: row.sessionId,
+        event: row.event,
+        idempotencyKey: row.idempotencyKey,
+        deliveryId: row.deliveryId,
+        payload: row.payload,
+        state: 'pending',
+        attempts: 0,
+      } as QueryDeepPartialEntity<WebhookOutboxEvent>);
     } catch (error) {
       // A conflict means this exact delivery is already recorded, which is what a replay looks
       // like: keep the existing row rather than duplicating it.
@@ -110,15 +113,12 @@ export class WebhookOutboxService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /**
-   * Record the outcome and retire the payload.
-   *
-   * `dispatched` covers both modes: handed to the queue, or completed inline. A failure INSIDE
-   * either owner dead-letters through webhook_delivery_failures, so a dispatched row is never the
-   * reconciler's concern, and retiring on ENQUEUE is what stops the reconciler duplicating work
-   * BullMQ already holds.
-   */
-  async close(webhookId: string, idempotencyKey: string, state: Exclude<WebhookOutboxState, 'pending'>): Promise<void> {
+  /** Retire replay data after successful delivery, cancellation or durable failure handoff. */
+  async close(
+    webhookId: string,
+    idempotencyKey: string,
+    state: Exclude<WebhookOutboxState, 'pending' | 'queued'>,
+  ): Promise<void> {
     try {
       await this.outbox.update({ webhookId, idempotencyKey }, { state, payload: null, lastAttemptAt: new Date() });
     } catch (error) {
@@ -126,13 +126,73 @@ export class WebhookOutboxService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** Pending rows older than the staleness window, oldest first. Only these are replayable. */
-  async findStale(olderThan: Date, limit: number): Promise<ReplayableDelivery[]> {
-    const rows = await this.outbox.find({
-      where: { state: 'pending', createdAt: LessThan(olderThan) },
-      order: { createdAt: 'ASC' },
-      take: limit,
-    });
+  /** Keep the queue's replay copy until the worker has settled the delivery. */
+  async markQueued(webhookId: string, idempotencyKey: string, deliveryId: string): Promise<void> {
+    try {
+      await this.outbox.update(
+        { webhookId, idempotencyKey, state: In(['pending', 'queued']), payload: Not(IsNull()) },
+        { state: 'queued', deliveryId, lastAttemptAt: new Date() },
+      );
+    } catch (error) {
+      this.logger.warn(`Could not record queued outbound delivery: ${String(error)}`);
+    }
+  }
+
+  /**
+   * Unsettled rows older than the staleness window; queued jobs are checked before replay.
+   *
+   * A stored payload that does not parse (an imported or hand-edited row on SQLite, where it is text)
+   * fails the read of every page it sits in, so no row behind it would ever be replayed. When the page
+   * read fails it is read again row by row, an unreadable row is logged and skipped, and `onScanned`
+   * receives the last id the page covered so a caller's cursor passes the unreadable rows too.
+   */
+  async findStale(
+    olderThan: Date,
+    limit: number,
+    afterId?: string,
+    onScanned?: (lastId: string) => void,
+  ): Promise<ReplayableDelivery[]> {
+    const pending = { state: In(['pending', 'queued']), payload: Not(IsNull()), createdAt: LessThan(olderThan) };
+    const where = afterId
+      ? {
+          ...pending,
+          // Compare in SQL so PostgreSQL's sub-millisecond timestamps are never rounded through Date.
+          createdAt: And(
+            LessThan(olderThan),
+            Raw(
+              alias =>
+                `(${alias}, "id") > (SELECT "createdAt", "id" FROM "webhook_outbox_events" WHERE "id" = :afterId)`,
+              { afterId },
+            ),
+          ),
+        }
+      : pending;
+    const order = { createdAt: 'ASC', id: 'ASC' } as const;
+    let rows: WebhookOutboxEvent[];
+    try {
+      rows = await this.outbox.find({ where, order, take: limit });
+    } catch (error) {
+      this.logger.warn('Reading a page of stranded deliveries failed; reading it row by row', {
+        error: error instanceof Error ? error.message : String(error),
+        action: 'webhook_outbox_page_unreadable',
+      });
+      const ids = await this.outbox.find({ select: { id: true }, where, order, take: limit });
+      rows = [];
+      for (const { id } of ids) {
+        try {
+          const row = await this.outbox.findOneBy({ id });
+          if (row) rows.push(row);
+        } catch (rowError) {
+          this.logger.error(
+            'A stranded delivery could not be read and is skipped',
+            rowError instanceof Error ? rowError.message : String(rowError),
+            { id, action: 'webhook_outbox_row_unreadable' },
+          );
+        }
+      }
+      const last = ids.at(-1);
+      if (last) onScanned?.(last.id);
+    }
     // A pending row always carries its payload; the guard is for a row whose payload was retired by
     // a concurrent close between the query and this read.
     return rows
@@ -145,6 +205,8 @@ export class WebhookOutboxService implements OnModuleInit, OnModuleDestroy {
         idempotencyKey: r.idempotencyKey,
         payload: r.payload,
         attempts: r.attempts,
+        deliveryId: r.deliveryId,
+        state: r.state,
       }));
   }
 
@@ -158,7 +220,7 @@ export class WebhookOutboxService implements OnModuleInit, OnModuleDestroy {
   async countAttempt(id: string, attempts: number): Promise<boolean> {
     try {
       const result = await this.outbox.update(
-        { id, state: 'pending' },
+        { id, state: In(['pending', 'queued']) },
         { attempts: attempts + 1, lastAttemptAt: new Date() },
       );
       return (result.affected ?? 0) > 0;

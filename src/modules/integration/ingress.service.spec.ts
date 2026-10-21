@@ -68,6 +68,36 @@ describe('redactSensitiveHeaders (persisted ingress payloads)', () => {
     expect(recorded.payload.headers['x-delivery']).toBe('d1');
   });
 
+  it("redacts an hmac route's declared signature header in the persisted and enqueued payload", async () => {
+    const d = deps({
+      manifestRoute: jest.fn().mockReturnValue({
+        route: 'shop',
+        mode: 'async',
+        verify: 'core',
+        maxBodyBytes: 1024,
+        signature: { scheme: 'hmac-sha256', header: 'X-Custom-Sig' },
+        dedupHeader: 'x-delivery',
+      }),
+    });
+    const res = await new IngressService(d).handle({
+      pluginId: 'shop',
+      instanceId: 'acct1',
+      route: 'shop',
+      method: 'POST',
+      headers: { 'x-delivery': 'd1', 'x-custom-sig': createHmac('sha256', 's').update('{}').digest('hex') },
+      query: {},
+      rawBody: '{}',
+    });
+    expect(res.status).toBe(202);
+    const recorded = (
+      d.events.recordOrSkip.mock.calls as unknown as [[{ payload: { headers: Record<string, string> } }]]
+    )[0][0];
+    expect(recorded.payload.headers['x-custom-sig']).toBe('[redacted]');
+    expect(recorded.payload.headers['x-delivery']).toBe('d1');
+    const job = (d.enqueue.mock.calls as unknown as [[{ payload: { headers: Record<string, string> } }]])[0][0];
+    expect(job.payload.headers['x-custom-sig']).toBe('[redacted]');
+  });
+
   it("redacts a shared-secret route's declared credential header in the persisted and enqueued payload", async () => {
     const d = deps({
       manifestRoute: jest.fn().mockReturnValue({
@@ -117,6 +147,27 @@ describe('IngressService.handle', () => {
     expect(d.events.recordOrSkip).toHaveBeenCalled();
     expect(d.enqueue).toHaveBeenCalledWith(expect.objectContaining({ deliveryId: 'd1', method: 'POST' }), 'd1');
     expect(res.status).toBe(202);
+  });
+
+  it('persists the request method so a replay keeps it', async () => {
+    const d = deps();
+    await new IngressService(d).handle({ ...req, method: 'PUT' });
+    const [recorded] = d.events.recordOrSkip.mock.calls[0] as [{ payload: { method?: string } }];
+    expect(recorded.payload.method).toBe('PUT');
+    // The job carries the method at its top level; its payload stays the plain request shape.
+    const [job] = d.enqueue.mock.calls[0] as [{ method: string; payload: { method?: string } }];
+    expect(job.method).toBe('PUT');
+    expect(job.payload.method).toBeUndefined();
+  });
+
+  // A body no parser read would be handled as the empty body: it passes a header-only scheme, and every
+  // such delivery hashes to the same dedup key, so all but the first are acked and dropped.
+  it('refuses a body in a content type no parser read (415), before anything is persisted', async () => {
+    const d = deps();
+    const res = await new IngressService(d).handle({ ...req, rawBody: '', unparsedBody: true });
+    expect(res).toMatchObject({ status: 415 });
+    expect(d.events.recordOrSkip).not.toHaveBeenCalled();
+    expect(d.enqueue).not.toHaveBeenCalled();
   });
 
   it('uses the signed webhook-id as the default Standard Webhooks dedup key', async () => {
@@ -495,6 +546,87 @@ describe('IngressService.handle', () => {
   });
 });
 
+describe('dedupOn: body (a provider that rotates its delivery id on retry)', () => {
+  // supabase/auth mints a fresh webhook-id for every attempt inside its own retry loop, so a lost
+  // ack means the same signed body arrives under a new id and is treated as a new delivery: the
+  // contact receives a second OTP. A route can declare that the body, not the header, is the
+  // retry key; the header keeps deciding for every route that does not.
+  // The request fixture above is scoped to the service describe, so this block carries its own.
+  const req = {
+    pluginId: 'chatwoot',
+    instanceId: 'acct1',
+    route: 'chatwoot',
+    method: 'POST',
+    headers: { 'x-delivery': 'd1' },
+    query: {},
+    rawBody: '{}',
+  };
+  const bodyKeyedRoute = () => ({
+    route: 'send-sms',
+    mode: 'async',
+    verify: 'core',
+    maxBodyBytes: 1024,
+    // scheme none, as the fixture above: this block is about the retry key, not the signature.
+    signature: { scheme: 'none' },
+    dedupHeader: 'webhook-id',
+    dedupOn: 'body',
+  });
+
+  it('keys the delivery on the body even when the dedup header is present', async () => {
+    const first = deps({ manifestRoute: jest.fn().mockReturnValue(bodyKeyedRoute()) });
+    await new IngressService(first).handle({ ...req, headers: { 'webhook-id': 'attempt-1' } });
+    const firstId = (first.enqueue.mock.calls[0] as [unknown, string])[1];
+
+    const retry = deps({ manifestRoute: jest.fn().mockReturnValue(bodyKeyedRoute()) });
+    await new IngressService(retry).handle({ ...req, headers: { 'webhook-id': 'attempt-2' } });
+    expect((retry.enqueue.mock.calls[0] as [unknown, string])[1]).toBe(firstId);
+
+    const other = deps({ manifestRoute: jest.fn().mockReturnValue(bodyKeyedRoute()) });
+    await new IngressService(other).handle({ ...req, headers: { 'webhook-id': 'attempt-3' }, rawBody: '{"a":1}' });
+    expect((other.enqueue.mock.calls[0] as [unknown, string])[1]).not.toBe(firstId);
+  });
+
+  it('leaves a route without the flag on the header', async () => {
+    const d = deps();
+    await new IngressService(d).handle({ ...req, headers: { 'x-delivery': 'd-1' } });
+    expect((d.enqueue.mock.calls[0] as [unknown, string])[1]).toBe('d-1');
+  });
+
+  it('falls back to the body hash when the dedup header is longer than 255 characters', async () => {
+    const d = deps();
+    await new IngressService(d).handle({ ...req, headers: { 'x-delivery': 'x'.repeat(256) }, rawBody: '{"n":1}' });
+    const id = (d.enqueue.mock.calls[0] as [unknown, string])[1];
+    expect(id).toMatch(/^[0-9a-f]{64}$/);
+    // The bound is inclusive: an id of exactly 255 characters is still the provider's.
+    const edge = deps();
+    await new IngressService(edge).handle({ ...req, headers: { 'x-delivery': 'y'.repeat(255) }, rawBody: '{"n":1}' });
+    expect((edge.enqueue.mock.calls[0] as [unknown, string])[1]).toBe('y'.repeat(255));
+  });
+
+  // A header that is present but blank is no id at all. Taking it as one gave every delivery the
+  // same empty key, so the dedup row admitted the first and dropped the rest while still answering
+  // each provider with the route's success ack.
+  it('falls back to the body hash when the dedup header is present but blank', async () => {
+    const first = deps();
+    await new IngressService(first).handle({ ...req, headers: { 'x-delivery': '' }, rawBody: '{"n":1}' });
+    const firstId = (first.enqueue.mock.calls[0] as [unknown, string])[1];
+    expect(firstId).not.toBe('');
+
+    const second = deps();
+    await new IngressService(second).handle({ ...req, headers: { 'x-delivery': '' }, rawBody: '{"n":2}' });
+    // The ids differ, which is the whole point: a blank header must not collapse two bodies onto one
+    // dedup row. (A fresh `deps()` always enqueues, so asserting the call count would prove nothing.)
+    expect((second.enqueue.mock.calls[0] as [unknown, string])[1]).not.toBe(firstId);
+
+    // And the fallback is the BODY hash, not a fresh value per delivery: the same bytes must key the
+    // same row, or a provider's retry of a blank-header delivery is processed a second time. An id
+    // minted per call would satisfy the inequality above while breaking what dedup exists for.
+    const repeat = deps();
+    await new IngressService(repeat).handle({ ...req, headers: { 'x-delivery': '' }, rawBody: '{"n":1}' });
+    expect((repeat.enqueue.mock.calls[0] as [unknown, string])[1]).toBe(firstId);
+  });
+});
+
 describe('extractConversationId', () => {
   it('returns undefined when no spec is declared', () => {
     expect(extractConversationId(undefined, {}, '{}')).toBeUndefined();
@@ -688,5 +820,103 @@ describe('IngressService.handle — response contract', () => {
     expect(first).toEqual({ status: 204, headers: { 'content-type': 'application/json' } });
     expect(retry).toEqual(first);
     expect(dup.enqueue).not.toHaveBeenCalled();
+  });
+});
+
+describe('IngressService per-instance rate bucket', () => {
+  const post = (overrides: Record<string, unknown> = {}) => ({
+    pluginId: 'chatwoot',
+    instanceId: 'acct1',
+    route: 'chatwoot',
+    method: 'POST',
+    headers: { 'x-delivery': 'd1' } as Record<string, string>,
+    query: {} as Record<string, string>,
+    rawBody: '{}',
+    ...overrides,
+  });
+  const admitted = {
+    ok: true,
+    headers: { 'X-RateLimit-Limit-instance': '120', 'X-RateLimit-Remaining-instance': '119' },
+  };
+  const blocked = { ok: false, headers: { 'Retry-After-instance': '7', 'Retry-After': '7' } };
+
+  it.each([
+    ['an unknown instance', { instances: { resolve: jest.fn().mockResolvedValue(null) } }, post(), 404],
+    ['an unknown route', { manifestRoute: jest.fn().mockReturnValue(undefined) }, post(), 404],
+    ['an oversized body', {}, post({ rawBody: 'x'.repeat(2048) }), 413],
+    [
+      'a failed signature',
+      {
+        manifestRoute: jest.fn().mockReturnValue({
+          route: 'chatwoot',
+          maxBodyBytes: 1024,
+          signature: { scheme: 'hmac-sha256', header: 'x-sig' },
+        }),
+      },
+      post({ headers: { 'x-sig': 'sha256=bad' } }),
+      401,
+    ],
+    [
+      'a GET challenge',
+      {
+        manifestRoute: jest.fn().mockReturnValue({
+          route: 'chatwoot',
+          maxBodyBytes: 1024,
+          signature: { scheme: 'none' },
+          challenge: { tokenParam: 'hub.verify_token', echoParam: 'hub.challenge' },
+        }),
+      },
+      post({ method: 'GET', query: { 'hub.verify_token': 'wrong' } }),
+      403,
+    ],
+  ])('does not charge the bucket for %s', async (_label, overrides, req, status) => {
+    const admitInstance = jest.fn().mockResolvedValue(blocked);
+    const svc = new IngressService(deps({ ...overrides, admitInstance }));
+    const res = await svc.handle(req);
+    expect(res.status).toBe(status);
+    expect(admitInstance).not.toHaveBeenCalled();
+  });
+
+  it('charges a verified delivery once and sheds it with the throttler 429 when the bucket is full', async () => {
+    const admitInstance = jest.fn().mockResolvedValue(blocked);
+    const d = deps({ admitInstance });
+    const res = await new IngressService(d).handle(post());
+    expect(admitInstance).toHaveBeenCalledTimes(1);
+    expect(admitInstance).toHaveBeenCalledWith('chatwoot', 'acct1');
+    expect(res).toEqual({
+      status: 429,
+      body: JSON.stringify({ statusCode: 429, message: 'ThrottlerException: Too Many Requests' }),
+      headers: { 'content-type': 'application/json', 'Retry-After-instance': '7', 'Retry-After': '7' },
+    });
+    expect(d.events.recordOrSkip).not.toHaveBeenCalled();
+    expect(d.enqueue).not.toHaveBeenCalled();
+  });
+
+  it('charges before the session-alive preflight, so a full bucket answers 429 rather than 503', async () => {
+    const admitInstance = jest.fn().mockResolvedValue(blocked);
+    const svc = new IngressService(
+      deps({
+        admitInstance,
+        sessionStatus: () => undefined,
+        manifestRoute: jest.fn().mockReturnValue({
+          route: 'chatwoot',
+          maxBodyBytes: 1024,
+          signature: { scheme: 'none' },
+          response: { preflight: [{ type: 'session-alive' }], ack: { status: 200 } },
+        }),
+      }),
+    );
+    await expect(svc.handle(post())).resolves.toMatchObject({ status: 429 });
+  });
+
+  it.each([
+    ['a new delivery', true],
+    ['a re-delivery', false],
+  ])('adds the rate headers to the ack of %s', async (_label, isNew) => {
+    const d = deps({ admitInstance: jest.fn().mockResolvedValue(admitted) });
+    d.events.recordOrSkip = jest.fn().mockResolvedValue(isNew);
+    const res = await new IngressService(d).handle(post());
+    expect(res.status).toBe(202);
+    expect(res.headers).toEqual(admitted.headers);
   });
 });

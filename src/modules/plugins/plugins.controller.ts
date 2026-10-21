@@ -27,9 +27,14 @@ import {
 import type { CatalogPlugin } from './catalog';
 import { RequireRole, RequireUnscopedKey } from '../auth/decorators/auth.decorators';
 import { ApiKeyRole } from '../auth/entities/api-key.entity';
+import { AuditService } from '../audit/audit.service';
+import { AuditAction } from '../audit/entities/audit-log.entity';
 
 /** Max accepted upload size for a plugin package (compressed). */
 const MAX_PLUGIN_UPLOAD_BYTES = 5 * 1024 * 1024;
+
+/** A lifecycle change to a plugin the boot restore has not finished with, which can outlast the boot wait. */
+const RESTORING_CONFLICT = 'The plugin is still being restored after startup; retry shortly';
 
 @ApiTags('plugins')
 @Controller('plugins')
@@ -40,7 +45,28 @@ const MAX_PLUGIN_UPLOAD_BYTES = 5 * 1024 * 1024;
 // another tenant's activation by sending its own session or []), and `updateSessionConfig` is
 // already covered by the guard through its own :sessionId route param.
 export class PluginsController {
-  constructor(private readonly pluginsService: PluginsService) {}
+  constructor(
+    private readonly pluginsService: PluginsService,
+    private readonly audit: AuditService,
+  ) {}
+
+  /**
+   * One audit row per successful plugin mutation. Plugins run in the gateway process, so which key
+   * installed, enabled or reconfigured one is the first thing an investigation needs. Ids, versions and
+   * config FIELD NAMES only: a config can carry credentials, and audit metadata is not a credential store.
+   */
+  private record(action: AuditAction, pluginId: string, extra: Record<string, unknown> = {}, sessionId?: string): void {
+    void this.audit.logInfo(action, { sessionId, metadata: { pluginId, ...extra } });
+  }
+
+  /** Host of a download URL: enough to tell where code came from, without a credential or token in the query. */
+  private static sourceHost(url: string): string {
+    try {
+      return new URL(url).host;
+    } catch {
+      return 'unknown';
+    }
+  }
 
   @Get()
   @RequireRole(ApiKeyRole.ADMIN)
@@ -70,8 +96,11 @@ export class PluginsController {
   @ApiResponse({ status: 201, description: 'Plugin installed', type: PluginDto })
   @ApiResponse({ status: 400, description: 'Invalid package' })
   @ApiResponse({ status: 409, description: 'Plugin already installed' })
-  install(@UploadedFile() file: { buffer?: Buffer }): PluginDto {
-    return this.pluginsService.install(file);
+  @ApiResponse({ status: 413, description: 'Package exceeds the 5 MB upload limit' })
+  async install(@UploadedFile() file: { buffer?: Buffer }): Promise<PluginDto> {
+    const plugin = await this.pluginsService.installPackage(file);
+    this.record(AuditAction.PLUGIN_INSTALLED, plugin.id, { version: plugin.version, source: 'upload' });
+    return plugin;
   }
 
   @Post('install-url')
@@ -80,9 +109,17 @@ export class PluginsController {
   @ApiOperation({ summary: 'Install a plugin by downloading its .zip from a URL (SSRF-guarded)' })
   @ApiResponse({ status: 201, description: 'Plugin installed', type: PluginDto })
   @ApiResponse({ status: 400, description: 'Invalid URL, download failed, or invalid package' })
-  @ApiResponse({ status: 409, description: 'Plugin already installed' })
+  @ApiResponse({
+    status: 409,
+    description: 'Plugin already installed, or the plugin is still being restored after startup; retry shortly',
+  })
   async installFromUrl(@Body() dto: InstallFromUrlDto): Promise<PluginDto> {
-    return await this.pluginsService.installFromUrl(dto.url);
+    const plugin = await this.pluginsService.installFromUrl(dto.url);
+    this.record(AuditAction.PLUGIN_INSTALLED, plugin.id, {
+      version: plugin.version,
+      source: PluginsController.sourceHost(dto.url),
+    });
+    return plugin;
   }
 
   // Declared before `:id` so `GET /plugins/catalog` is not captured by the `:id` route.
@@ -112,8 +149,12 @@ export class PluginsController {
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Enable a plugin' })
   @ApiResponse({ status: 200, description: 'Plugin enabled successfully', type: PluginActionResponseDto })
+  @ApiResponse({ status: 404, description: 'Plugin not found' })
+  @ApiResponse({ status: 409, description: RESTORING_CONFLICT })
   async enable(@Param('id') id: string): Promise<{ success: boolean; message: string }> {
-    return await this.pluginsService.enable(id);
+    const result = await this.pluginsService.enable(id);
+    if (result.success) this.record(AuditAction.PLUGIN_ENABLED, id);
+    return result;
   }
 
   @Post(':id/disable')
@@ -122,8 +163,12 @@ export class PluginsController {
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Disable a plugin' })
   @ApiResponse({ status: 200, description: 'Plugin disabled successfully', type: PluginActionResponseDto })
+  @ApiResponse({ status: 404, description: 'Plugin not found' })
+  @ApiResponse({ status: 409, description: RESTORING_CONFLICT })
   async disable(@Param('id') id: string): Promise<{ success: boolean; message: string }> {
-    return await this.pluginsService.disable(id);
+    const result = await this.pluginsService.disable(id);
+    if (result.success) this.record(AuditAction.PLUGIN_DISABLED, id);
+    return result;
   }
 
   @Put(':id/config')
@@ -131,8 +176,14 @@ export class PluginsController {
   @RequireUnscopedKey()
   @ApiOperation({ summary: 'Update plugin configuration' })
   @ApiResponse({ status: 200, description: 'Plugin configuration updated', type: PluginActionResponseDto })
+  @ApiResponse({ status: 400, description: 'Validation failed, or the body carries a field the DTO does not declare.' })
+  @ApiResponse({ status: 404, description: 'Plugin not found' })
   updateConfig(@Param('id') id: string, @Body() configDto: PluginConfigDto): { success: boolean; message: string } {
-    return this.pluginsService.updateConfig(id, configDto.config);
+    const result = this.pluginsService.updateConfig(id, configDto.config);
+    // The service answers a refused change with 200 and success false, so a row is written only for one applied.
+    if (result.success)
+      this.record(AuditAction.PLUGIN_CONFIG_UPDATED, id, { fields: Object.keys(configDto.config ?? {}) });
+    return result;
   }
 
   // The dashboard fetches this WITH the API key and injects the body as an opaque-origin sandboxed
@@ -161,14 +212,18 @@ export class PluginsController {
   @RequireRole(ApiKeyRole.ADMIN)
   @ApiOperation({ summary: 'Set a plugin config override for a specific session (empty = clear it)' })
   @ApiResponse({ status: 200, description: 'Per-session plugin configuration updated', type: PluginActionResponseDto })
-  @ApiResponse({ status: 400, description: 'Plugin is global (not session-scoped)' })
+  @ApiResponse({ status: 400, description: 'Plugin is global (not session-scoped), or the body failed validation' })
   @ApiResponse({ status: 404, description: 'Plugin not found' })
   updateSessionConfig(
     @Param('id') id: string,
     @Param('sessionId') sessionId: string,
     @Body() configDto: PluginConfigDto,
   ): { success: boolean; message: string } {
-    return this.pluginsService.updateSessionConfig(id, sessionId, configDto.config);
+    const result = this.pluginsService.updateSessionConfig(id, sessionId, configDto.config);
+    if (result.success) {
+      this.record(AuditAction.PLUGIN_CONFIG_UPDATED, id, { fields: Object.keys(configDto.config ?? {}) }, sessionId);
+    }
+    return result;
   }
 
   @Put(':id/sessions')
@@ -176,7 +231,7 @@ export class PluginsController {
   @RequireUnscopedKey()
   @ApiOperation({ summary: "Set which sessions a session-scoped plugin is activated for (['*'] = all)" })
   @ApiResponse({ status: 200, description: 'Plugin session activation updated', type: PluginDto })
-  @ApiResponse({ status: 400, description: 'Plugin is global (not session-scoped)' })
+  @ApiResponse({ status: 400, description: 'Plugin is global (not session-scoped), or the body failed validation' })
   @ApiResponse({
     status: 403,
     description:
@@ -187,7 +242,9 @@ export class PluginsController {
     // This is a full-replacement PUT (setPluginSessions overwrites the entire activeSessions array),
     // so a scoped key must never reach it: sending [] or its own session would delete every other
     // tenant's activation. The @RequireUnscopedKey fence above enforces that before the handler runs.
-    return this.pluginsService.updateSessions(id, dto.sessions);
+    const plugin = this.pluginsService.updateSessions(id, dto.sessions);
+    this.record(AuditAction.PLUGIN_SESSIONS_UPDATED, id, { sessions: dto.sessions });
+    return plugin;
   }
 
   @Post(':id/update')
@@ -197,8 +254,18 @@ export class PluginsController {
   @ApiResponse({ status: 201, description: 'Plugin updated', type: PluginDto })
   @ApiResponse({ status: 400, description: 'Invalid URL/package, id mismatch, or built-in' })
   @ApiResponse({ status: 404, description: 'Plugin not found' })
+  @ApiResponse({ status: 409, description: RESTORING_CONFLICT })
+  @ApiResponse({
+    status: 503,
+    description: 'Gateway shutting down; the previous version was kept',
+  })
   async update(@Param('id') id: string, @Body() dto: InstallFromUrlDto): Promise<PluginDto> {
-    return await this.pluginsService.updateFromUrl(id, dto.url);
+    const plugin = await this.pluginsService.updateFromUrl(id, dto.url);
+    this.record(AuditAction.PLUGIN_UPDATED, id, {
+      version: plugin.version,
+      source: PluginsController.sourceHost(dto.url),
+    });
+    return plugin;
   }
 
   @Delete(':id')
@@ -208,8 +275,11 @@ export class PluginsController {
   @ApiResponse({ status: 200, description: 'Plugin uninstalled', type: PluginActionResponseDto })
   @ApiResponse({ status: 400, description: 'Cannot uninstall (e.g. built-in)' })
   @ApiResponse({ status: 404, description: 'Plugin not found' })
+  @ApiResponse({ status: 409, description: RESTORING_CONFLICT })
   async uninstall(@Param('id') id: string): Promise<{ success: boolean; message: string }> {
-    return await this.pluginsService.uninstall(id);
+    const result = await this.pluginsService.uninstall(id);
+    this.record(AuditAction.PLUGIN_UNINSTALLED, id);
+    return result;
   }
 
   @Get(':id/health')
@@ -217,6 +287,7 @@ export class PluginsController {
   @RequireUnscopedKey()
   @ApiOperation({ summary: 'Check plugin health' })
   @ApiResponse({ status: 200, description: 'Plugin health status', type: PluginHealthResponseDto })
+  @ApiResponse({ status: 404, description: 'Plugin not found' })
   async healthCheck(@Param('id') id: string): Promise<{ healthy: boolean; message?: string }> {
     return await this.pluginsService.healthCheck(id);
   }

@@ -41,13 +41,19 @@ export class ScopeBindingService implements OnApplicationBootstrap {
    * cannot abort the rest.
    */
   async onApplicationBootstrap(): Promise<void> {
-    let rows: PluginInstance[];
     try {
-      rows = await this.instances.listAll();
+      await this.reconcile();
     } catch (err) {
-      this.logger.error('Scope-binding reconciliation skipped (failed to list instances)', String(err));
-      return;
+      this.logger.error('Scope-binding reconciliation failed', String(err));
     }
+  }
+
+  /**
+   * The boot pass itself, shared with {@link resyncAfterImport}. Rejects only when the instance rows
+   * cannot be listed; a single binding failure is absorbed by applyScopeBinding.
+   */
+  async reconcile(): Promise<void> {
+    const rows = await this.instances.listAll();
 
     // Order-independent reconciliation: listAll() is repo.find() with no ORDER BY, so its row order
     // is DB/restart-dependent (differs between SQLite and Postgres). applyScopeBinding mutates the
@@ -80,6 +86,41 @@ export class ScopeBindingService implements OnApplicationBootstrap {
         count,
       });
     }
+  }
+
+  /**
+   * Bring the runtime bindings back in line after a restore replaced every `plugin_instances` row.
+   *
+   * The boot pass only adds, so on its own it can never retire a binding whose instance the restore
+   * dropped (or restored disabled): the plugin would keep firing on that session with the retired
+   * instance's config, across restarts. So first tear down every scope that was bound by an enabled
+   * row BEFORE the import and is bound by no enabled row now, then re-run the boot pass over the
+   * restored rows. The teardown set comes only from the pre-import rows, never from activeSessions,
+   * so a session an operator activated through PUT /api/plugins/:id/sessions is left alone. The
+   * teardown is additive for the same reason: a restore makes no new narrowing decision, so it drops
+   * the retired scope without also retiring an operator's '*'. A retired wildcard still loses its '*'
+   * unless a restored wildcard row keeps it. applyScopeBinding runs after the commit, so its sibling
+   * checks read the restored rows.
+   */
+  async resyncAfterImport(
+    previous: ReadonlyArray<{ pluginId: string; sessionScope: string | null; enabled: boolean }>,
+  ): Promise<void> {
+    const scopeKey = (scope: string | null): string => (!scope || scope === '*' ? '*' : scope);
+    const bound = new Set(
+      (await this.instances.listAll())
+        .filter(row => row.enabled)
+        .map(row => `${row.pluginId}\u0000${scopeKey(row.sessionScope)}`),
+    );
+    const retired = new Map<string, { pluginId: string; sessionScope: string | null }>();
+    for (const row of previous) {
+      const key = `${row.pluginId}\u0000${scopeKey(row.sessionScope)}`;
+      if (row.enabled && !bound.has(key)) retired.set(key, row);
+    }
+    for (const { pluginId, sessionScope } of retired.values()) {
+      if (!this.loader.getPlugin(pluginId)) continue;
+      await this.applyScopeBinding(pluginId, sessionScope, {}, false, { additive: true });
+    }
+    await this.reconcile();
   }
 
   /**
@@ -155,15 +196,14 @@ export class ScopeBindingService implements OnApplicationBootstrap {
           this.loader.setPluginSessions(pluginId, ['*']);
           return;
         }
-        const anyWildcardLeft = (await this.instances.list(pluginId)).some(
-          i => i.enabled && (!i.sessionScope || i.sessionScope === '*'),
-        );
+        const rows = await this.instances.list(pluginId);
+        const anyWildcardLeft = rows.some(i => i.enabled && (!i.sessionScope || i.sessionScope === '*'));
         if (!anyWildcardLeft) {
+          // Activating a wildcard replaced activeSessions with ['*'], dropping the scopes enabled
+          // concrete siblings bind, so put those back rather than leave them silenced until a restart.
           const current = this.loader.getPlugin(pluginId)?.activeSessions ?? [];
-          this.loader.setPluginSessions(
-            pluginId,
-            current.filter(s => s !== '*'),
-          );
+          const concrete = rows.filter(i => i.enabled && i.sessionScope).map(i => i.sessionScope as string);
+          this.loader.setPluginSessions(pluginId, [...new Set([...current.filter(s => s !== '*'), ...concrete])]);
         }
         return;
       }
@@ -198,6 +238,12 @@ export class ScopeBindingService implements OnApplicationBootstrap {
       // Provisioning retires '*' (this instance narrows the plugin to one session); the additive boot
       // path keeps the restored set whole, so an operator's PUT /plugins/:id/sessions survives a restart.
       const set = new Set(opts.additive ? current : current.filter(s => s !== '*'));
+      // "*" covered the sessions of the plugin's other concrete instances too, so retiring it narrows the
+      // plugin to those scopes rather than to this one alone (the wildcard teardown above does the same).
+      // An explicit list has no "*" and stays as the operator set it.
+      if (!opts.additive && current.includes('*')) {
+        for (const i of siblings) if (i.enabled && i.sessionScope && i.sessionScope !== '*') set.add(i.sessionScope);
+      }
       if (activate) set.add(scope);
       else set.delete(scope);
       // Preserve '*' while an enabled wildcard/null sibling still binds all sessions ('*' subsumes

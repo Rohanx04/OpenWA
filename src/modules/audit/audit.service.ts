@@ -1,6 +1,6 @@
 import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, Between, LessThan, In } from 'typeorm';
+import { Repository, LessThan, In } from 'typeorm';
 import { AuditLog, AuditAction, AuditSeverity } from './entities/audit-log.entity';
 import { ApiKey } from '../auth/entities/api-key.entity';
 import { createLogger } from '../../common/services/logger.service';
@@ -9,6 +9,18 @@ import { resolveSessionScope } from '../../common/security/session-scope';
 
 /** Upper bound on a single audit-log page, so a large `limit` can't load the whole table at once. */
 export const MAX_AUDIT_PAGE_SIZE = 200;
+
+/**
+ * Caller-supplied text is cut to these lengths before it is stored. The first three match the
+ * entity's varchar lengths, which SQLite does not enforce; errorMessage is a text column with no
+ * declared bound. Without the clamp one row could carry a request path of many kilobytes.
+ */
+const MAX_USER_AGENT_LENGTH = 500;
+const MAX_METHOD_LENGTH = 10;
+const MAX_PATH_LENGTH = 500;
+const MAX_ERROR_MESSAGE_LENGTH = 1000;
+
+const clampText = (value: string | undefined, max: number): string | null => (value ? value.slice(0, max) : null);
 
 interface AuditContext {
   apiKey?: ApiKey;
@@ -28,8 +40,6 @@ export interface AuditQueryOptions {
   apiKeyId?: string;
   sessionId?: string;
   severity?: AuditSeverity;
-  startDate?: Date;
-  endDate?: Date;
   limit?: number;
   offset?: number;
 }
@@ -101,12 +111,12 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
       sessionId: context.sessionId || null,
       sessionName: context.sessionName || null,
       ipAddress: ipAddress || null,
-      userAgent: context.userAgent || null,
-      method: context.method || null,
-      path: context.path || null,
+      userAgent: clampText(context.userAgent, MAX_USER_AGENT_LENGTH),
+      method: clampText(context.method, MAX_METHOD_LENGTH),
+      path: clampText(context.path, MAX_PATH_LENGTH),
       statusCode: context.statusCode || null,
       metadata,
-      errorMessage: context.errorMessage || null,
+      errorMessage: clampText(context.errorMessage, MAX_ERROR_MESSAGE_LENGTH),
     });
 
     // Audit logging is best-effort: a failed insert must never turn a succeeded operation into a 500
@@ -131,10 +141,6 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
     return this.log(action, context, AuditSeverity.WARN);
   }
 
-  async logError(action: AuditAction, context: AuditContext = {}): Promise<AuditLog | null> {
-    return this.log(action, context, AuditSeverity.ERROR);
-  }
-
   async findAll(
     options: AuditQueryOptions = {},
     allowedSessions?: string[] | null,
@@ -156,17 +162,15 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
     }
     if (options.severity) where.severity = options.severity;
 
-    if (options.startDate && options.endDate) {
-      where.createdAt = Between(options.startDate, options.endDate);
-    }
-
     // Clamp the page size so an arbitrarily large `limit` can't load the whole table into one response.
     const requested = options.limit && options.limit > 0 ? options.limit : 50;
     const take = Math.min(requested, MAX_AUDIT_PAGE_SIZE);
 
     const [data, total] = await this.auditRepository.findAndCount({
       where,
-      order: { createdAt: 'DESC' },
+      // createdAt has one-second precision, so rows written in the same second tie; the unique id gives
+      // them one fixed order, or separate LIMIT/OFFSET pages could repeat one row and skip another.
+      order: { createdAt: 'DESC', id: 'DESC' },
       take,
       // Clamp to a non-negative skip: a negative offset (e.g. from an unvalidated `?offset=-5`) would
       // otherwise reach the query driver verbatim.
@@ -174,22 +178,6 @@ export class AuditService implements OnModuleInit, OnModuleDestroy {
     });
 
     return { data, total };
-  }
-
-  async getRecentByApiKey(apiKeyId: string, limit = 10): Promise<AuditLog[]> {
-    return this.auditRepository.find({
-      where: { apiKeyId },
-      order: { createdAt: 'DESC' },
-      take: limit,
-    });
-  }
-
-  async getRecentBySession(sessionId: string, limit = 10): Promise<AuditLog[]> {
-    return this.auditRepository.find({
-      where: { sessionId },
-      order: { createdAt: 'DESC' },
-      take: limit,
-    });
   }
 
   async cleanup(olderThanDays = 30): Promise<number> {

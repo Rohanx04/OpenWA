@@ -7,11 +7,12 @@
   },
   "common": {
     "appName": "OpenWA",
+    "updateAvailable": "גרסה v{{version}} זמינה",
     "loading": "טוען...",
     "cancel": "ביטול",
     "delete": "מחיקה",
     "create": "יצירה",
-    "save": "Save",
+    "save": "שמירה",
     "close": "סגירה",
     "showApiKey": "הצג מפתח API",
     "hideApiKey": "הסתר מפתח API",
@@ -30,9 +31,16 @@
     "disconnected": "מנותק",
     "never": "אף פעם",
     "justNow": "ממש עכשיו",
-    "minAgo": "לפני {{count}} דקות",
-    "hoursAgo": "לפני {{count}} שעות",
+    "minAgo": "לפני {{count}} דקה",
+    "minAgo_many": "לפני {{count}} דקות",
+    "minAgo_other": "לפני {{count}} דקות",
+    "minAgo_two": "לפני שתי דקות",
+    "hoursAgo": "לפני {{count}} שעה",
+    "hoursAgo_many": "לפני {{count}} שעות",
+    "hoursAgo_other": "לפני {{count}} שעות",
+    "hoursAgo_two": "לפני שעתיים",
     "optional": "אופציונלי",
+    "fieldTooLong": "מוגבל ל-{{max}} תווים (כרגע {{count}}).",
     "language": "שפה",
     "back": "חזרה",
     "next": "הבא",
@@ -58,8 +66,9 @@
     "dashboard": "דאשבורד",
     "sessions": "Sessions",
     "chats": "שיחות",
+    "numberChecker": "בודק מספרים",
     "webhooks": "Webhooks",
-    "templates": "Templates",
+    "templates": "תבניות",
     "apiKeys": "מפתחות API",
     "messageTester": "בדיקת הודעות",
     "infrastructure": "תשתית",
@@ -67,6 +76,7 @@
     "logs": "לוגים"
   },
   "chats": {
+    "edited": "נערך",
     "media": {
       "location": "מיקום",
       "call": "שיחה",
@@ -86,12 +96,14 @@
     "empty": "אין שיחות",
     "noMessageYet": "אין הודעות עדיין",
     "unreadBadge": "{{count}} הודעה שלא נקראה",
+    "unreadBadge_many": "{{count}} הודעות שלא נקראו",
     "unreadBadge_other": "{{count}} הודעות שלא נקראו",
     "unreadBadge_two": "שתי הודעות שלא נקראו",
-    "unreadBadge_many": "{{count}} הודעות שלא נקראו",
+    "markedUnread": "סומן כלא נקרא",
     "loadingMessages": "טוען הודעות...",
     "loadingOlderMessages": "טוען הודעות ישנות יותר...",
     "loadOlderMessagesError": "טעינת ההודעות הישנות נכשלה. גלול למעלה כדי לנסות שוב.",
+    "loadOlderMessagesRetryHint": "גלול למעלה כדי לנסות שוב.",
     "noMessagesInChat": "אין הודעות עדיין. שלח את ההודעה הראשונה כדי להתחיל!",
     "downloadDocument": "הורדת מסמך",
     "actions": {
@@ -100,8 +112,26 @@
       "delete": "מחק הודעה"
     },
     "replyingTo": "משיב ל-{{name}}",
+    "messageType": {
+      "text": "טקסט",
+      "image": "תמונה",
+      "video": "וידאו",
+      "audio": "אודיו",
+      "voice": "הודעה קולית",
+      "document": "מסמך",
+      "sticker": "מדבקה",
+      "location": "מיקום",
+      "contact": "איש קשר",
+      "poll": "סקר",
+      "call": "שיחה",
+      "revoked": "הודעה שנמחקה",
+      "order": "הזמנה",
+      "product": "מוצר",
+      "masked": "הודעה מוסתרת",
+      "unknown": "הודעה",
+      "unknownType": "סוג לא ידוע"
+    },
     "you": "אתה",
-    "youPrefix": "אתה: ",
     "yesterday": "אתמול",
     "attachTitle": "שליחת קובץ / תמונה",
     "emojiTitle": "בחירת אימוג'י",
@@ -122,7 +152,9 @@
       "group": "קבוצה",
       "channel": "ערוץ",
       "status": "סטטוס",
-      "broadcast": "שידור"
+      "broadcast": "שידור",
+      "individual": "פרטי",
+      "unknown": "לא ידוע"
     },
     "tab": {
       "chats": "שיחות",
@@ -159,9 +191,9 @@
       "empty": "עדיין אינך רשום/ה לאף ערוץ.",
       "notReady": "הסשן עדיין אינו מוכן.",
       "subscribers": "{{count}} מנוי",
+      "subscribers_many": "{{count}} מנויים",
       "subscribers_other": "{{count}} מנויים",
-      "subscribers_two": "שני מנויים",
-      "subscribers_many": "{{count}} מנויים"
+      "subscribers_two": "שני מנויים"
     },
     "errors": {
       "loadSessions": "טעינת הסשנים נכשלה",
@@ -171,7 +203,8 @@
       "react": "התגובה להודעה נכשלה",
       "delete": "מחיקת ההודעה נכשלה",
       "clickButton": "לחיצה על הכפתור נכשלה",
-      "fileTooLarge": "הקובץ גדול מדי (מקסימום 18 MB)"
+      "fileTooLarge": "הקובץ גדול מדי (מקסימום 18 MB)",
+      "searchHitSessionNotReady": "הסשן של הודעה זו אינו מחובר"
     },
     "loadMessagesError": "לא ניתן לטעון את ההודעות. בדקו את יומני השרת.",
     "messageStatus": {
@@ -180,6 +213,133 @@
       "delivered": "נמסר",
       "read": "נקרא",
       "failed": "נכשל"
+    },
+    "clearSearch": "ניקוי החיפוש",
+    "filters": {
+      "label": "סינון שיחות",
+      "all": "הכול",
+      "unread": "לא נקראו",
+      "direct": "צ׳אטים אישיים",
+      "groups": "קבוצות",
+      "unknown": "לא מוכרים"
+    },
+    "noFilterResults": "אין צ׳אטים שתואמים למסנן זה",
+    "moreActions": "פעולות נוספות",
+    "copyChatId": "העתקת מזהה הצ׳אט",
+    "chatIdCopied": "מזהה הצ׳אט הועתק",
+    "copyFailed": "ההעתקה ללוח נכשלה",
+    "closeChat": "סגירת הצ׳אט",
+    "chatId": "מזהה צ׳אט",
+    "newChat": {
+      "title": "צ׳אט חדש",
+      "searchPlaceholder": "חיפוש שם או מספר עם קידומת מדינה",
+      "startWithNumber": "התחלת צ׳אט עם {{number}}",
+      "contacts": "אנשי קשר",
+      "noContacts": "לא נמצאו אנשי קשר",
+      "loadingContacts": "טוען אנשי קשר...",
+      "contactsError": "לא ניתן לטעון את אנשי הקשר",
+      "checking": "בודק את המספר...",
+      "notOnWhatsApp": "{{number}} אינו רשום ב-WhatsApp",
+      "checkFailed": "לא ניתן לבדוק את המספר",
+      "numberHint": "יש להזין מספרים עם קידומת מדינה, למשל ‎+972 50 123 4567"
+    },
+    "newGroup": {
+      "title": "קבוצה חדשה",
+      "namePlaceholder": "שם הקבוצה",
+      "participantsPlaceholder": "חיפוש משתתפים או הזנת מספר",
+      "addNumber": "הוספת {{number}}",
+      "selected": "{{count}} נבחרו",
+      "create": "יצירת קבוצה",
+      "created": "הקבוצה \"{{name}}\" נוצרה",
+      "createFailed": "לא ניתן ליצור את הקבוצה",
+      "removeParticipant": "הסרת {{name}}"
+    },
+    "group": {
+      "info": "פרטי הקבוצה",
+      "leave": "יציאה מהקבוצה",
+      "leaveConfirm": "לצאת מהקבוצה \"{{name}}\"?",
+      "left": "יצאת מ-\"{{name}}\"",
+      "leaveFailed": "לא ניתן לצאת מהקבוצה",
+      "editTitle": "עריכת קבוצה",
+      "tabInfo": "מידע",
+      "tabParticipants": "משתתפים",
+      "managedBy": "מנוהל דרך {{session}}",
+      "notAdmin": "אין הרשאת מנהל דרך {{session}}",
+      "name": "שם הקבוצה",
+      "picture": "תמונת הקבוצה",
+      "pictureHint": "לחצו על שדה זה כדי לבחור תמונת קבוצה חדשה.",
+      "readOnlyHint": "רק מנהלי הקבוצה יכולים לשנות אותה.",
+      "description": "תיאור",
+      "descriptionPlaceholder": "תיאור הקבוצה (אופציונלי)",
+      "save": "שמירת השינויים",
+      "saved": "הקבוצה עודכנה",
+      "saveFailed": "לא ניתן לשמור את הקבוצה",
+      "loadFailed": "לא ניתן לטעון את פרטי הקבוצה",
+      "participantCount": "משתתפים: {{count}}",
+      "admin": "מנהל",
+      "owner": "יוצר",
+      "makeAdmin": "הפיכה למנהל",
+      "removeAdmin": "הסרת הרשאת מנהל",
+      "remove": "הסרה",
+      "removeConfirm": "להסיר את {{name}} מהקבוצה?",
+      "add": "הוספה",
+      "addPlaceholder": "הוסיפו מספר עם קידומת מדינה",
+      "memberActionFailed": "הפעולה נכשלה",
+      "leaveWarning": "לא תקבלו עוד הודעות מהקבוצה, ורק מנהל קבוצה יוכל להוסיף אתכם שוב."
+    },
+    "rowActions": {
+      "actionsFor": "פעולות עבור {{name}}",
+      "markUnread": "סימון כלא נקרא",
+      "markUnreadFailed": "לא ניתן לסמן את השיחה כלא נקראה",
+      "clear": "ניקוי השיחה",
+      "clearConfirm": "למחוק את כל ההודעות בשיחה עם {{name}}?",
+      "clearWarning": "השיחה נשארת ברשימה. השער מוחק גם את העותק השמור של ההודעות, כולל מדיה; ייצאו את ההיסטוריה קודם אם אתם צריכים אותה.",
+      "cleared": "השיחה עם {{name}} נוקתה",
+      "clearFailed": "לא ניתן לנקות את השיחה",
+      "delete": "מחיקת השיחה",
+      "deleteConfirm": "למחוק את השיחה עם {{name}}?",
+      "deleteWarning": "השיחה נעלמת מהרשימה, והשער מוחק את העותק השמור של ההודעות, כולל מדיה.",
+      "deleted": "השיחה עם {{name}} נמחקה",
+      "deleteFailed": "לא ניתן למחוק את השיחה",
+      "saveContact": "שמירת איש קשר",
+      "renameContact": "שינוי שם איש קשר",
+      "firstName": "שם פרטי",
+      "lastName": "שם משפחה (אופציונלי)",
+      "contactSaved": "איש הקשר נשמר",
+      "contactSaveFailed": "לא ניתן לשמור את איש הקשר",
+      "pin": "הצמדת השיחה",
+      "unpin": "ביטול הצמדת השיחה",
+      "pinFailed": "לא ניתן להצמיד את השיחה. וואטסאפ מאפשרת עד שלוש שיחות מוצמדות.",
+      "unpinFailed": "לא ניתן לבטל את הצמדת השיחה",
+      "pinnedLabel": "מוצמדת",
+      "mute": "השתקת התראות",
+      "unmute": "ביטול השתקה",
+      "mutedLabel": "מושתקת",
+      "muteTitle": "השתקת \"{{name}}\"",
+      "muteHint": "המשתתפים האחרים לא יידעו שהשתקתם את השיחה. תקבלו התראה כשיזכירו אתכם.",
+      "muteFailed": "לא ניתן לשנות את ההתראות",
+      "archive": "העברה לארכיון",
+      "unarchive": "הוצאה מהארכיון",
+      "archived": "השיחה הועברה לארכיון",
+      "unarchived": "השיחה הוצאה מהארכיון",
+      "archiveFailed": "לא ניתן לשנות את הארכיון",
+      "archivedEntry": "בארכיון",
+      "archivedTitle": "שיחות בארכיון",
+      "archiveEmpty": "אין שיחות בארכיון",
+      "declined": "וואטסאפ דחתה את השינוי.",
+      "block": "חסימת איש קשר",
+      "unblock": "ביטול חסימה",
+      "blockConfirm": "לחסום את {{name}}?",
+      "blockWarning": "אנשי קשר חסומים לא יוכלו להתקשר אליכם או לשלוח לכם הודעות.",
+      "blocked": "{{name}} נחסם",
+      "unblocked": "החסימה של {{name}} בוטלה",
+      "blockFailed": "לא ניתן לשנות את החסימה",
+      "muteFor": {
+        "8h": "8 שעות",
+        "1w": "שבוע",
+        "always": "תמיד"
+      },
+      "saveContactUnavailable": "נדרש מספר טלפון ידוע: לשיחה זו יש רק מזהה פרטיות (@lid)."
     }
   },
   "errorBoundary": {
@@ -222,6 +382,7 @@
     "noSessions": "לא נמצאו Sessions. יש ליצור אחד כדי להתחיל.",
     "view": "צפייה",
     "disconnect": "ניתוק",
+    "disconnectFailed": "לא ניתן לנתק את ה-Session",
     "errorPrefix": "שגיאה: {{message}}",
     "loadError": "טעינת הנתונים נכשלה",
     "charts": {
@@ -232,6 +393,7 @@
         "30d": "30 יום"
       },
       "overTime": "הודעות לאורך זמן",
+      "overTimeUtcDays": "הודעות לאורך זמן (ימים לפי UTC)",
       "byType": "הודעות לפי סוג",
       "topChats": "צ'אטים מובילים",
       "sent": "נשלחו",
@@ -280,7 +442,8 @@
       "successTitle": "ה-Session נוצר",
       "successDesc": "Session \"{{name}}\" נוצר בהצלחה",
       "errorTitle": "היצירה נכשלה",
-      "errorDefault": "יצירת ה-Session נכשלה"
+      "errorDefault": "יצירת ה-Session נכשלה",
+      "tooShort": "השם חייב להכיל לפחות 3 תווים."
     },
     "delete": {
       "title": "אישור מחיקה",
@@ -314,24 +477,24 @@
       "created": "נוצר בתאריך",
       "lastActive": "פעילות אחרונה",
       "autoRejectCalls": "דחיית שיחות אוטומטית",
-      "autoRejectCallsHint": "שיחות נכנסות נדחות ברגע שהן מצלצלות. ה-webhook call.received עדיין נשלח לפני כן. חל מהשיחה הבאה — ללא צורך בהפעלה מחדש. במנוע Baileys בלבד: whatsapp-web.js לא יכול לדחות שיחות."
+      "autoRejectCallsHint": "שיחות נכנסות נדחות ברגע שהן מצלצלות. ה-webhook call.received עדיין נשלח לפני כן. חל מהשיחה הבאה, ללא צורך בהפעלה מחדש. במנוע Baileys בלבד: whatsapp-web.js לא יכול לדחות שיחות."
     },
     "proxy": {
-      "title": "Proxy Configuration",
-      "status": "Current",
-      "enabled": "Use proxy",
-      "url": "Proxy URL",
+      "title": "הגדרות proxy",
+      "status": "נוכחי",
+      "enabled": "שימוש ב-proxy",
+      "url": "כתובת URL של ה-proxy",
       "urlPlaceholder": "http://user:pass@proxy.example.com:8080",
-      "urlKeepPlaceholder": "Enter new URL to replace {{host}} (credentials not shown)",
+      "urlKeepPlaceholder": "יש להזין כתובת URL חדשה במקום {{host}} (פרטי הגישה אינם מוצגים)",
       "configured": "{{host}} ({{type}})",
-      "noProxy": "No proxy configured",
-      "hasCredentials": "Credentials are stored but not shown. Enter a full URL to change them.",
-      "hint": "Changes apply on the next session start, not to a running connection. The proxy must be real and reachable — an unreachable value blocks QR delivery and start returns 504.",
-      "createHint": "Only needed when your network cannot reach WhatsApp directly. Must be a real, reachable proxy.",
-      "invalidUrl": "Enter a valid http, https, socks4, or socks5 proxy URL.",
-      "saveSuccessTitle": "Proxy Saved",
-      "saveSuccess": "Proxy settings saved. They apply on the next session start.",
-      "saveError": "Failed to save proxy settings"
+      "noProxy": "לא הוגדר proxy",
+      "hasCredentials": "פרטי הגישה שמורים אך אינם מוצגים. כדי לשנות אותם יש להזין כתובת URL מלאה.",
+      "hint": "השינויים חלים בהפעלה הבאה של הסשן, ולא על חיבור פעיל. ה-proxy חייב להיות אמיתי ונגיש: ערך שאינו נגיש חוסם את קבלת ה-QR. ב-whatsapp-web.js ההפעלה מחזירה 504, וב-Baileys ההפעלה מצליחה והסשן ממשיך לנסות שוב.",
+      "createHint": "נדרש רק כשהרשת שלכם לא מצליחה להגיע ישירות ל-WhatsApp. חייב להיות proxy אמיתי ונגיש.",
+      "invalidUrl": "יש להזין כתובת URL תקינה של proxy מסוג http, https, socks4 או socks5.",
+      "saveSuccessTitle": "ה-proxy נשמר",
+      "saveSuccess": "הגדרות ה-proxy נשמרו. הן יחולו בהפעלה הבאה של הסשן.",
+      "saveError": "שמירת הגדרות ה-proxy נכשלה"
     },
     "actions": {
       "view": "צפייה",
@@ -351,7 +514,8 @@
       "actionRequiredTitle": "נדרשת פעולה",
       "actionRequiredDesc": "ה-Session הזה דורש את תשומת לבך. פתחו את ה-Session כדי לראות מה לעשות.",
       "failedTitle": "ה-Session נכשל",
-      "failedDesc": "ה-Session של WhatsApp נכשל באתחול. פתחו את ה-Session כדי לראות את הסיבה."
+      "failedDesc": "ה-Session של WhatsApp נכשל באתחול. פתחו את ה-Session כדי לראות את הסיבה.",
+      "stopFailedTitle": "העצירה נכשלה"
     },
     "card": {
       "phone": "טלפון",
@@ -424,15 +588,17 @@
     "selectSession": "בחירת Session...",
     "session": "Session",
     "events": "אירועים",
+    "noEvents": "בחרו לפחות אירוע אחד.",
     "available": "אירועים זמינים",
     "saveChanges": "שמירת שינויים",
     "filters": {
       "badge": "{{count}} מסנן",
-      "badge_other": "{{count}} מסננים",
       "badge_many": "{{count}} מסננים",
+      "badge_other": "{{count}} מסננים",
       "badge_two": "שני מסננים",
       "title": "מסננים (אופציונלי)",
       "hint": "הפעלה רק כאשר כל התנאים מתקיימים. חל על אירועי הודעות.",
+      "incomplete": "יש לתת ערך לכל תנאי סינון ולהשתמש בעד 20 תנאים, עד 100 ערכים לכל תנאי ועד 1000 תווי טקסט.",
       "addCondition": "הוספת תנאי",
       "removeCondition": "הסרת תנאי",
       "caseSensitive": "תלוי רישיות",
@@ -448,7 +614,7 @@
         "body": "גוף ההודעה",
         "type": "סוג הודעה",
         "isGroup": "צ'אט קבוצתי",
-        "kind": "Chat kind",
+        "kind": "סוג שיחה",
         "fromMe": "נשלח על ידי",
         "hasMedia": "מכיל מדיה",
         "mentions": "אזכורים"
@@ -464,15 +630,16 @@
       "valueLabel": "ערך סינון"
     },
     "columns": {
-      "url": "כתובת URL",
       "events": "אירועים",
       "session": "Session",
-      "status": "סטטוס",
-      "actions": "פעולות"
+      "status": "סטטוס"
     },
     "empty": {
       "title": "לא הוגדרו Webhooks",
-      "description": "יש להוסיף Webhook כדי לקבל התראות בזמן אמת"
+      "description": "יש להוסיף Webhook כדי לקבל התראות בזמן אמת",
+      "loadErrorTitle": "לא ניתן לטעון את ה-Webhooks",
+      "forbiddenTitle": "אין גישה ל-Webhooks",
+      "forbiddenDesc": "Webhooks דורשים מפתח API עם תפקיד מפעיל או מנהל."
     },
     "toasts": {
       "created": "ה-Webhook נוצר בהצלחה",
@@ -493,10 +660,57 @@
     "eventDescriptions": {
       "message.received": "כאשר מתקבלת הודעה",
       "message.sent": "כאשר נשלחת הודעה",
-      "session.connected": "כאשר Session מתחבר",
-      "session.disconnected": "כאשר Session מתנתק",
+      "message.ack": "כאשר סטטוס המסירה או הקריאה של הודעה משתנה",
+      "message.receipt": "כל נמען שמקבל, קורא או מנגן הודעת קבוצה או סטטוס ששלחת (Baileys בלבד; לא כלול ב-*)",
+      "message.failed": "כאשר מסירת הודעה יוצאת נכשלת",
+      "message.revoked": "כאשר הודעה נמחקת אצל כולם",
+      "message.reaction": "כאשר תגובה נוספת, משתנה או מוסרת",
+      "message.edited": "כאשר הודעה נערכת",
+      "session.status": "כאשר הסטטוס של Session משתנה",
       "session.qr": "כאשר נוצר קוד QR",
+      "session.authenticated": "כאשר Session מקושר ומוכן",
+      "session.disconnected": "כאשר Session מתנתק",
+      "session.reconnect_loop": "כאשר Session נכשל שוב ושוב בהתחברות מחדש",
+      "session.restriction": "כאשר WhatsApp מגביל את החשבון או מסיר הגבלה",
+      "presence.update": "כאשר צ'אט במעקב מתחבר, מקליד או מתנתק",
+      "event.response": "כאשר אורח עונה להזמנה לאירוע בוואטסאפ (מגיע, לא מגיע, אולי)",
+      "group.join": "כאשר משתתפים מצטרפים לקבוצה או מתווספים אליה",
+      "group.leave": "כאשר משתתפים עוזבים קבוצה או מוסרים ממנה",
+      "group.update": "כאשר השם, התיאור או ההגדרות של קבוצה משתנים",
+      "group.join_request": "כאשר מישהו מבקש להצטרף לקבוצה שה-Session הזה מנהל",
+      "call.received": "כאשר שיחה נכנסת מתחילה לצלצל",
+      "call.accepted": "כאשר עונים לשיחה",
+      "call.rejected": "כאשר שיחה נדחית",
+      "call.missed": "כאשר שיחה לא נענית",
+      "status.received": "כאשר איש קשר מפרסם סטטוס",
       "all": "כל האירועים"
+    },
+    "auth": {
+      "title": "אימות משלוח",
+      "hint": "אופציונלי. ערכים שמורים לא מוצגים שוב לאחר השמירה.",
+      "editHint": "הסוד והכותרות השמורים לעולם אינם מוצגים. השאירו את החלק הזה ללא שינוי כדי לשמור אותם.",
+      "secret": "סוד חתימה",
+      "secretHint": "16 עד 255 תווים. כל משלוח נושא חתימת HMAC-SHA256 בכותרת X-OpenWA-Signature.",
+      "secretKeepPlaceholder": "השאירו ריק כדי לשמור את הסוד הנוכחי",
+      "generateSecret": "יצירה",
+      "copySecret": "העתקה",
+      "secretCopied": "סוד החתימה הועתק",
+      "removeSecret": "הפסקת חתימת המשלוחים (הסרת הסוד)",
+      "headers": "כותרות מותאמות",
+      "headerName": "שם הכותרת",
+      "headerValue": "ערך הכותרת",
+      "addHeader": "הוספת כותרת",
+      "removeHeader": "הסרת כותרת",
+      "replaceHeaders": "החלפת הכותרות המותאמות",
+      "replaceHint": "השורות האלה מחליפות את כל הכותרות השמורות. ללא שורות, הכותרות השמורות מוסרות.",
+      "errors": {
+        "headerName": "שמות כותרות יכולים להכיל רק אותיות, ספרות ומקפים.",
+        "headerValue": "ערכי כותרות מוגבלים ל-1024 תווים, ללא תווי בקרה או תווים מחוץ ל-Latin-1.",
+        "headerReserved": "Content-Type, User-Agent, X-OpenWA-* וכותרות חיבור נקבעות על ידי השער ואי אפשר להשתמש בהן.",
+        "headerDuplicate": "ניתן להשתמש בכל שם כותרת פעם אחת בלבד.",
+        "tooMany": "מותרות לכל היותר 50 כותרות מותאמות.",
+        "secretLength": "אורך סוד החתימה חייב להיות בין 16 ל-255 תווים."
+      }
     }
   },
   "templates": {
@@ -530,6 +744,7 @@
     },
     "empty": {
       "title": "אין תבניות שמורות",
+      "noMatch": "אין תבניות שתואמות לחיפוש.",
       "description": "צרו תבנית לשימוש חוזר כדי לזרז תשובות והתראות נפוצות.",
       "noSessionsTitle": "אין סשנים זמינים",
       "noSessionsDesc": "צרו סשן WhatsApp לפני הוספת תבניות.",
@@ -556,6 +771,7 @@
     "createdTitle": "מפתח ה-API נוצר",
     "createdHint": "יש להעתיק את המפתח כעת. לא ניתן יהיה לצפות בו שוב.",
     "namePlaceholder": "לדוגמה: Production Key",
+    "nameTooShort": "השתמשו לפחות ב-3 תווים.",
     "rolesTitle": "מדריך תפקידים",
     "roles": {
       "admin": "Admin",
@@ -574,15 +790,20 @@
       "status": "סטטוס",
       "lastUsed": "שימוש אחרון",
       "actions": "פעולות",
-      "sessions": "סשנים"
+      "sessions": "סשנים",
+      "restrictions": "הגבלות"
     },
     "statuses": {
       "active": "פעיל",
-      "revoked": "בוטל"
+      "revoked": "בוטל",
+      "expired": "פג תוקף"
     },
     "empty": {
       "title": "לא נוצרו מפתחות API",
-      "description": "יש ליצור מפתח API לאימות הבקשות"
+      "description": "יש ליצור מפתח API לאימות הבקשות",
+      "loadErrorTitle": "לא ניתן לטעון את מפתחות ה-API",
+      "forbiddenTitle": "אין גישה למפתחות ה-API",
+      "forbiddenDesc": "ניהול מפתחות API דורש מפתח מנהל שאינו מוגבל לסשנים מסוימים."
     },
     "confirm": {
       "deleteTitle": "מחיקת מפתח API",
@@ -593,10 +814,9 @@
       "revoke": "ביטול"
     },
     "actions": {
-      "copy": "העתקה",
       "revoke": "ביטול",
       "delete": "מחיקה",
-      "editSessions": "עריכת סשנים"
+      "edit": "עריכת גישה"
     },
     "sessions": {
       "label": "גישה לסשנים",
@@ -604,10 +824,37 @@
       "all": "כל הסשנים",
       "empty": "עדיין אין סשנים. המפתח הזה יוכל לגשת לכולם ברגע שיהיו.",
       "restricted": "{{count}} נבחרו",
-      "editTitle": "עריכת גישה לסשנים",
       "save": "שמירה",
       "choose": "בחירת סשנים",
       "leaveAll": "להשאיר לכל הסשנים"
+    },
+    "edit": {
+      "title": "עריכת הגישה של המפתח",
+      "signedIn": "לוח הבקרה הזה מחובר עם המפתח הזה. שינוי התפקיד, כתובות ה-IP, הצ'אטים או התפוגה שלו עלול לנתק אתכם."
+    },
+    "restrictions": {
+      "none": "אין",
+      "ips": "כתובות IP: {{count}}",
+      "chats": "צ'אטים: {{count}}",
+      "expires": "פג ב-{{date}}",
+      "expired": "פג תוקף ב-{{date}}"
+    },
+    "ips": {
+      "label": "כתובות IP מורשות (אופציונלי)",
+      "hint": "כתובת IP אחת או טווח CIDR אחד בכל שורה. השאירו ריק כדי לקבל כל כתובת.",
+      "invalid": "אינה כתובת IPv4 או טווח CIDR: {{value}}"
+    },
+    "chats": {
+      "label": "גישה לצ'אטים (אופציונלי)",
+      "hint": "צ'אט אחד בכל שורה: מזהה קבוצה שמסתיים ב-@g.us, מזהה איש קשר שמסתיים ב-@c.us או ב-@lid, או מספר טלפון. השאירו ריק לכל הצ'אטים. מפתח שמוגבל לצ'אטים יכול להשתמש רק בנתיבים הפתוחים למפתחות כאלה; הגישה שלו דרך ה-WebSocket של האירועים ו-MCP מוגבלת לצ'אטים האלה.",
+      "invalid": "אינו מזהה צ'אט או מספר טלפון: {{value}}",
+      "tooMany": "יותר מדי צ'אטים ({{count}}): מפתח יכול לכלול לכל היותר {{max}}."
+    },
+    "expiry": {
+      "label": "תפוגה (אופציונלי)",
+      "hint": "לפי אזור הזמן של הדפדפן הזה. השאירו ריק למפתח שאינו פג לעולם.",
+      "clear": "הסרת התפוגה",
+      "invalid": "הזינו תאריך ושעה מלאים, לא מאוחר משנת 9999, או רוקנו את השדה למפתח שאינו פג לעולם."
     }
   },
   "logs": {
@@ -635,7 +882,12 @@
       "filteredTitle": "אין התאמות בעמוד זה",
       "filteredDescription": "החיפוש מסנן את העמוד הנוכחי בלבד. נקו אותו, דפדפו בין העמודים או השתמשו במסנן החומרה בצד השרת.",
       "filteredServerDescription": "אין יומנים התואמים למסננים אלה. התאימו את מסנן החומרה כדי להרחיב את החיפוש."
-    }
+    },
+    "exportFailed": "לא ניתן לייצא את יומן הביקורת",
+    "exportTruncated": "הייצוא כולל רק את {{rows}} הרשומות האחרונות. צמצמו את מסנן החומרה כדי לייצא רשומות ישנות יותר.",
+    "exportThrottled": "הייצוא כולל רק את {{rows}} הרשומות האחרונות, כי השער מגביל קריאות של יומן הביקורת. המתינו דקה וייצאו שוב.",
+    "exportNoMatches": "אין רשומות ביומן הביקורת התואמות לחיפוש, ולכן לא יוצא דבר.",
+    "exportNoMatchesTruncated": "אף אחת מ-{{rows}} הרשומות האחרונות שנסרקו אינה תואמת לחיפוש, ולכן לא יוצא דבר. רשומות ישנות יותר לא נסרקו."
   },
   "messageTester": {
     "title": "בדיקת הודעות",
@@ -653,6 +905,12 @@
     "loadingGroups": "טוען קבוצות...",
     "noGroupsFound": "לא נמצאו קבוצות",
     "selectGroupHint": "יש לבחור קבוצה מתוך WhatsApp",
+    "selectAllGroups": "בחירת הכל",
+    "selectMatchingGroups": "בחירת התוצאות",
+    "clearGroupSelection": "ניקוי",
+    "groupsSelectedCount": "נבחרו: {{count}}/{{max}}",
+    "noGroupsMatch": "אין קבוצות התואמות לחיפוש",
+    "forwardUsesFirstGroup": "העברה משתמשת רק בקבוצה הראשונה שנבחרה, כצ'אט שממנו מעבירים.",
     "phoneHint": "יש להשתמש בפורמט בינלאומי ללא רווחים",
     "messageType": "סוג הודעה",
     "types": {
@@ -710,17 +968,29 @@
     "bulkRecipientsCount": "נמענים: {{count}}",
     "bulkDelay": "השהיה בין הודעות (אלפיות שנייה)",
     "bulkDelayHint": "1000–60000 אלפיות שנייה (ברירת מחדל 3000)",
+    "bulkMediaKind": "שליחה בתור",
+    "bulkMediaHint": "כשמצורף קובץ, ההודעה הופכת לכיתוב שלו. קובץ שנבחר נשלח בתוך הבקשה עצמה, ולכן קבצים גדולים לנמענים רבים דורשים כתובת URL ציבורית למדיה במקום זאת.",
+    "bulkMediaTooLarge": "הקובץ גדול מדי לשליחה ישירה אל {{count}} נמענים: בכמות כזו כל קובץ יכול להיות בגודל של {{size}} לכל היותר. יש להשתמש בכתובת URL ציבורית למדיה במקום זאת, או לשלוח לפחות נמענים.",
+    "bulkMediaUrlInvalid": "יש להזין כתובת מלאה שמתחילה ב-http:// או ב-https://, למשל https://example.com/file.pdf.",
+    "bulkCaptionTooLong": "כשמצורף קובץ, ההודעה נשלחת ככיתוב שלו, שמוגבל ל-{{max}} תווים (כרגע {{count}}).",
+    "bulkAudioNoCaption": "שמע נשלח ללא כיתוב, ולכן הטקסט הזה לא יישלח. נקה את ההודעה או בחר סוג אחר.",
     "send": "שליחת הודעה",
     "sending": "שולח...",
+    "sendingProgress": "שולח {{current}}/{{total}}...",
     "viewOnly": "צפייה בלבד",
     "responseEmpty": "יש לשלוח הודעה כדי לראות את תגובת ה-API",
     "successLabel": "הצלחה",
     "failedLabel": "נכשל",
+    "groupsSentSummary": "נשלחו {{sent}}/{{total}}",
+    "groupSendCancelled": "{{count}}, בוטלו",
+    "groupSendStopped": "{{count}}, נעצר אחרי HTTP {{status}}",
     "response": {
       "timestamp": "חותמת זמן",
       "messageId": "מזהה הודעה",
       "batchId": "מזהה אצווה",
-      "error": "שגיאה"
+      "error": "שגיאה",
+      "groups": "קבוצות",
+      "notSent": "לא נשלחו"
     },
     "sendFailed": "שליחת ההודעה נכשלה",
     "notOnWhatsApp": "מספר זה אינו רשום בוואטסאפ",
@@ -735,6 +1005,125 @@
       "progress": "נשלחו {{sent}} מתוך {{total}} · {{failed}} נכשלו · {{pending}} ממתינים",
       "cancel": "ביטול אצווה",
       "cancelling": "מבטל..."
+    }
+  },
+  "numberChecker": {
+    "subtitle": "בדיקה שקטה אם למספרי טלפון יש חשבונות WhatsApp פעילים, ללא שליחת הודעות",
+    "zeroMessages": "ללא שליחת הודעות",
+    "noSession": {
+      "title": "אין Session של WhatsApp מחובר ופעיל.",
+      "desc": "כדי לבדוק מספרי טלפון, OpenWA דורש לפחות Session אחד מאומת.",
+      "goToSessions": "מעבר אל Sessions"
+    },
+    "tabs": {
+      "single": "בדיקה בודדת",
+      "bulk": "בדיקת מספרים מרובה"
+    },
+    "session": {
+      "label": "Session של WhatsApp",
+      "none": "אין Sessions מוכנים",
+      "hint": "השאילתות מנותבות דרך חשבון WhatsApp המחובר הזה."
+    },
+    "single": {
+      "title": "בדיקת חשבון בודד",
+      "phoneLabel": "מספר טלפון",
+      "phonePlaceholder": "לדוגמה: 919876543210 או 6281234567890 (עם קידומת המדינה)",
+      "check": "בדיקה",
+      "checking": "בודק...",
+      "autoPrefix": "הוספה אוטומטית של הקידומת ‎<strong>+91</strong> למספרים בני 10 ספרות (מספרים בני 12 ספרות נשארים כפי שהם)",
+      "silent": "<strong>שקט לחלוטין:</strong> הבדיקה פונה ישירות למאגר הרישום של WhatsApp. איש הקשר לא מקבל התראה, צליל או הודעה.",
+      "resultTitle": "תוצאת הבדיקה",
+      "querying": "שולח שאילתה לשרתי WhatsApp...",
+      "empty": "יש להזין מספר טלפון וללחוץ על \"בדיקה\" כדי לראות את מצבו ב-WhatsApp."
+    },
+    "preview": {
+      "prefixed": "ייבדק בתור: ‎<strong>+{{number}}</strong> (10 ספרות ← נוספה אוטומטית הקידומת 91)",
+      "kept": "ייבדק בתור: ‎<strong>+{{number}}</strong> (12 ספרות ← נשאר ללא שינוי)",
+      "digits": "ייבדק בתור: ‎<strong>+{{number}}</strong> ({{digits}} ספרות)"
+    },
+    "prefixHint": {
+      "single": "הקידומת ‎+91 מתווספת למספרים בני 10 ספרות ולמספרים בני 11 ספרות שמתחילים ב-0. מספרים עם + או 00 נשארים כפי שהוקלדו.",
+      "bulk": "הקידומת ‎+91 מתווספת למספרים בני 10 ספרות (למשל 96...) ולמספרים בני 11 ספרות שמתחילים ב-0. מספרים עם + או 00 נשארים כפי שהוקלדו.",
+      "off": "המספרים נבדקים כפי שהוקלדו, ספרות בלבד, ולכן יש לכלול את קידומת המדינה."
+    },
+    "result": {
+      "registered": "רשום ב-WhatsApp",
+      "notRegistered": "לא רשום",
+      "avatarAlt": "תמונת פרופיל",
+      "status": "סטטוס",
+      "active": "חשבון פעיל",
+      "none": "לא נמצא חשבון",
+      "jid": "מזהה WhatsApp (JID)",
+      "copyJid": "העתקת JID",
+      "copy": "העתקה",
+      "copied": "הועתק",
+      "checkedAt": "זמן הבדיקה",
+      "openTester": "פתיחה בבדיקת הודעות"
+    },
+    "recent": {
+      "title": "בדיקות אחרונות",
+      "clear": "ניקוי היסטוריה"
+    },
+    "table": {
+      "phone": "מספר טלפון",
+      "status": "סטטוס WhatsApp",
+      "id": "מזהה WhatsApp",
+      "time": "זמן"
+    },
+    "status": {
+      "registered": "רשום",
+      "unregistered": "לא רשום",
+      "notRegistered": "לא רשום",
+      "failed": "נכשל"
+    },
+    "bulk": {
+      "title": "בדיקת מספרים מרובה",
+      "delayLabel": "השהיה בטוחה בין בדיקות (אלפיות שנייה)",
+      "delay1": "1000 אלפיות שנייה / שנייה אחת (מומלץ)",
+      "delay2": "2000 אלפיות שנייה / 2 שניות (בטוח במיוחד)",
+      "delay3": "3000 אלפיות שנייה / 3 שניות (בטוח לכמויות גדולות)",
+      "delayHint": "ההמתנה בין השאילתות נועדה להישאר מתחת למגבלת הבקשות של השער (100 בדקה כברירת מחדל). הבדיקה נעצרת אם השער מסרב לשאילתות נוספות.",
+      "countryRule": "כלל קידומת המדינה",
+      "autoPrefix": "הוספה אוטומטית של הקידומת ‎<strong>+91</strong> (הודו) למספרים בני 10 ספרות",
+      "numbersLabel": "מספרים לבדיקה (אחד בכל שורה או מופרדים בפסיקים)",
+      "numbersHint": "יש להדביק מספרי טלפון עם קידומת המדינה, אחד בכל שורה או מופרדים בפסיקים. עד {{max}} מספרים בכל אצווה.",
+      "parsed": "זוהה <strong>{{count}}</strong> מספר ייחודי",
+      "parsed_many": "זוהו <strong>{{count}}</strong> מספרים ייחודיים",
+      "parsed_other": "זוהו <strong>{{count}}</strong> מספרים ייחודיים",
+      "parsed_two": "זוהו <strong>שני</strong> מספרים ייחודיים",
+      "tenDigitAdded": "({{ten}} מתוכם בני 10 ספרות ← נוספה ‎+91)",
+      "tenDigitAddedPreserved": "({{ten}} מתוכם בני 10 ספרות ← נוספה ‎+91, {{twelve}} בני 12 ספרות נשארו ללא שינוי)",
+      "tooMany": "יותר מדי מספרים: זוהו {{parsed}}, והמקסימום לכל אצווה הוא {{max}}. יש להסיר את העודף ({{excess}}) כדי להתחיל.",
+      "start": "התחלת בדיקה מרובה",
+      "stop": "עצירת הבדיקה",
+      "export": "ייצוא תוצאות (CSV)",
+      "stoppedTitle": "האצווה נעצרה",
+      "checked": "נבדקו",
+      "remaining": "נותרו",
+      "all": "הכול"
+    },
+    "stopped": {
+      "reason409": "ה-Session אינו מחובר",
+      "reason429": "מגבלת הקצב של השער מוצתה",
+      "reason503": "WhatsApp לא השיב לשאילתה",
+      "reasonOther": "השער סירב לשאילתה",
+      "partial": "{{reason}} (HTTP {{status}}). הבדיקה נעצרה במספר {{attempted}} מתוך {{total}}; {{count}} מספר לא נשלח. יש לנסות שוב מאוחר יותר.",
+      "partial_many": "{{reason}} (HTTP {{status}}). הבדיקה נעצרה במספר {{attempted}} מתוך {{total}}; {{count}} מספרים לא נשלחו. יש לנסות שוב מאוחר יותר.",
+      "partial_other": "{{reason}} (HTTP {{status}}). הבדיקה נעצרה במספר {{attempted}} מתוך {{total}}; {{count}} מספרים לא נשלחו. יש לנסות שוב מאוחר יותר.",
+      "partial_two": "{{reason}} (HTTP {{status}}). הבדיקה נעצרה במספר {{attempted}} מתוך {{total}}; שני מספרים לא נשלחו. יש לנסות שוב מאוחר יותר.",
+      "last": "{{reason}} (HTTP {{status}}). השאילתה האחרונה נכשלה. יש לנסות שוב מאוחר יותר."
+    },
+    "toast": {
+      "enterNumber": "יש להזין מספר טלפון לבדיקה.",
+      "noSession": "אין Session של WhatsApp מוכן.",
+      "checkFailed": "הבדיקה נכשלה",
+      "unknownError": "שגיאת שאילתה לא ידועה",
+      "lookupFailed": "השאילתה נכשלה",
+      "enterNumbers": "יש להזין מספרי טלפון תקינים (אחד בכל שורה או מופרדים בפסיקים).",
+      "completed": "הושלמה בדיקת {{count}} מספר.",
+      "completed_many": "הושלמה בדיקת {{count}} מספרים.",
+      "completed_other": "הושלמה בדיקת {{count}} מספרים.",
+      "completed_two": "הושלמה בדיקת שני מספרים."
     }
   },
   "infrastructure": {
@@ -759,7 +1148,7 @@
       "sslRejectUnauthorized": "אימות תעודת SSL",
       "sslRejectUnauthorizedDesc": "דחיית תעודות בחתימה עצמית או לא תקפות. כבה עבור Postgres מנוהל עם תעודות בחתימה עצמית (Supabase, Heroku, Render, Railway).",
       "migrationsTitle": "Migrations של מסד הנתונים",
-      "migrationsStatus": "הסכמה מסונכרנת אוטומטית עם TypeORM",
+      "migrationsStatus": "Migrations ממתינים מוחלים אוטומטית בעת ההפעלה",
       "migrationsHint": "ה-Migrations מנוהלים אוטומטית. ניתן להשתמש ב-CLI ל-Migrations ידניים."
     },
     "engine": {
@@ -782,7 +1171,7 @@
     "redis": {
       "title": "Redis",
       "enable": "הפעלת Redis",
-      "enableDesc": "נדרש למטמון, אחסון Sessions ותורי BullMQ",
+      "enableDesc": "משמש למטמון, לתורי BullMQ, למוני הגבלת קצב ולהפצת WebSocket בין צמתים מרובים",
       "useBuiltIn": "שימוש בקונטיינר Redis מובנה",
       "builtInDesc": "OpenWA ינהל עבורך קונטיינר Redis",
       "queueTitle": "הפעלת מערכת התורים BullMQ",
@@ -794,7 +1183,7 @@
       "failed": "נכשלו",
       "viewBullMq": "פתיחת Bull MQ Dashboard",
       "disabledTitle": "Redis מושבת",
-      "disabledDesc": "יש להפעיל את Redis למטמון, אחסון Sessions ותורי הודעות BullMQ.",
+      "disabledDesc": "יש להפעיל את Redis למטמון, לתורי הודעות BullMQ, למוני הגבלת קצב ולהפצת WebSocket בין צמתים מרובים.",
       "passwordOptional": "(אופציונלי)",
       "bullMqUrlCopied": "כתובת לוח Bull MQ הועתקה",
       "bullMqUrlHint": "פתח אותו עם מפתח API מסוג ADMIN — לשונית דפדפן אינה יכולה לאמת."
@@ -834,7 +1223,8 @@
       "checking": "בודק את סטטוס השרת...",
       "dontClose": "אין לסגור חלון זה",
       "successMsg": "השרת חזר לפעולה! הדף ייטען מחדש אוטומטית.",
-      "errorMsg": "השרת לא הגיב לאחר 30 שניות. יש לבדוק את לוגי Docker ולאתחל ידנית.",
+      "errorMsg": "השרת לא הגיב. יש לבדוק את לוגי Docker ולאתחל ידנית.",
+      "outcomeUnknown": "ה-proxy החזיר שגיאה לפני שהשרת הגיב, ולכן לא ידוע אם האתחול מתבצע. יש לטעון את הדף מחדש בעוד דקה כדי לבדוק.",
       "reload": "טעינת הדף מחדש"
     },
     "toasts": {
@@ -848,19 +1238,20 @@
       "storageWarning": "קובצי מדיה קיימים אינם מועברים אוטומטית למנגנון האחסון החדש; הם יישארו במיקום הישן.",
       "downloadBackup": "הורידו גיבוי תחילה",
       "backupTitle": "גיבוי ושחזור נתונים",
-      "backupHint": "ייצאו את כל הנתונים כ-JSON לפני החלפת מסדי הנתונים, ולאחר מכן ייבאו אותם לאחר ההחלפה. הגיבוי מכיל סודות webhook ופרטי גישה של proxy בטקסט גלוי — אחסנו אותו באופן מאובטח ומחקו אותו לאחר השחזור.",
+      "backupHint": "ייצאו את כל הנתונים כ-JSON לפני החלפת מסדי הנתונים, ולאחר מכן ייבאו אותם לאחר ההחלפה. סודות החתימה של ה-webhook, כותרות webhook מותאמות ופרטי הגישה של ה-proxy אינם נכללים; הזינו אותם מחדש לאחר השחזור. הסודות וההגדרות של מופעי האינטגרציה נכללים בטקסט גלוי, לכן אחסנו את הקובץ באופן מאובטח ומחקו אותו לאחר השחזור.",
       "export": "ייצוא נתונים",
       "import": "ייבוא נתונים",
       "exportFailed": "לא ניתן לייצא את הנתונים",
-      "exportPartialTitle": "Backup is missing some media",
-      "exportPartial": "{{count}} attachment payload(s) exceeded the export media budget and were saved as placeholders. The messages restore; their media does not.",
+      "exportPartialTitle": "חלק מהמדיה חסר בגיבוי",
+      "exportPartial": "קבצים מצורפים שחרגו ממכסת המדיה של הייצוא: {{count}}. הם נשמרו כמצייני מיקום. ההודעות משוחזרות; המדיה שלהן לא.",
       "importFailed": "לא ניתן לייבא את הנתונים",
       "importOk": "הנתונים יובאו",
       "importConfirm": "הייבוא יחליף את כל הנתונים הנוכחיים בגיבוי ({{rows}} שורות). לא ניתן לבטל פעולה זו. להמשיך?",
       "invalidFile": "הקובץ הזה אינו גיבוי נתונים תקין של OpenWA.",
       "importTooLarge": "הגיבוי גדול מדי עבור מגבלת הבקשה. הגדילו את BODY_SIZE_LIMIT בשרת ונסו שוב."
     },
-    "statusLoadError": "לא ניתן לטעון את מצב התשתית הנוכחי. רעננו כדי לנסות שוב."
+    "statusLoadError": "לא ניתן לטעון את מצב התשתית הנוכחי. רעננו כדי לנסות שוב.",
+    "configLoadError": "לא ניתן לטעון את התצורה השמורה, ולכן אי אפשר לערוך אותה כאן. רעננו כדי לנסות שוב."
   },
   "plugins": {
     "title": "תוספים",
@@ -868,6 +1259,19 @@
     "refresh": "רענון",
     "builtIn": "מובנה",
     "noDescription": "אין תיאור זמין",
+    "statuses": {
+      "installed": "מותקן",
+      "enabled": "מופעל",
+      "disabled": "מושבת",
+      "error": "שגיאה"
+    },
+    "types": {
+      "engine": "מנוע",
+      "storage": "אחסון",
+      "queue": "תור",
+      "auth": "אימות",
+      "extension": "הרחבה"
+    },
     "enable": "הפעלה",
     "disable": "השבתה",
     "healthCheck": "בדיקת תקינות",
@@ -882,7 +1286,7 @@
     "config": {
       "title": "הגדרת {{name}}",
       "noOptions": "אין אפשרויות הגדרה זמינות עבור תוסף זה",
-      "uiHandshakeError": "ממשק הגדרת התוסף לא אותחל. השתמשו בטופס שלמטה אם הוא זמין.",
+      "uiHandshakeError": "ממשק הגדרת התוסף לא אותחל.",
       "save": "שמירת תצורה",
       "addItem": "הוספה",
       "tabConfig": "הגדרות",
@@ -913,7 +1317,7 @@
       "healthFail": "בדיקת התקינות נכשלה",
       "healthError": "שגיאה בבדיקת תקינות",
       "savedTitle": "התצורה נשמרה",
-      "savedDesc": "נדרש אתחול שרת כדי להחיל את השינויים.",
+      "savedDesc": "השינויים נכנסים לתוקף ללא אתחול השרת.",
       "saveFailed": "השמירה נכשלה",
       "installed": "התוסף הותקן",
       "installFailed": "ההתקנה נכשלה",
@@ -942,7 +1346,6 @@
       "title": "מופעים",
       "description": "הקצו מופעים לכל חשבון עבור אינטגרציה זו. לכל מופע יש מפתח חתימה סודי וכתובת URL לקליטה משלו.",
       "create": "יצירת מופע",
-      "save": "Save",
       "empty": "אין עדיין מופעים. צרו מופע כדי לקבל כתובת URL וסוד.",
       "loadError": "טעינת המופעים נכשלה.",
       "allSessions": "כל ה-Sessions",
@@ -966,7 +1369,8 @@
         "title": "המופע נוצר",
         "hint": "העתיקו את הסוד כעת — הוא מוצג רק פעם אחת.",
         "secret": "מפתח חתימה סודי",
-        "ingressUrls": "כתובת/כתובות URL לקליטה"
+        "ingressUrls": "כתובת/כתובות URL לקליטה",
+        "verifyToken": "טוקן אימות"
       },
       "regenerate": {
         "title": "יצירת סוד מחדש",
@@ -1018,7 +1422,7 @@
   },
   "search": {
     "placeholder": "חיפוש הודעות…",
-    "results": "{{count}} תוצאות",
+    "loadMore": "הצג עוד ({{shown}} מתוך {{total}})",
     "empty": "לא נמצאו הודעות.",
     "error": "החיפוש נכשל. נסה שוב.",
     "unavailable": "החיפוש אינו מוגדר.",

@@ -48,4 +48,24 @@ describe('loadCliEnv (migration CLI env precedence)', () => {
 
     expect(process.env[KEY]).toBe('postgres');
   });
+
+  // dotenv writes its "injected env" banner to stdout up to dotenv 17 and to stderr (console.error) from 18,
+  // so every console channel is watched, not the one the installed version happens to use.
+  it("loads both files without printing dotenv's banner", () => {
+    delete process.env.DOTENV_QUIET;
+    delete process.env.DOTENV_CONFIG_QUIET;
+    fs.writeFileSync(path.join(dir, '.env'), 'DATABASE_TYPE=postgres\n');
+    fs.writeFileSync(path.join(dir, 'data', '.env.generated'), 'DATABASE_TYPE=sqlite\n');
+    const lines: string[] = [];
+    const spies = (['log', 'info', 'warn', 'error', 'debug'] as const).map(channel =>
+      jest.spyOn(console, channel).mockImplementation((...args: unknown[]) => void lines.push(args.join(' '))),
+    );
+
+    try {
+      loadCliEnv(dir);
+      expect(lines).not.toContainEqual(expect.stringContaining('injected env'));
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+  });
 });

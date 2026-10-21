@@ -25,6 +25,11 @@
  * dropped. Any OTHER reject means the installed shape drifted from the backport's
  * expected base; we abort the build loudly rather than ship a silently partial
  * patch.
+ *
+ * The PR's one typings hunk (index.d.ts, a method signature joined onto one line) is left out of
+ * wwebjs-201832.patch. It changes no behavior; as the first file `patch` wrote it would be the only
+ * marker of an interrupted run that tests formatting instead of the fix; and a release that merely
+ * reformatted its typings would reject it and fail the install.
  */
 'use strict';
 
@@ -42,7 +47,7 @@ const EXPECTED_REJECTS = new Set(['src/structures/Contact.js.rej']);
 // unnoticed. `patch` always writes a .rej for a hunk it couldn't place, but a hunk placed at the
 // WRONG offset would be silent — these assertions are what close that gap.
 //
-// This list must cover every file the patch normalizes, not just the structure constructors, because
+// This list must cover every file the patch writes, not just the structure constructors, because
 // the skip branch below uses it to decide a half-patched tree apart from an upstream fix. `patch`
 // applies the diff in file order and Utils.js is applied LAST, one file after Message.js — which is
 // what the skip branch keys on. Omitting a file here means a run that died in that window leaves a
@@ -77,6 +82,25 @@ function normalizeArtifactPath(rel) {
 function siteLanded(wwjsDir, rel) {
   const marker = REQUIRED_SITES.find(([r]) => r === rel)[1];
   return marker.test(fs.readFileSync(path.join(wwjsDir, rel), 'utf8'));
+}
+
+/**
+ * The REQUIRED_SITES a backport this patcher began did not reach, by relative path. The tree is judged
+ * ours when at least one site carries the text its marker looks for: with none the backport never
+ * started, or upstream fixed the tree its own way. A run killed part-way leaves any prefix of the eleven
+ * files, so no single file can stand for the rest. A file that cannot be read is not counted, since an
+ * install that cannot be inspected is not evidence of a broken one.
+ */
+function missingSites(wwjsDir = DEFAULT_WWJS) {
+  const landed = rel => {
+    try {
+      return siteLanded(wwjsDir, rel);
+    } catch {
+      return undefined;
+    }
+  };
+  if (!REQUIRED_SITES.some(([rel]) => landed(rel) === true)) return [];
+  return REQUIRED_SITES.filter(([rel]) => landed(rel) === false).map(([rel]) => rel);
 }
 
 /**
@@ -125,8 +149,8 @@ function findArtifacts(root, dir = root) {
  * has CRLF.
  *
  * Neither applier accepts CRLF: a unified diff line must start with ' ', '+', '-' or '@', and a bare
- * \r is none of those, so both stop at line 7 of this patch — its first empty context line (`git
- * apply`: "corrupt patch at line 7"; `patch`: "malformed patch at line 7"). Windows checks the file out
+ * \r is none of those, so both stop at line 12 of this patch — its first empty context line (`git
+ * apply`: "corrupt patch at line 12"; `patch`: "malformed patch at line 12"). Windows checks the file out
  * that way whenever `core.autocrlf` is on, which is its default, so the git fallback added for Windows
  * could never actually run there and took `npm install` down with it (#889).
  *
@@ -214,7 +238,8 @@ function applyBackport(wwjsDir = DEFAULT_WWJS, patchFile = DEFAULT_PATCH) {
   const msgSrc = fs.readFileSync(msgJs, 'utf8');
   if (/_normalizeId\(|\.\$1/.test(msgSrc)) {
     // Message.js normalizing is necessary but NOT sufficient to stand down. `patch` writes as it goes and
-    // Message.js is patched early, so a run that died part-way through lands here too — and skipping would
+    // Message.js is the second to last file it writes, so a run that died after it lands here too (and one
+    // that died before it is caught below), and skipping would
     // latch that half-patched tree in permanently, because every later run takes this same branch and never
     // reaches the assertions below. An upstream release that fixes this lands every site at once; a crashed
     // run does not. Proving the tree is whole is what tells the two apart.
@@ -233,6 +258,20 @@ function applyBackport(wwjsDir = DEFAULT_WWJS, patchFile = DEFAULT_PATCH) {
       );
     }
     return { skipped: true, reason: 'installed whatsapp-web.js already normalizes message ids' };
+  }
+
+  // A run that died before Message.js (the 10th of 11 files) left the earlier files patched and this one
+  // not. Applying the diff again would reject every hunk that already landed, litter the tree with .rej
+  // files and report version skew for what is an interrupted install.
+  const landedBefore = missingSites(wwjsDir);
+  if (landedBefore.length) {
+    throw partialTree(
+      new Error(
+        'whatsapp-web.js is PARTIALLY patched: an earlier run was interrupted and ' +
+          `${landedBefore.join(', ')} did not land. The tree cannot repair itself. Reinstall the dependency ` +
+          '(`rm -rf node_modules/whatsapp-web.js && npm ci`) and re-run.',
+      ),
+    );
   }
 
   // Apply the real upstream diff via `patch` (no git-discovery interference).
@@ -331,6 +370,8 @@ if (require.main === module) {
 
 module.exports = {
   applyBackport,
+  missingSites,
+  REQUIRED_SITES,
   normalizeArtifactPath,
   gitApplyLeftTreeUntouched,
   DEFAULT_WWJS,

@@ -1,6 +1,3 @@
-// archiver v8 is ESM-only (pulled in transitively via @Global StorageModule); stub for ts-jest CJS.
-jest.mock('archiver', () => ({ TarArchive: jest.fn() }));
-
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
 import { getRepositoryToken } from '@nestjs/typeorm';
@@ -22,6 +19,8 @@ import { WebhookDeliveryFailure } from './../src/modules/webhook/entities/webhoo
  * which the unit specs mock away: a session-restricted ADMIN key must never read another session's rows.
  */
 describe('Session-scoped query endpoints (e2e)', () => {
+  // Text the failure rows below retain for a redrive, which the list route must never carry.
+  const RETAINED_BODY = 'retained event body';
   let app: INestApplication<App>;
   let sessA: string;
   let sessB: string;
@@ -62,6 +61,7 @@ describe('Session-scoped query endpoints (e2e)', () => {
           url: `https://${sessionId}.example/hook`,
           attempts: 3,
           lastError: 'ECONNREFUSED',
+          payload: { body: RETAINED_BODY },
         }),
       );
     }
@@ -165,6 +165,17 @@ describe('Session-scoped query endpoints (e2e)', () => {
       const sessions = (res.body as WebhookDeliveryFailure[]).map(r => r.sessionId);
       expect(sessions).toContain(sessA);
       expect(sessions).toContain(sessB);
+    });
+
+    it('never returns the event body a failure row retains for a redrive', async () => {
+      const res = await request(app.getHttpServer())
+        .get('/api/webhooks/delivery-failures')
+        .set('X-API-Key', adminKey)
+        .expect(200);
+      expect((res.body as WebhookDeliveryFailure[]).map(r => r.sessionId)).toEqual(
+        expect.arrayContaining([sessA, sessB]),
+      );
+      expect(JSON.stringify(res.body)).not.toContain(RETAINED_BODY);
     });
   });
 

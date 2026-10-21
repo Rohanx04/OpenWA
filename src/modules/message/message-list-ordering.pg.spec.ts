@@ -2,7 +2,7 @@
    skipped in the default test job, so its lines would be unread and skew the global coverage gate. */
 import 'reflect-metadata';
 import { randomUUID } from 'crypto';
-import { DataSource, Repository } from 'typeorm';
+import { DataSource, Repository, SelectQueryBuilder } from 'typeorm';
 import { MessageService } from './message.service';
 import { Message, MessageDirection } from './entities/message.entity';
 import type { EngineRegistry } from '../../engine/engine-registry.service';
@@ -11,6 +11,7 @@ import type { HookManager } from '../../core/hooks';
 import type { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import type { SendPacingService } from './send-pacing.service';
 import type { MessageSendService } from './message-send.service';
+import { AddMessageWindowIndexes1790812800000 } from '../../database/migrations/1790812800000-AddMessageWindowIndexes';
 
 /**
  * `createdAt` is not a unique sort key. On SQLite it is whole seconds; on Postgres `NOW()` is
@@ -79,7 +80,10 @@ const POSTGRES_ENABLED = process.env.DATABASE_TYPE === 'postgres';
       {} as EngineRegistry,
       {} as MessageProjector,
       {} as HookManager,
-      { lidsForPhone: () => [], getCached: () => undefined } as unknown as LidMappingStoreService,
+      {
+        findLidsForPhone: () => Promise.resolve([]),
+        findPhoneForLid: () => Promise.resolve(null),
+      } as unknown as LidMappingStoreService,
       {} as SendPacingService,
       {} as MessageSendService,
     );
@@ -115,6 +119,193 @@ const POSTGRES_ENABLED = process.env.DATABASE_TYPE === 'postgres';
     const distinct = new Set(served);
     expect(served).toHaveLength(ROWS);
     expect(distinct.size).toBe(ROWS); // no row repeated, and therefore none missed
+  });
+
+  it('applies fractional message-time bounds to bigint timestamps', async () => {
+    const sessionId = 'sess-time-bounds';
+    await repository.insert([
+      ...Array.from({ length: 8 }, (_, i) => ({
+        id: randomUUID(),
+        sessionId,
+        chatId: 'peer@c.us',
+        from: 'peer@c.us',
+        to: 'me@c.us',
+        timestamp: 1000 + Math.floor(i / 2),
+        type: 'image',
+        direction: i % 2 ? MessageDirection.OUTGOING : MessageDirection.INCOMING,
+      })),
+      {
+        id: randomUUID(),
+        sessionId,
+        chatId: 'peer@c.us',
+        from: 'peer@c.us',
+        to: 'me@c.us',
+        type: 'image',
+        direction: MessageDirection.INCOMING,
+      },
+      {
+        id: randomUUID(),
+        sessionId,
+        chatId: 'peer@c.us',
+        from: 'peer@c.us',
+        to: 'me@c.us',
+        type: 'text',
+        direction: MessageDirection.INCOMING,
+      },
+    ]);
+    for (const [until, timestamps] of [
+      [1003000, [1002, 1001]],
+      [1002000.5, [1002, 1001]],
+      [1002000, [1001]],
+    ] as const) {
+      const page = await service.getMessages(sessionId, {
+        since: 1000000.5,
+        until,
+        orderBy: 'timestamp',
+        direction: MessageDirection.INCOMING,
+        type: 'image',
+        inlineMedia: false,
+      });
+      expect(page.total).toBe(timestamps.length);
+      expect(page.unknownTimestampTotal).toBe(1);
+      expect(page.messages.map(m => m.timestamp)).toEqual(timestamps);
+    }
+  });
+
+  it('walks tied message times through reversible timestamp indexes', async () => {
+    const sessionId = 'sess-time-walk';
+    const runner = ds.createQueryRunner();
+    const migration = new AddMessageWindowIndexes1790812800000();
+    await migration.up(runner);
+    await migration.up(runner);
+    await repository.insert(
+      Array.from({ length: 240 }, (_, i) => ({
+        id: randomUUID(),
+        sessionId,
+        chatId: 'peer@c.us',
+        from: 'peer@c.us',
+        to: 'me@c.us',
+        timestamp: 1000 + Math.floor(i / 4),
+      })),
+    );
+    const ids: string[] = [];
+    let after: string | undefined;
+    do {
+      const page = await service.getMessages(sessionId, {
+        since: 1000000,
+        until: 1060000,
+        orderBy: 'timestamp',
+        after,
+        limit: 31,
+      });
+      expect(page.total).toBe(240);
+      ids.push(...page.messages.map(m => m.id));
+      if (!after)
+        await repository.insert({
+          id: randomUUID(),
+          sessionId,
+          chatId: 'peer@c.us',
+          from: 'peer@c.us',
+          to: 'me@c.us',
+          timestamp: 1060,
+        });
+      if (page.messages.length < 31) break;
+      after = page.messages.at(-1)!.id;
+    } while (ids.length < 300);
+    expect(ids).toHaveLength(240);
+    expect(new Set(ids).size).toBe(240);
+    const names = async (): Promise<string[]> =>
+      (
+        (await runner.query(
+          `SELECT indexname FROM pg_indexes WHERE tablename = 'messages' AND indexname LIKE 'IDX_messages_session_%timestamp_id'`,
+        )) as Array<{ indexname: string }>
+      ).map(row => row.indexname);
+    expect(await names()).toHaveLength(3);
+    await migration.down(runner);
+    expect(await names()).toEqual([]);
+    expect(await repository.countBy({ sessionId })).toBe(241);
+    await migration.up(runner);
+    expect(await names()).toHaveLength(3);
+    await runner.release();
+  });
+
+  /**
+   * A chat filter on a user id expands to several dialect candidates, which picks a SQLite-only sort
+   * key there. PostgreSQL must keep the plain one, so the chat-filtered walk runs on the real server.
+   */
+  it('walks one chat by its several dialect candidates in the same total order', async () => {
+    const served: string[] = [];
+    for (let offset = 0; offset < ROWS; offset += PAGE * 10) {
+      const { messages } = await service.getMessages(SESSION_ID, { chatId: 'peer@c.us', limit: PAGE, offset });
+      served.push(...messages.map(m => m.id));
+    }
+    const unfiltered: string[] = [];
+    for (let offset = 0; offset < ROWS; offset += PAGE * 10) {
+      const { messages } = await service.getMessages(SESSION_ID, { limit: PAGE, offset });
+      unfiltered.push(...messages.map(m => m.id));
+    }
+
+    expect(served).toHaveLength(ROWS / 10);
+    expect(served).toEqual(unfiltered);
+  });
+
+  /**
+   * The message-time order of a user chat keeps the plain sort key here, so the planner may read the
+   * (sessionId, timestamp, id) index in order. The SQLite key, an expression over the column, leaves it
+   * no ordered path: it must sort. The cost-based choice between the two depends on table statistics,
+   * so the plan is read with sorting disabled for the planner, which makes the answer exact: a plain
+   * key plans with no Sort node, an expression over the column cannot.
+   */
+  it('plans the message-time order of a user chat on the time index, with no sort step', async () => {
+    const sessionId = 'sess-chat-plan';
+    type PlanNode = { 'Node Type': string; 'Index Name'?: string; Plans?: PlanNode[] };
+    const planNodes = (node: PlanNode): PlanNode[] => [node, ...(node.Plans ?? []).flatMap(planNodes)];
+    const stored: Array<[string, number]> = [
+      ['1001@c.us', 1000],
+      ['1001@s.whatsapp.net', 1001],
+      ['1001@c.us', 1002],
+      ['2002@c.us', 1003],
+    ];
+    const builders = jest.spyOn(repository, 'createQueryBuilder');
+    const runner = ds.createQueryRunner();
+    try {
+      await new AddMessageWindowIndexes1790812800000().up(runner);
+      await repository.insert(
+        stored.map(([chatId, timestamp]) => ({
+          id: randomUUID(),
+          sessionId,
+          chatId,
+          from: chatId,
+          to: 'me@c.us',
+          timestamp,
+        })),
+      );
+      builders.mockClear();
+      const page = await service.getMessages(sessionId, {
+        chatId: '1001@c.us',
+        orderBy: 'timestamp',
+        since: 1000_000,
+        until: 1060_000,
+      });
+      expect(page.messages.map(m => m.timestamp)).toEqual([1002, 1001, 1000]);
+
+      // The first builder is the page statement itself, left in the state it was executed in.
+      const [sql, params] = (builders.mock.results[0].value as SelectQueryBuilder<Message>).getQueryAndParameters();
+      await runner.startTransaction();
+      await runner.query('SET LOCAL enable_sort = off');
+      const [{ 'QUERY PLAN': plans }] = (await runner.query(`EXPLAIN (FORMAT JSON) ${sql}`, params)) as Array<{
+        'QUERY PLAN': Array<{ Plan: PlanNode }>;
+      }>;
+      const nodes = planNodes(plans[0].Plan);
+
+      expect(nodes.map(node => node['Index Name'])).toContain('IDX_messages_session_timestamp_id');
+      expect(nodes.map(node => node['Node Type'])).not.toContain('Sort');
+    } finally {
+      builders.mockRestore();
+      if (runner.isTransactionActive) await runner.rollbackTransaction();
+      await runner.release();
+      await repository.delete({ sessionId });
+    }
   });
 
   /**
@@ -192,5 +383,41 @@ const POSTGRES_ENABLED = process.env.DATABASE_TYPE === 'postgres';
         /Unknown cursor/,
       );
     });
+  });
+
+  /**
+   * The page is picked by id, sized by a raw `OCTET_LENGTH(metadata)` select and read back in chunks, so
+   * the dialect SQL and the order restore after the IN read are only proven against the real server.
+   */
+  it('reads a media page in order and omits the payloads past the budget', async () => {
+    const MEDIA_SESSION = 'sess-media-budget';
+    const prev = process.env.MESSAGE_LIST_INLINE_MEDIA_BUDGET_BYTES;
+    process.env.MESSAGE_LIST_INLINE_MEDIA_BUDGET_BYTES = String(3000);
+    try {
+      await repository.insert(
+        Array.from({ length: 6 }, (_, i) => ({
+          id: randomUUID(),
+          sessionId: MEDIA_SESSION,
+          chatId: 'peer@c.us',
+          from: 'peer@c.us',
+          to: 'me@c.us',
+          body: `media-${i}`,
+          direction: MessageDirection.INCOMING,
+          metadata: { media: { mimetype: 'image/jpeg', data: 'A'.repeat(1000) } },
+          createdAt: new Date(Date.UTC(2026, 2, 1, 0, 0, i)),
+        })),
+      );
+
+      const { messages, total } = await service.getMessages(MEDIA_SESSION, { limit: 100 });
+
+      expect(total).toBe(6);
+      expect(messages.map(m => m.body)).toEqual(['media-5', 'media-4', 'media-3', 'media-2', 'media-1', 'media-0']);
+      const inline = messages.map(m => typeof (m.metadata as { media: { data?: unknown } }).media.data === 'string');
+      expect(inline).toEqual([true, true, true, false, false, false]);
+    } finally {
+      if (prev === undefined) delete process.env.MESSAGE_LIST_INLINE_MEDIA_BUDGET_BYTES;
+      else process.env.MESSAGE_LIST_INLINE_MEDIA_BUDGET_BYTES = prev;
+      await repository.delete({ sessionId: MEDIA_SESSION });
+    }
   });
 });

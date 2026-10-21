@@ -1,9 +1,13 @@
 import {
+  BaileysContextContent,
   BaileysIncomingFields,
+  baileysChatJid,
   buildIncomingMessageFromBaileys,
+  extractBaileysPoll,
   extractBaileysBody,
   extractBaileysButtonReply,
   extractBaileysButtons,
+  extractBaileysClickableButtons,
   resolveBaileysButtonClick,
   toBaileysButtonClickContent,
   BUTTONS_MAX_ENTRIES,
@@ -13,6 +17,7 @@ import {
   isBaileysCatalogShare,
   mapBaileysMessageType,
   mapBaileysStatus,
+  setBaileysText,
 } from './baileys-message-mapper';
 
 describe('mapBaileysMessageType (baileys content-type -> neutral MessageType)', () => {
@@ -21,6 +26,8 @@ describe('mapBaileysMessageType (baileys content-type -> neutral MessageType)', 
     ['extendedTextMessage', false, 'text'],
     ['imageMessage', false, 'image'],
     ['videoMessage', false, 'video'],
+    // A round video note is a VideoMessage under its own key.
+    ['ptvMessage', false, 'video'],
     ['audioMessage', false, 'audio'],
     ['audioMessage', true, 'voice'],
     ['documentMessage', false, 'document'],
@@ -187,6 +194,29 @@ describe('extractBaileysBody (inbound text/caption + interactive shapes)', () =>
   });
 });
 
+describe('setBaileysText (an edit written back where extractBaileysBody reads it)', () => {
+  it.each([
+    ['a plain text', { conversation: 'before' }],
+    ['an extended text', { extendedTextMessage: { text: 'before', matchedText: 'https://example.com' } }],
+    ['a photo caption', { imageMessage: { caption: 'before', url: 'https://mmg.example/x' } }],
+    ['a video caption', { videoMessage: { caption: 'before' } }],
+    ['a document caption', { documentMessage: { caption: 'before', fileName: 'a.pdf' } }],
+  ])('rewrites %s and keeps the rest of the content', (_kind, content) => {
+    const copy = structuredClone(content);
+    expect(setBaileysText(copy, 'after')).toBe(true);
+    expect(extractBaileysBody(copy)).toBe('after');
+    // Only the text slot moved: the same object with the new text is what remains.
+    expect(setBaileysText(copy, 'before')).toBe(true);
+    expect(copy).toEqual(content);
+  });
+
+  it('changes nothing on content with no text slot', () => {
+    const content = { locationMessage: { degreesLatitude: 1 } } as Record<string, unknown>;
+    expect(setBaileysText(content, 'after')).toBe(false);
+    expect(content).toEqual({ locationMessage: { degreesLatitude: 1 } });
+  });
+});
+
 describe('extractBaileysContext (quoted body shares the live body extractor)', () => {
   const quoted = (quotedMessage: object) =>
     extractBaileysContext({
@@ -206,6 +236,42 @@ describe('extractBaileysContext (quoted body shares the live body extractor)', (
     expect(quoted({ imageMessage: { caption: 'pic' } })?.body).toBe('pic');
     expect(quoted({ conversation: 'the original' })?.body).toBe('the original');
     expect(quoted({ stickerMessage: {} })?.body).toBe('');
+  });
+
+  it('reads the quote, timer and mentions off a video note', () => {
+    expect(
+      extractBaileysContext({
+        ptvMessage: {
+          contextInfo: {
+            stanzaId: 'wamid.original',
+            quotedMessage: { conversation: 'the original' },
+            expiration: 86400,
+            mentionedJid: ['628222@s.whatsapp.net'],
+          },
+        },
+      }),
+    ).toMatchObject({
+      quotedMessage: { id: 'wamid.original', body: 'the original' },
+      ephemeralDuration: 86400,
+      mentionedJids: ['628222@s.whatsapp.net'],
+    });
+  });
+
+  it.each([
+    'productMessage',
+    'contactMessage',
+    'contactsArrayMessage',
+    'pollCreationMessageV3',
+    'liveLocationMessage',
+    'orderMessage',
+    'eventMessage',
+  ])('reads the disappearing-messages timer off a %s', type => {
+    const content = { [type]: { contextInfo: { expiration: 86400 } } } as BaileysContextContent;
+    expect(extractBaileysContext(content).ephemeralDuration).toBe(86400);
+  });
+
+  it('reads no timer when no content node carries one', () => {
+    expect(extractBaileysContext({ conversation: 'hi' } as BaileysContextContent).ephemeralDuration).toBeUndefined();
   });
 
   it('carries a quote from a button-reply contextInfo', () => {
@@ -297,6 +363,16 @@ describe('buildIncomingMessageFromBaileys', () => {
     expect(r.isLidSender).toBe(true);
   });
 
+  it('reads an empty participant as none: a lid chat is still a lid sender and a group names no author', () => {
+    // A live key goes through cleanMessage, which writes '' for the participant of a 1:1 chat.
+    const direct = buildIncomingMessageFromBaileys({ ...base, remoteJid: '111@lid', participant: '' });
+    expect(direct.isLidSender).toBe(true);
+    expect(direct.author).toBeUndefined();
+    const group = buildIncomingMessageFromBaileys({ ...base, remoteJid: '123-456@g.us', participant: '' });
+    expect(group.author).toBeUndefined();
+    expect(group.isLidSender).toBeFalsy();
+  });
+
   it('flags a status broadcast', () => {
     const r = buildIncomingMessageFromBaileys({ ...base, remoteJid: 'status@broadcast' });
     expect(r.isStatusBroadcast).toBe(true);
@@ -313,6 +389,55 @@ describe('buildIncomingMessageFromBaileys', () => {
     // Without this, buildIncomingStatus can only resolve the poster to the status@broadcast
     // pseudo-JID itself and drops the status entirely.
     expect(r.author).toBe('628111@s.whatsapp.net');
+  });
+
+  it("files a received broadcast-list message under the sender's chat, as Baileys does", () => {
+    const normalize = (jid: string) => jid.replace('@s.whatsapp.net', '@c.us');
+    const r = buildIncomingMessageFromBaileys(
+      { ...base, remoteJid: '1700000000@broadcast', participant: '628222@s.whatsapp.net' },
+      normalize,
+    );
+    expect(r.chatId).toBe('628222@c.us');
+    expect(r.from).toBe('628222@c.us');
+    expect(r.to).toBe('628999@c.us');
+    expect(r.kind).toBe('individual');
+    expect(r.isStatusBroadcast).toBe(false);
+    expect(r.isGroup).toBe(false);
+    expect(r.author).toBe('628222@c.us');
+  });
+
+  it('keeps the list as the chat for a received list message with no participant', () => {
+    const r = buildIncomingMessageFromBaileys({ ...base, remoteJid: '1700000000@broadcast' });
+    expect(r.chatId).toBe('1700000000@broadcast');
+    expect(r.kind).toBe('broadcast');
+  });
+
+  it('flags a lid sender of a received list message and files it under the lid', () => {
+    const r = buildIncomingMessageFromBaileys({ ...base, remoteJid: '1700000000@broadcast', participant: '222@lid' });
+    expect(r.chatId).toBe('222@lid');
+    expect(r.isLidSender).toBe(true);
+  });
+
+  it('baileysChatJid mirrors Baileys getChatId without throwing', () => {
+    const list = '1700000000@broadcast';
+    const sender = '628222@s.whatsapp.net';
+    expect(baileysChatJid(list, sender, false)).toBe(sender);
+    expect(baileysChatJid(list, sender, true)).toBe(list);
+    expect(baileysChatJid(list, undefined, false)).toBe(list);
+    expect(baileysChatJid('status@broadcast', sender, false)).toBe('status@broadcast');
+    expect(baileysChatJid('120363@g.us', sender, false)).toBe('120363@g.us');
+  });
+
+  it('keeps the list as the chat for a broadcast-list message the account sent', () => {
+    const normalize = (jid: string) => jid.replace('@s.whatsapp.net', '@c.us');
+    const r = buildIncomingMessageFromBaileys(
+      { ...base, remoteJid: '1700000000@broadcast', fromMe: true, participant: '628999@s.whatsapp.net' },
+      normalize,
+    );
+    expect(r.chatId).toBe('1700000000@broadcast');
+    expect(r.from).toBe('628999@c.us');
+    expect(r.to).toBe('1700000000@broadcast');
+    expect(r.author).toBe('628999@c.us');
   });
 
   it('converts extended-text status styling: backgroundArgb -> #RRGGBB, font passed through', () => {
@@ -541,6 +666,123 @@ describe('extractBaileysButtons (prompt choices Sim/Não / list rows)', () => {
     ]);
   });
 
+  it('drops a native-flow CTA carried inside a classic buttonsMessage', () => {
+    // The same envelope can hold both a reply button and a CTA that opens a URL or dials a number.
+    // A CTA cannot be answered, so publishing it would offer a choice the click route must refuse.
+    expect(
+      extractBaileysButtons(
+        {
+          buttonsMessage: {
+            buttons: [
+              { buttonId: 'yes', buttonText: { displayText: 'Sim' } },
+              {
+                buttonId: 'docs',
+                buttonText: { displayText: 'Open the docs' },
+                nativeFlowInfo: { name: 'cta_url' },
+              },
+            ],
+          },
+        },
+        'buttonsMessage',
+      ),
+    ).toEqual([{ id: 'yes', text: 'Sim' }]);
+  });
+
+  it('keeps a native-flow quick reply carried inside a classic buttonsMessage', () => {
+    expect(
+      extractBaileysButtons(
+        {
+          buttonsMessage: {
+            buttons: [
+              {
+                buttonId: 'yes',
+                buttonText: { displayText: 'Sim' },
+                nativeFlowInfo: { name: 'quick_reply' },
+              },
+            ],
+          },
+        },
+        'buttonsMessage',
+      ),
+    ).toEqual([{ id: 'yes', text: 'Sim' }]);
+  });
+
+  it('keeps one index namespace for a template that numbers only some of its buttons', () => {
+    // selectedIndex goes back to the business bot verbatim. Falling back to the array position for
+    // an unnumbered entry can hand the bot a number belonging to a different button, so an entry the
+    // template did not number carries no index at all. It is still offered: the user can see and tap
+    // it in WhatsApp, and the reply names it by id.
+    const prompt = {
+      templateMessage: {
+        hydratedTemplate: {
+          hydratedButtons: [
+            { index: 5, quickReplyButton: { id: 'yes', displayText: 'Sim' } },
+            { quickReplyButton: { id: 'maybe', displayText: 'Talvez' } },
+            { index: 7, quickReplyButton: { id: 'no', displayText: 'Não' } },
+          ],
+        },
+      },
+    };
+    expect(extractBaileysButtons(prompt, 'templateMessage')).toEqual([
+      { id: 'yes', text: 'Sim' },
+      { id: 'maybe', text: 'Talvez' },
+      { id: 'no', text: 'Não' },
+    ]);
+    expect(extractBaileysClickableButtons(prompt, 'templateMessage')).toEqual([
+      { id: 'yes', text: 'Sim', index: 5 },
+      { id: 'maybe', text: 'Talvez', index: undefined },
+      { id: 'no', text: 'Não', index: 7 },
+    ]);
+  });
+
+  it('offers the quick replies of a template whose only numbered button is a CTA', () => {
+    // The CTA is never offered, so its index was the only thing making the prompt look numbered.
+    // Requiring an index of every entry emptied the whole prompt, which is how a visible Sim/Não
+    // pair disappeared from buttons[] and was then refused by the click route.
+    const prompt = {
+      templateMessage: {
+        hydratedTemplate: {
+          hydratedButtons: [
+            { index: 1, urlButton: { displayText: 'Open', url: 'https://example.com' } },
+            { quickReplyButton: { id: 'yes', displayText: 'Sim' } },
+            { quickReplyButton: { id: 'no', displayText: 'Não' } },
+          ],
+        },
+      },
+    };
+    expect(extractBaileysButtons(prompt, 'templateMessage')).toEqual([
+      { id: 'yes', text: 'Sim' },
+      { id: 'no', text: 'Não' },
+    ]);
+    expect(extractBaileysClickableButtons(prompt, 'templateMessage')).toEqual([
+      { id: 'yes', text: 'Sim', index: undefined },
+      { id: 'no', text: 'Não', index: undefined },
+    ]);
+  });
+
+  it('numbers by array position when the template carries no indices at all', () => {
+    // Asserted through the clickable list, which keeps the index; extractBaileysButtons projects it
+    // away, so it cannot tell a correct position from any other number.
+    expect(
+      extractBaileysClickableButtons(
+        {
+          templateMessage: {
+            hydratedTemplate: {
+              hydratedButtons: [
+                { quickReplyButton: { id: 'yes', displayText: 'Sim' } },
+                { quickReplyButton: { id: 'no', displayText: 'Não' } },
+              ],
+            },
+          },
+        },
+        'templateMessage',
+      ),
+    ).toEqual([
+      { id: 'yes', text: 'Sim', index: 0 },
+      { id: 'no', text: 'Não', index: 1 },
+    ]);
+  });
+
   it('extracts interactiveMessage native-flow quick replies', () => {
     expect(
       extractBaileysButtons(
@@ -673,6 +915,38 @@ describe('resolveBaileysButtonClick (API click against a stored prompt)', () => 
         content: {
           buttonReply: { displayText: 'Sim', id: 'yes', index: 0 },
           type: 'plain',
+        },
+      },
+    });
+  });
+
+  it('answers a choice a numbered template left unnumbered with no selectedIndex', () => {
+    // `selectedIndex` has explicit presence on the wire and Baileys drops an undefined field before
+    // encoding, so the bot receives the id and the label and no number at all, which is honest.
+    // Fabricating a position here could name a different button in the template's own numbering.
+    const result = resolveBaileysButtonClick(
+      {
+        templateMessage: {
+          hydratedTemplate: {
+            hydratedButtons: [
+              { index: 5, quickReplyButton: { id: 'yes', displayText: 'Sim' } },
+              { quickReplyButton: { id: 'maybe', displayText: 'Talvez' } },
+            ],
+          },
+        },
+      },
+      'templateMessage',
+      'maybe',
+    );
+    expect(result).toEqual({
+      ok: true,
+      payload: {
+        id: 'maybe',
+        text: 'Talvez',
+        index: undefined,
+        content: {
+          buttonReply: { displayText: 'Talvez', id: 'maybe', index: undefined },
+          type: 'template',
         },
       },
     });
@@ -890,5 +1164,35 @@ describe('isBaileysCatalogShare (the productMessage arm with no product)', () =>
     expect(isBaileysCatalogShare({ productMessage: { product: { productId: '2' }, catalog: { title: 'S' } } })).toBe(
       false,
     );
+  });
+});
+
+describe('native poll choice metadata', () => {
+  it.each(['pollCreationMessage', 'pollCreationMessageV2', 'pollCreationMessageV3'] as const)(
+    'reads %s without changing option texts',
+    key => {
+      expect(
+        extractBaileysPoll({
+          [key]: {
+            name: 'Where?',
+            options: [{ optionName: ' Park ' }, { optionName: 'Beach' }],
+            selectableOptionsCount: 1,
+          },
+        }),
+      ).toEqual({ name: 'Where?', options: [' Park ', 'Beach'], allowMultipleAnswers: false });
+    },
+  );
+  it('reports multiple choices and omits unavailable poll data', () => {
+    expect(
+      extractBaileysPoll({
+        pollCreationMessageV3: {
+          name: 'Q',
+          options: [{ optionName: 'a' }, { optionName: 'b' }],
+          selectableOptionsCount: 0,
+        },
+      })?.allowMultipleAnswers,
+    ).toBe(true);
+    expect(extractBaileysPoll({})).toBeUndefined();
+    expect(extractBaileysPoll({ pollCreationMessage: {} })).toBeUndefined();
   });
 });

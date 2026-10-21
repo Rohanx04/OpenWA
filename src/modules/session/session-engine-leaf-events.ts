@@ -59,6 +59,7 @@ export class SessionEngineLeafEvents {
    * `(sessionId, waStatusId)`, so this can never double-count a status onMessage already ingested.
    */
   async seedStatuses(sessionId: string, engine: IWhatsAppEngine): Promise<void> {
+    const lifetime = this.statusStore.captureWrites(sessionId);
     try {
       // Read the status-broadcast chat's own recent messages rather than getContactStatuses(): on
       // whatsapp-web.js the latter reads the StatusV3 collection, which loads asynchronously and is
@@ -73,8 +74,8 @@ export class SessionEngineLeafEvents {
       const mediaMaxBytes =
         this.configService?.get<number>('status.mediaMaxBytes', DEFAULT_MEDIA_MAX_BYTES) ?? DEFAULT_MEDIA_MAX_BYTES;
       const messages = await engine.getChatHistory('status@broadcast', STATUS_SEED_LIMIT, true, mediaMaxBytes);
-      // getChatHistory maps a message's contact from the sync cache only, so status posters (usually
-      // @lid ids) come back nameless. Resolve each unique poster once via getContactById — the same
+      // getChatHistory resolves each poster's contact, but a lookup that failed or found no name leaves
+      // the status nameless (usually an @lid poster). Resolve each once via getContactById — the same
       // lookup the contacts API uses, which maps the @lid to the real contact — so a seeded status
       // carries the poster's name like a live one does. Cached per JID: one lookup per contact, not
       // one per status.
@@ -108,7 +109,7 @@ export class SessionEngineLeafEvents {
             status.contactName = poster.name;
             status.contactPushName = poster.pushName;
           }
-          await this.statusStore.ingest(sessionId, status);
+          await this.statusStore.ingest(sessionId, status, lifetime);
         } catch (itemErr) {
           // One bad item must not abort the whole backfill.
           this.logger.warn('Status seed item skipped', {
@@ -122,6 +123,8 @@ export class SessionEngineLeafEvents {
         sessionId,
         error: err instanceof Error ? err.message : String(err),
       });
+    } finally {
+      lifetime.close();
     }
   }
 

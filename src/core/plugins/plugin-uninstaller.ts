@@ -29,11 +29,22 @@ export class PluginUninstaller {
     private readonly pluginsDir: string,
     /** The lifecycle's unload — passed as a callback so this file never imports the lifecycle back. */
     private readonly unload: (pluginId: string) => Promise<void>,
+    /** The legacy plugin tree the boot scan also loads from, or null when PLUGINS_DIR is set. */
+    private readonly legacyPluginsDir: string | null = null,
+    /** Hands the chats the plugin took over back to the bot; the conversation store is not this file's. */
+    private readonly releaseTakeovers?: (pluginId: string) => Promise<void>,
   ) {}
 
-  /** <plugins.dir>/<id> for an id with no loaded package, or null if the id escapes that root. */
-  private resolveUninstallDir(pluginId: string): string | null {
-    const base = path.resolve(this.pluginsDir);
+  /**
+   * Package folders of plugins whose uninstall stopped after the unload dropped their runtime record,
+   * until a repeat completes: without it the repeat only has the id to go by, and a package whose folder
+   * is not its manifest id would be left on disk to load again on the next boot.
+   */
+  private readonly unloadedDirs = new Map<string, string>();
+
+  /** <root>/<id> for an id with no loaded package, or null if the id escapes that root. */
+  private resolveUninstallDir(root: string, pluginId: string): string | null {
+    const base = path.resolve(root);
     const dir = path.resolve(base, pluginId);
     return dir !== base && dir.startsWith(base + path.sep) ? dir : null;
   }
@@ -52,18 +63,36 @@ export class PluginUninstaller {
     // it, and for a plugin loaded from the legacy directory the configured root is the wrong tree —
     // deleting there removes the ctx.storage directory and leaves the code, so the plugin comes
     // back on the next boot having reported a successful uninstall.
-    const recordedDir = this.plugins.get(pluginId)?.packageDir ?? null;
+    const recordedDir = this.plugins.get(pluginId)?.packageDir ?? this.unloadedDirs.get(pluginId) ?? null;
+    if (recordedDir) this.unloadedDirs.set(pluginId, recordedDir);
 
     if (this.plugins.has(pluginId)) {
       await this.unload(pluginId);
     }
+
+    // A takeover the plugin held keeps every other plugin silent on that chat, and nothing is left to
+    // hand it back once the plugin is gone. Done after the unload, because until its worker ends the
+    // plugin can still take a chat over again, and before the registry entry goes: a store that cannot
+    // take the release fails the uninstall, and a repeat finds no runtime and goes straight to it.
+    await this.releaseTakeovers?.(pluginId);
     this.pluginStorage.deletePluginEntry(pluginId);
 
     // A recorded directory came from the boot scan and is already contained. Without one the id is
     // the only input, so it stays behind the traversal guard against the configured root.
-    const dir = recordedDir ?? this.resolveUninstallDir(pluginId);
+    const dir = recordedDir ?? this.resolveUninstallDir(this.pluginsDir, pluginId);
     if (dir && fs.existsSync(dir)) {
       fs.rmSync(dir, { recursive: true, force: true });
+    }
+    // The legacy tree can still hold a copy the scan would load again on the next boot (as a new
+    // plugin, config lost): the package of a plugin that failed to load (its registry entry survives
+    // the boot scan but no runtime record does), or a copy the scan skipped as a duplicate because
+    // the same id loaded from the configured tree. When the recorded dir was the legacy copy it is
+    // already gone above, and this is a no-op.
+    if (this.legacyPluginsDir) {
+      const legacyDir = this.resolveUninstallDir(this.legacyPluginsDir, pluginId);
+      if (legacyDir && fs.existsSync(path.join(legacyDir, 'manifest.json'))) {
+        fs.rmSync(legacyDir, { recursive: true, force: true });
+      }
     }
 
     // Drop the plugin's ctx.storage data dir. Under shipped defaults it lives INSIDE the package
@@ -72,6 +101,7 @@ export class PluginUninstaller {
     // Best-effort, and strictly that one plugin's directory.
     this.pluginStorage.deletePluginData(pluginId);
 
+    this.unloadedDirs.delete(pluginId);
     this.logger.log(`Plugin uninstalled: ${pluginId}`, { pluginId, action: 'plugin_uninstalled' });
   }
 }

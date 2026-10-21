@@ -14,6 +14,8 @@ public enum WebhookEvent {
     MESSAGE_SENT,
     @SerializedName("message.ack")
     MESSAGE_ACK,
+    @SerializedName("message.receipt")
+    MESSAGE_RECEIPT,
     @SerializedName("message.failed")
     MESSAGE_FAILED,
     @SerializedName("message.revoked")
@@ -36,6 +38,8 @@ public enum WebhookEvent {
     SESSION_RESTRICTION,
     @SerializedName("presence.update")
     PRESENCE_UPDATE,
+    @SerializedName("event.response")
+    EVENT_RESPONSE,
     @SerializedName("call.accepted")
     CALL_ACCEPTED,
     @SerializedName("call.rejected")

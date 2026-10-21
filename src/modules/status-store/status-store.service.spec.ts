@@ -1,13 +1,12 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { DataSource, DeepPartial, Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
-
-jest.mock('archiver', () => ({ default: jest.fn() }));
 
 import { StorageService } from '../../common/storage/storage.service';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
+import { LidMapping } from '../../engine/identity/lid-mapping.entity';
 import { userPart } from '../../engine/identity/wa-id';
 import { StatusUpdate } from './entities/status-update.entity';
 import { StatusStoreService } from './status-store.service';
@@ -44,6 +43,44 @@ describe('StatusStoreService (ingest / list / getMedia)', () => {
     fs.rmSync(baseDir, { recursive: true, force: true });
   });
 
+  // SQLite serves every repository from one connection, so a transaction a save opens is shared with the
+  // writes made while it is open, and the rollback of a duplicate's unique violation would undo them too,
+  // after ingest had reported them created and the status.received webhook had gone out.
+  it('keeps a row written while a duplicate that lost the unique-key race is refused', async () => {
+    const status = (waStatusId: string) => ({
+      waStatusId,
+      contactJid: '628111@c.us',
+      type: 'text' as const,
+      caption: waStatusId,
+      postedAt: Date.now(),
+    });
+    await service.ingest('sess-race', status('dup'));
+    // The racing ingest read before the winner wrote, so it goes on to the insert that must be refused.
+    jest.spyOn(repository, 'findOne').mockResolvedValueOnce(null);
+    let concurrent: Promise<unknown> | undefined;
+    ds.subscribers.push({
+      listenTo: () => StatusUpdate,
+      beforeInsert: event => {
+        if ((event.entity as StatusUpdate).waStatusId === 'dup' && !concurrent) {
+          const other = status('other');
+          concurrent = repository.insert({
+            ...other,
+            sessionId: 'sess-race',
+            expiresAt: other.postedAt + 24 * 60 * 60 * 1000,
+            mediaOmitted: false,
+          });
+        }
+      },
+    });
+
+    const { created } = await service.ingest('sess-race', status('dup'));
+    await concurrent;
+
+    expect(created).toBe(false);
+    const stored = (await repository.find({ where: { sessionId: 'sess-race' } })).map(row => row.waStatusId).sort();
+    expect(stored).toEqual(['dup', 'other']);
+  });
+
   it('ingest writes a text row with expiresAt = postedAt + 24h, flagged as created', async () => {
     const postedAt = Date.now();
     const { row, created } = await service.ingest('sess', {
@@ -75,6 +112,25 @@ describe('StatusStoreService (ingest / list / getMedia)', () => {
     const styled = (await service.list('sess')).find(s => s.id === 'styled')!;
     expect(styled.backgroundColor).toBe('#25d366');
     expect(styled.font).toBe(2);
+  });
+
+  it('serves a status with no name, push name, caption or styling without those keys', async () => {
+    const postedAt = Date.now();
+    await service.ingest('sess', { waStatusId: 'bare', contactJid: '628333@c.us', type: 'text', postedAt });
+
+    // The columns read back as null, but StatusDto and the openapi schema declare these fields optional,
+    // not nullable: a client typed from the contract must see them absent.
+    const listed = (await service.list('sess')).find(s => s.id === 'bare')!;
+    const [byContact] = await service.listByContact('sess', '628333@c.us');
+    const wire = {
+      id: 'bare',
+      contact: { id: '628333@c.us' },
+      type: 'text',
+      timestamp: new Date(postedAt).toISOString(),
+      expiresAt: new Date(postedAt + 24 * 60 * 60 * 1000).toISOString(),
+    };
+    expect(JSON.parse(JSON.stringify(listed))).toEqual(wire);
+    expect(JSON.parse(JSON.stringify(byContact))).toEqual(wire);
   });
 
   it('ingest persists media to a file under the cap and records mediaPath', async () => {
@@ -199,6 +255,21 @@ describe('StatusStoreService (ingest / list / getMedia)', () => {
     expect(media?.path).toContain('statuses/sess/');
   });
 
+  // A status whose media arrived without a type still has its bytes stored and its mediaUrl
+  // advertised, so the URL has to resolve; the media endpoint serves an unknown type as inert bytes.
+  it('getMedia serves stored media that arrived without a mimetype as octet-stream', async () => {
+    await service.ingest('sess', {
+      waStatusId: 'untyped',
+      contactJid: '628111@c.us',
+      type: 'image',
+      media: { mimetype: '', data: Buffer.from('raw').toString('base64') },
+      postedAt: Date.now(),
+    });
+    const media = await service.getMedia('sess', 'untyped');
+    expect(media?.mimetype).toBe('application/octet-stream');
+    expect(media?.path).toContain('statuses/sess/');
+  });
+
   it('getMedia returns null for an omitted-media status', async () => {
     expect(await service.getMedia('sess', 'w3')).toBeNull();
   });
@@ -232,13 +303,7 @@ describe('StatusStoreService (ingest / list / getMedia)', () => {
     // The in-memory row returned here is exactly what dispatchStatusReceived sends. Every other
     // omission path sets omitReason, so leaving it unset made a real media loss indistinguishable
     // from an unexplained omission — and nothing retries it.
-    const saveSpy = jest.spyOn(repository, 'save');
-    let calls = 0;
-    saveSpy.mockImplementation((row: DeepPartial<StatusUpdate>) => {
-      calls += 1;
-      if (calls === 2) return Promise.reject(new Error('db blip')); // the post-write update
-      return Promise.resolve(row as DeepPartial<StatusUpdate> & StatusUpdate);
-    });
+    const updateSpy = jest.spyOn(repository, 'update').mockRejectedValueOnce(new Error('db blip'));
     try {
       const { row } = await service.ingest('sess', {
         waStatusId: 'w-row-fail',
@@ -251,7 +316,7 @@ describe('StatusStoreService (ingest / list / getMedia)', () => {
       expect(row.omitReason).toBe('write_failed');
       expect(row.mediaPath).toBeFalsy();
     } finally {
-      saveSpy.mockRestore();
+      updateSpy.mockRestore();
     }
   });
 
@@ -413,11 +478,14 @@ describe('StatusStoreService contact identity (read-time lid resolution)', () =>
     const getCached = (lid: string): string | null | undefined => (lid in mappings ? mappings[lid] : undefined);
     return {
       getCached,
+      findPhoneForLid: (lid: string) => Promise.resolve(getCached(lid) ?? null),
       resolveLid: (jid: string) => getCached(userPart(jid)) ?? null,
-      lidsForPhone: (phone: string) =>
-        Object.entries(mappings)
-          .filter(([, p]) => p === phone)
-          .map(([l]) => l),
+      findLidsForPhone: (phone: string) =>
+        Promise.resolve(
+          Object.entries(mappings)
+            .filter(([, p]) => p === phone)
+            .map(([l]) => l),
+        ),
     } as unknown as LidMappingStoreService;
   };
 
@@ -458,6 +526,55 @@ describe('StatusStoreService contact identity (read-time lid resolution)', () =>
     const out = await svc.listByContact('sess', '111@lid');
     expect(out).toHaveLength(1);
     expect(out[0].contact.id).toBe('628111@c.us');
+  });
+
+  it.each(['111@hosted.lid', '111@LID', ' 111@lid '])(
+    'listByContact treats %p as a lid, matching its phone and lid rows',
+    async query => {
+      const svc = new StatusStoreService(
+        repository,
+        storageService,
+        fakeConfigService(),
+        lidStore({ '111': '628111' }),
+      );
+      const now = Date.now();
+      await svc.ingest('sess', { waStatusId: 'h1', contactJid: '628111@c.us', type: 'text', postedAt: now });
+      await svc.ingest('sess', { waStatusId: 'h2', contactJid: '111@lid', type: 'text', postedAt: now + 1 });
+
+      const out = await svc.listByContact('sess', query);
+      expect(out).toHaveLength(2);
+    },
+  );
+
+  it("listByContact never reads a lid's digits as a phone", async () => {
+    // Lid 111 is 628111. A phone 111 and the lid 999 mapped to that phone are someone else.
+    const svc = new StatusStoreService(
+      repository,
+      storageService,
+      fakeConfigService(),
+      lidStore({ '111': '628111', '999': '111' }),
+    );
+    const now = Date.now();
+    await svc.ingest('sess', { waStatusId: 'own-lid', contactJid: '111@lid', type: 'text', postedAt: now });
+    await svc.ingest('sess', { waStatusId: 'own-phone', contactJid: '628111@c.us', type: 'text', postedAt: now + 1 });
+    await svc.ingest('sess', { waStatusId: 'other-phone', contactJid: '111@c.us', type: 'text', postedAt: now + 2 });
+    await svc.ingest('sess', { waStatusId: 'other-lid', contactJid: '999@lid', type: 'text', postedAt: now + 3 });
+
+    const ids = (await svc.listByContact('sess', '111@lid')).map(s => s.id).sort();
+    expect(ids).toEqual(['own-lid', 'own-phone']);
+  });
+
+  it('listByContact forward-resolves a lid the store only holds in its table, not its cache', async () => {
+    const table = [{ lid: '111', phone: '628111' }];
+    const store = new LidMappingStoreService({
+      find: () => Promise.resolve([]),
+      findOne: ({ where }: { where: { lid: string } }) => Promise.resolve(table.find(r => r.lid === where.lid) ?? null),
+    } as unknown as Repository<LidMapping>);
+    const svc = new StatusStoreService(repository, storageService, fakeConfigService(), store);
+    await svc.ingest('sess', { waStatusId: 'l6', contactJid: '628111@c.us', type: 'text', postedAt: Date.now() });
+
+    const out = await svc.listByContact('sess', '111@lid');
+    expect(out).toHaveLength(1);
   });
 
   it('never resolves phone-shaped JIDs through the lid map (digit-collision guard)', async () => {
@@ -575,9 +692,8 @@ describe('StatusStoreService.purgeExpired', () => {
 
     // Every expired row has a media file and every delete fails, so nothing is deletable — an
     // unguarded delete([]) would throw TypeORM's empty-criteria error instead of returning 0.
-    const failingStorage = {
-      deleteFile: jest.fn().mockRejectedValue(new Error('backend down')),
-    } as unknown as StorageService;
+    const deleteFile = jest.fn().mockRejectedValue(new Error('backend down'));
+    const failingStorage = { deleteFile } as unknown as StorageService;
     const failingService = new StatusStoreService(repository, failingStorage, fakeConfigService());
 
     const now = 2000 + 24 * 60 * 60 * 1000 + 1;
@@ -588,7 +704,77 @@ describe('StatusStoreService.purgeExpired', () => {
     expect(remaining.map(r => r.waStatusId).sort()).toEqual(['expired-a', 'expired-b']);
     expect(fs.existsSync(path.join(baseDir, 'media', a.mediaPath!))).toBe(true);
     expect(fs.existsSync(path.join(baseDir, 'media', b.mediaPath!))).toBe(true);
+    // Tried once each, not re-selected in a loop.
+    expect(deleteFile).toHaveBeenCalledTimes(2);
   });
+
+  /** Seed rows cheaply, in statements well under SQLite's bind-parameter ceiling. */
+  const seed = async (rows: Array<Partial<StatusUpdate>>): Promise<void> => {
+    for (let i = 0; i < rows.length; i += 100) {
+      await repository.insert(
+        rows.slice(i, i + 100).map(r => ({
+          sessionId: 'sess',
+          contactJid: '628111@c.us',
+          waStatusId: r.id,
+          type: 'text' as const,
+          mediaOmitted: false,
+          postedAt: 1000,
+          expiresAt: 2000,
+          ...r,
+        })),
+      );
+    }
+  };
+  const id = (prefix: string, i: number): string => `${prefix}-0000-4000-8000-${String(i).padStart(12, '0')}`;
+
+  it('drains a backlog in batches, never deleting more than 500 rows in one statement', async () => {
+    await seed([
+      ...Array.from({ length: 1201 }, (_, i) => ({ id: id('00000000', i) })),
+      { id: id('ffffffff', 0), expiresAt: Date.now() + 60_000 },
+    ]);
+    const del = jest.spyOn(repository, 'delete');
+
+    expect(await service.purgeExpired(Date.now())).toBe(1201);
+
+    const sizes = del.mock.calls.map(([ids]) => (ids as string[]).length);
+    expect(sizes).toEqual([500, 500, 201]);
+    expect((await repository.find()).map(r => r.id)).toEqual([id('ffffffff', 0)]);
+    del.mockRestore();
+  }, 30_000);
+
+  it('does not let a batch of undeletable media block newer expired rows', async () => {
+    // Ids sort the undeletable rows first: a purge that restarted from the lowest id after an
+    // all-failed batch would never reach the rows behind them.
+    await seed([
+      ...Array.from({ length: 510 }, (_, i) => ({
+        id: id('00000000', i),
+        type: 'image' as const,
+        mediaPath: `bad/${i}`,
+      })),
+      ...Array.from({ length: 5 }, (_, i) => ({
+        id: id('ffffffff', i),
+        type: 'image' as const,
+        mediaPath: `good/${i}`,
+      })),
+    ]);
+    const deleteFile = jest.fn((key: string) =>
+      key.startsWith('bad/') ? Promise.reject(new Error('EACCES')) : Promise.resolve(),
+    );
+    const storage = { deleteFile } as unknown as StorageService;
+
+    const purger = new StatusStoreService(repository, storage, fakeConfigService());
+
+    // A batch where every delete fails ends the run instead of walking on through the backlog.
+    expect(await purger.purgeExpired(Date.now())).toBe(0);
+    expect(deleteFile).toHaveBeenCalledTimes(500);
+    // The next run resumes after that batch.
+    expect(await purger.purgeExpired(Date.now())).toBe(5);
+    expect(deleteFile).toHaveBeenCalledTimes(515);
+    expect(await repository.count()).toBe(510);
+    // Once the walk is drained, the next run starts over and retries the undeletable rows.
+    await purger.purgeExpired(Date.now());
+    expect(deleteFile.mock.calls[515][0]).toBe('bad/0');
+  }, 30_000);
 });
 
 describe('StatusStoreService.sweepOrphanedMedia', () => {
@@ -688,22 +874,13 @@ describe('StatusStoreService.sweepOrphanedMedia', () => {
     expect(fs.existsSync(path.join(baseDir, 'media', 'statuses', 'sess', 'orphan.jpg'))).toBe(false);
   });
 
-  it('enumerates past the listFiles() cap so orphans beyond it are still reaped', async () => {
-    // listFiles() truncates at STORAGE_LIST_MAX_FILES (a per-call DoS guard, not a completeness
-    // contract); the sweep reconciles against the FULL store, so it streams iterateFiles() instead.
-    process.env.STORAGE_LIST_MAX_FILES = '5';
-    try {
-      for (let i = 0; i < 8; i++) writeFile(`statuses/sess/orphan-${i}.jpg`, 'orphan');
-      // The capped call the sweep used to make would see only 5 of the 8 orphans.
-      expect((await storageService.listFiles()).filter(f => f.startsWith('statuses/'))).toHaveLength(5);
+  it('reaps every orphan under its prefix, not just the first few', async () => {
+    for (let i = 0; i < 8; i++) writeFile(`statuses/sess/orphan-${i}.jpg`, 'orphan');
 
-      const t0 = Date.now();
-      expect(await service.sweepOrphanedMedia(t0)).toBe(0); // first sighting starts the grace clock
-      expect(await service.sweepOrphanedMedia(t0 + 61 * 60 * 1000)).toBe(8); // all 8, not the capped 5
-      expect(fs.readdirSync(path.join(baseDir, 'media', 'statuses', 'sess'))).toHaveLength(0);
-    } finally {
-      delete process.env.STORAGE_LIST_MAX_FILES;
-    }
+    const t0 = Date.now();
+    expect(await service.sweepOrphanedMedia(t0)).toBe(0); // first sighting starts the grace clock
+    expect(await service.sweepOrphanedMedia(t0 + 61 * 60 * 1000)).toBe(8);
+    expect(fs.readdirSync(path.join(baseDir, 'media', 'statuses', 'sess'))).toHaveLength(0);
   });
 });
 
@@ -715,7 +892,7 @@ describe('StatusStoreService onModuleInit/onModuleDestroy (sweep scheduling)', (
     return { repo, storage, find };
   };
 
-  it('purges once at startup and schedules a recurring sweep, cleared on destroy', () => {
+  it('purges once at startup and schedules a recurring sweep, cleared on destroy', async () => {
     const { repo, storage } = mockDeps();
     const service = new StatusStoreService(repo, storage, fakeConfigService());
 
@@ -726,19 +903,76 @@ describe('StatusStoreService onModuleInit/onModuleDestroy (sweep scheduling)', (
       expect(purgeSpy).toHaveBeenCalledTimes(1);
 
       purgeSpy.mockClear();
-      jest.advanceTimersByTime(15 * 60 * 1000);
+      await jest.advanceTimersByTimeAsync(15 * 60 * 1000);
       expect(purgeSpy).toHaveBeenCalledTimes(1);
 
       service.onModuleDestroy();
       purgeSpy.mockClear();
-      jest.advanceTimersByTime(15 * 60 * 1000);
+      await jest.advanceTimersByTimeAsync(15 * 60 * 1000);
       expect(purgeSpy).not.toHaveBeenCalled();
     } finally {
       jest.useRealTimers();
     }
   });
 
-  it('runs the orphan sweep once at startup and on its own (slower) cadence, cleared on destroy', () => {
+  it('skips a purge tick while the previous purge is still running', async () => {
+    const { repo, storage } = mockDeps();
+    const service = new StatusStoreService(repo, storage, fakeConfigService());
+
+    jest.useFakeTimers();
+    let release: () => void = () => undefined;
+    const purgeSpy = jest
+      .spyOn(service, 'purgeExpired')
+      .mockImplementationOnce(() => new Promise<number>(resolve => (release = () => resolve(0))))
+      .mockResolvedValue(0);
+    try {
+      service.onModuleInit();
+      await jest.advanceTimersByTimeAsync(15 * 60 * 1000);
+      await jest.advanceTimersByTimeAsync(15 * 60 * 1000);
+      expect(purgeSpy).toHaveBeenCalledTimes(1);
+
+      release();
+      await jest.advanceTimersByTimeAsync(15 * 60 * 1000);
+      expect(purgeSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      service.onModuleDestroy();
+      release();
+      jest.useRealTimers();
+    }
+  });
+
+  it('skips an orphan sweep tick while the previous sweep is still running', async () => {
+    const { repo, storage } = mockDeps();
+    const service = new StatusStoreService(
+      repo,
+      storage,
+      fakeConfigService({ 'status.orphanSweepIntervalMs': 60_000 }),
+    );
+
+    jest.useFakeTimers();
+    let release: () => void = () => undefined;
+    jest.spyOn(service, 'purgeExpired').mockResolvedValue(0);
+    const sweepSpy = jest
+      .spyOn(service, 'sweepOrphanedMedia')
+      .mockImplementationOnce(() => new Promise<number>(resolve => (release = () => resolve(0))))
+      .mockResolvedValue(0);
+    try {
+      service.onModuleInit();
+      await jest.advanceTimersByTimeAsync(60_000);
+      await jest.advanceTimersByTimeAsync(60_000);
+      expect(sweepSpy).toHaveBeenCalledTimes(1);
+
+      release();
+      await jest.advanceTimersByTimeAsync(60_000);
+      expect(sweepSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      service.onModuleDestroy();
+      release();
+      jest.useRealTimers();
+    }
+  });
+
+  it('runs the orphan sweep once at startup and on its own (slower) cadence, cleared on destroy', async () => {
     const { repo, storage } = mockDeps();
     const service = new StatusStoreService(repo, storage, fakeConfigService());
 
@@ -750,21 +984,21 @@ describe('StatusStoreService onModuleInit/onModuleDestroy (sweep scheduling)', (
 
       // The TTL purge fires every 15 min; the orphan sweep only on its own 1h interval.
       sweepSpy.mockClear();
-      jest.advanceTimersByTime(15 * 60 * 1000);
+      await jest.advanceTimersByTimeAsync(15 * 60 * 1000);
       expect(sweepSpy).not.toHaveBeenCalled();
-      jest.advanceTimersByTime(45 * 60 * 1000);
+      await jest.advanceTimersByTimeAsync(45 * 60 * 1000);
       expect(sweepSpy).toHaveBeenCalledTimes(1);
 
       service.onModuleDestroy();
       sweepSpy.mockClear();
-      jest.advanceTimersByTime(60 * 60 * 1000);
+      await jest.advanceTimersByTimeAsync(60 * 60 * 1000);
       expect(sweepSpy).not.toHaveBeenCalled();
     } finally {
       jest.useRealTimers();
     }
   });
 
-  it('honors a configured status.orphanSweepIntervalMs override', () => {
+  it('honors a configured status.orphanSweepIntervalMs override', async () => {
     const { repo, storage } = mockDeps();
     const service = new StatusStoreService(
       repo,
@@ -777,7 +1011,7 @@ describe('StatusStoreService onModuleInit/onModuleDestroy (sweep scheduling)', (
       const sweepSpy = jest.spyOn(service, 'sweepOrphanedMedia').mockResolvedValue(0);
       service.onModuleInit();
       sweepSpy.mockClear();
-      jest.advanceTimersByTime(5 * 60 * 1000);
+      await jest.advanceTimersByTimeAsync(5 * 60 * 1000);
       expect(sweepSpy).toHaveBeenCalledTimes(1);
       service.onModuleDestroy();
     } finally {
