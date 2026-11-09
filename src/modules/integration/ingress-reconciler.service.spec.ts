@@ -7,7 +7,7 @@ import { IngressEnqueueService, sanitizeIngressJobId } from './ingress-enqueue.s
 import { PluginInstanceService } from './plugin-instance.service';
 import { PluginLoaderService } from '../../core/plugins/plugin-loader.service';
 import { RedriveService } from './redrive.service';
-import { INGRESS_DISPATCH_TIMEOUT_MS } from './integration.constants';
+import { INGRESS_SHUTDOWN_WAIT_MS } from './integration.constants';
 import { IngressJobData } from '../queue/processors/ingress.processor';
 import { ConfigService } from '@nestjs/config';
 
@@ -22,9 +22,20 @@ describe('IngressReconcilerService.sweep', () => {
   let failures: Repository<IntegrationDeliveryFailure>;
   let enqueue: jest.Mock;
   let getPlugin: jest.Mock;
+  let restoring: Set<string>;
+  // What the loader reports as still restoring when a batch is selected. The per-row check reads
+  // `restoring` directly, so a test can make the two disagree, as they do when a restore begins during a pass.
+  let restoringIds: () => string[];
   let resolveInstance: jest.Mock;
   let service: IngressReconcilerService;
   let seq: number;
+
+  const loaderDouble = (): PluginLoaderService =>
+    ({
+      getPlugin,
+      isRestorePending: (id: string) => restoring.has(id),
+      restorePendingIds: () => restoringIds(),
+    }) as unknown as PluginLoaderService;
 
   beforeEach(async () => {
     seq = 0;
@@ -42,12 +53,14 @@ describe('IngressReconcilerService.sweep', () => {
       .save({ id: 'plug:inst', pluginId: 'plug', instanceId: 'inst', secret: 's', enabled: true });
     enqueue = jest.fn().mockResolvedValue({ outcome: 'queued' });
     getPlugin = jest.fn().mockReturnValue(undefined);
+    restoring = new Set();
+    restoringIds = () => [...restoring];
     resolveInstance = jest.fn().mockResolvedValue({ enabled: true });
     service = new IngressReconcilerService(
       events,
       failures,
       { enqueue, existingJobState: jest.fn().mockResolvedValue(undefined) } as unknown as IngressEnqueueService,
-      { getPlugin } as unknown as PluginLoaderService,
+      loaderDouble(),
       { resolve: resolveInstance } as unknown as PluginInstanceService,
     );
   });
@@ -82,6 +95,29 @@ describe('IngressReconcilerService.sweep', () => {
   };
   const stored = (id: string) => events.findOneByOrFail({ id });
   const enqueuedJobs = () => enqueue.mock.calls as Array<[IngressJobData, string]>;
+
+  it('keeps the provider id through reconciliation, a failed dispatch, and redrive', async () => {
+    await insertEvent({
+      providerDeliveryId: 'body-specific-key',
+      payload: { headers: {}, query: {}, body: '{}', rawBody: '{}', providerDeliveryId: 'provider-17' },
+      dispatchAttempts: 4,
+    });
+    enqueue.mockResolvedValue({ outcome: 'failed', error: 'unavailable' });
+
+    await service.sweep(OPTS);
+    const [first] = enqueuedJobs()[0];
+    expect(first).toMatchObject({ deliveryId: 'body-specific-key', payload: { providerDeliveryId: 'provider-17' } });
+    expect((await failures.find())[0]).toMatchObject({
+      deliveryId: 'body-specific-key',
+      payload: { ingress: { providerDeliveryId: 'provider-17' } },
+    });
+
+    enqueue.mockResolvedValue({ outcome: 'queued' });
+    const redrive = new RedriveService(failures, events, { enqueue } as unknown as IngressEnqueueService);
+    expect((await redrive.redriveInstance('plug', 'inst', 'sess-1')).redriven).toBe(1);
+    const [replayed] = enqueuedJobs()[1];
+    expect(replayed).toMatchObject({ deliveryId: 'body-specific-key', payload: { providerDeliveryId: 'provider-17' } });
+  });
 
   it('replays a stale pending event with its original deliveryId as jobId, then marks it dispatched', async () => {
     const id = await insertEvent();
@@ -555,13 +591,9 @@ describe('IngressReconcilerService.sweep', () => {
         { get: jest.fn().mockReturnValue(true) } as unknown as ConfigService,
         queue as never,
       );
-      service = new IngressReconcilerService(
-        events,
-        failures,
-        realEnqueue,
-        { getPlugin } as unknown as PluginLoaderService,
-        { resolve: resolveInstance } as unknown as PluginInstanceService,
-      );
+      service = new IngressReconcilerService(events, failures, realEnqueue, loaderDouble(), {
+        resolve: resolveInstance,
+      } as unknown as PluginInstanceService);
     });
 
     const processorDeadLetter = () =>
@@ -769,7 +801,7 @@ describe('IngressReconcilerService.sweep', () => {
     );
     const redrive = new RedriveService(failures, events, { enqueue } as unknown as IngressEnqueueService);
 
-    const res = await redrive.redriveInstance('plug', 'inst', null);
+    const res = await redrive.redriveInstance('plug', 'inst', 'sess-1');
 
     expect(res.redriven).toBe(1);
     expect((await stored(id)).dispatchState).toBe('dispatched');
@@ -777,6 +809,36 @@ describe('IngressReconcilerService.sweep', () => {
     const stats = await service.sweep(OPTS);
     expect(stats.scanned).toBe(0);
     expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('redrives, on a real database, only the rows written under the current all-sessions binding', async () => {
+    const dead = (deliveryId: string, sessionId: string | null) =>
+      failures.save(
+        failures.create({
+          direction: 'inbound',
+          pluginId: 'plug',
+          instanceId: 'inst',
+          sessionId,
+          deliveryId,
+          attempts: 0,
+          lastError: 'failed',
+          payload: { route: 'chatwoot', ingress: { headers: {}, query: {}, body: '{}', rawBody: '{}' } },
+          redriven: false,
+        }),
+      );
+    await dead('d-none', null);
+    await dead('d-star', '*');
+    await dead('d-old', 'sess-old');
+    const redrive = new RedriveService(failures, events, { enqueue } as unknown as IngressEnqueueService);
+
+    const res = await redrive.redriveInstance('plug', 'inst', null);
+
+    expect(res).toMatchObject({ redriven: 2, remaining: 0 });
+    expect((enqueue.mock.calls as Array<[{ deliveryId: string }]>).map(call => call[0].deliveryId).sort()).toEqual([
+      'd-none',
+      'd-star',
+    ]);
+    expect(await failures.count({ where: { sessionId: 'sess-old', redriven: false } })).toBe(1);
   });
 
   it('skips a row whose instance was disabled after persist, and replays it once re-enabled', async () => {
@@ -796,6 +858,58 @@ describe('IngressReconcilerService.sweep', () => {
     const stats2 = await service.sweep(OPTS);
     expect(stats2.replayed).toBe(1);
     expect((await stored(id)).dispatchState).toBe('dispatched');
+  });
+
+  // A replay is a delivery arriving later than the live one, and a plugin the boot restore has not reached has no
+  // worker to take it: the dispatch would only spend an attempt of the row's budget on a refusal.
+  it('leaves a row whose plugin is still being restored untouched, and replays it once that is done', async () => {
+    const id = await insertEvent();
+    restoring.add('plug');
+
+    const stats = await service.sweep(OPTS);
+
+    expect(stats).toMatchObject({ scanned: 0, replayed: 0 });
+    expect(enqueue).not.toHaveBeenCalled();
+    const held = await stored(id);
+    expect(held.dispatchState).toBe('pending');
+    expect(held.dispatchAttempts).toBe(0);
+    expect(await failures.count()).toBe(0);
+
+    restoring.delete('plug');
+    const stats2 = await service.sweep(OPTS);
+    expect(stats2).toMatchObject({ scanned: 1, replayed: 1 });
+    expect((await stored(id)).dispatchState).toBe('dispatched');
+  });
+
+  // The batch is the oldest rows a pass can act on. Rows of a restoring plugin are skipped, so if they were
+  // selected like the rest, a plugin with a batch's worth of stranded rows would hand the same ones back every
+  // pass and no other plugin's stranded delivery would ever be replayed until its restore ended.
+  it('does not let the stranded rows of a restoring plugin take the whole batch', async () => {
+    await ds
+      .getRepository(PluginInstance)
+      .save({ id: 'other:inst', pluginId: 'other', instanceId: 'inst', secret: 's', enabled: true });
+    for (let i = 0; i < OPTS.batchSize + 1; i++) await insertEvent({ createdAt: minutesAgo(20) });
+    const other = await insertEvent({ pluginId: 'other', createdAt: minutesAgo(10) });
+    restoring.add('plug');
+
+    const stats = await service.sweep(OPTS);
+
+    expect(stats).toMatchObject({ scanned: 1, replayed: 1, skipped: 0 });
+    expect(enqueuedJobs().map(([data]) => data.pluginId)).toEqual(['other']);
+    expect((await stored(other)).dispatchState).toBe('dispatched');
+    expect(await events.countBy({ pluginId: 'plug', dispatchState: 'pending' })).toBe(OPTS.batchSize + 1);
+  });
+
+  it('still leaves a row alone whose plugin began restoring after the batch was read', async () => {
+    const id = await insertEvent();
+    restoringIds = () => []; // the batch is selected before the restore begins...
+    restoring.add('plug'); // ...and the per-row check sees it begin
+
+    const stats = await service.sweep(OPTS);
+
+    expect(stats).toMatchObject({ scanned: 0, replayed: 0, skipped: 1 });
+    expect(enqueue).not.toHaveBeenCalled();
+    expect((await stored(id)).dispatchAttempts).toBe(0);
   });
 
   it('skips a row whose instance was deleted after persist', async () => {
@@ -912,7 +1026,7 @@ describe('IngressReconcilerService.sweep', () => {
           waitUntilReady: jest.fn().mockResolvedValue(undefined),
         } as never,
       ),
-      { getPlugin } as unknown as PluginLoaderService,
+      loaderDouble(),
       { resolve: resolveInstance } as unknown as PluginInstanceService,
     );
 
@@ -924,7 +1038,7 @@ describe('IngressReconcilerService.sweep', () => {
     jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
     try {
       void service.onModuleDestroy().then(() => (destroyed = true));
-      await jest.advanceTimersByTimeAsync(INGRESS_DISPATCH_TIMEOUT_MS - 1);
+      await jest.advanceTimersByTimeAsync(INGRESS_SHUTDOWN_WAIT_MS - 1);
       await new Promise(setImmediate);
       destroyedBeforeDeadline = destroyed;
       await jest.advanceTimersByTimeAsync(1);
@@ -969,7 +1083,7 @@ describe('IngressReconcilerService.sweep', () => {
         { get: jest.fn().mockReturnValue(true) } as unknown as ConfigService,
         queue as never,
       ),
-      { getPlugin } as unknown as PluginLoaderService,
+      loaderDouble(),
       { resolve: resolveInstance } as unknown as PluginInstanceService,
     );
 

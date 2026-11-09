@@ -174,6 +174,8 @@ row), and the SDK major by the check applied to a manifest that declares `ingres
 | `provides` / `requires` | —        | Features this plugin provides / depends on                                                                                                                                                                                                                                                           |
 | `i18n`                  | —        | Localized dashboard text per locale (dashboard-only; a `configUi` editor receives it through the localized `schema`)                                                                                                                                                                                 |
 
+Schema defaults are seeded into stored config when a plugin is loaded. A stored value remains unchanged across updates and restarts, even if a later version changes that field's default. Plugin authors should document required value changes for existing installations; operators must save those values explicitly. The current default applies only when the field has no stored value.
+
 **The `configUi` bridge.** The editor is injected as `srcdoc` into a `sandbox="allow-scripts"` iframe, so
 it has an opaque origin and no access to the dashboard. It talks to the host by `postMessage`:
 
@@ -202,7 +204,16 @@ host.
 
 A `configSchema` field may set `secret: true` (e.g. an API key): the value is masked on read and
 preserved on an unchanged write. A write keeps the stored value for the mask and for an empty string, and
-removes it for an explicit `null`.
+removes it for an explicit `null`. A per-session override and an integration instance's own config are
+overlaid on the base config, secret fields included, so a stored secret reaches every override that does
+not replace it. The exception is an override or instance that points a `net.allowConfigHosts` key at
+another origin than the layer beneath: it does not inherit that layer's secret fields (a list that holds
+one is dropped whole) and must bring its own. A host key that holds no text (a list, an object, a number) counts
+as another origin. The same rule applies on write: a write to an override or an instance that points a host key
+at another origin than the stored layer is bound to (its own host key, or the host of the layer beneath it
+when it names none) gets no stored secret back for the mask or an empty string, so the secret has to be sent
+with it. An instance row loses its own secrets while a per-session override beneath it has moved a host key the
+row leaves unset away from the base config.
 
 ### Plugin Entry Point
 
@@ -231,8 +242,9 @@ export default class MyAwesomePlugin implements IPlugin {
       const message = data as { from: string; body?: string };
 
       if (message.body?.toLowerCase() === 'help' && sessionId) {
-        // Capability call — requires the 'messages:send' permission + an in-scope, live session.
-        await ctx.messages.sendText(sessionId, message.from, cfg.greeting ?? 'How can I help you?');
+        void ctx.messages
+          .sendText(sessionId, message.from, cfg.greeting ?? 'How can I help you?')
+          .catch(error => ctx.logger.error('Reply failed', error));
         return { continue: false }; // stop the chain
       }
       return { continue: true };
@@ -321,6 +333,8 @@ claims a route the manifest already declared under `ingress`: the host owns the 
 [27 — Writing a Search-Provider Plugin](./27-plugin-search-providers.md). Hook handlers use the host
 `HookContext` / `HookResult` shape (see §19.5), not a `{ continue, modified }` shape.
 
+Ingress routes may set `dedupBodyMismatchAsNew: true` only for providers whose retries preserve body bytes. The default keeps header-keyed retries suppressed even when the body changes; all such mismatches are logged and counted. With the option enabled, a different body gets a separate storage and queue key while the handler keeps the provider delivery id, so the handler of such a route keys its side effects on the delivery id and the body together. See [25.6](25-integration-fabric.md#256-security-model) for the retry and idempotency contract.
+
 ### Capability facade
 
 A plugin reaches WhatsApp, the engine, and the network **only** through these namespaces. Each call is
@@ -385,9 +399,15 @@ export interface PluginStorage {
 }
 ```
 
+Writes accept keys of at most 184 UTF-8 bytes, keeping their encoded filenames within the 255-byte filesystem limit. A longer key is rejected with a validation error before any file is written.
+
+A key that is spelled like another key's encoded filename (`key-Zm9v` for `foo`) is not read as a legacy key, so it neither returns nor deletes that other key's value. `list()` returns only keys that `get` and `delete` accept.
+
 ## 19.5 Hook System
 
 ### Hook Lifecycle
+
+A plain text send may wait up to `SIMULATE_TYPING_MAX_MS` (5 s by default) for typing simulation before the engine send. Do not await message sends in hooks or webhook handlers: start the promise with a `.catch` handler and return the hook result or webhook response promptly.
 
 ```mermaid
 sequenceDiagram
@@ -488,6 +508,13 @@ export type HookEvent =
 timestamps and so on), never the stored `proxyUrl` or `config`; `session:deleted` carries
 `{ id, name, phone, pushName }`.
 
+`webhook:delivered` fires after every successful POST (a queued job, the direct path, or the direct fallback
+after a failed queue add). `webhook:after` is legacy: it fires only after a successful direct or fallback POST,
+always with `success: true`. `webhook:error` fires when a dispatch did not deliver: retries exhausted, a job
+that stalled out, a dispatch shed or refused before sending, or a failed queue add. It is not always final: a
+failed queue add is followed by a direct fallback, and a shed dispatch stays in the outbox for a later replay
+under a new `deliveryId`, so either can still end in `webhook:delivered`.
+
 ### Hook context and result
 
 ```typescript
@@ -519,7 +546,9 @@ and among themselves in their own order. On `execute(event, data,
 handler that returns `{ continue: false }` stops the chain. A handler that **throws** is logged and the
 chain continues with the previous data (one bad plugin can't break the chain). Same-event re-entrancy
 is blocked: a handler that re-fires the event it is handling is short-circuited (guards synchronous
-re-entry only). Plugins never call `HookManager` directly — they use `ctx.registerHook(...)`, which
+re-entry only). The guard ends with the call that opened it, so a send that a handler schedules from a
+timer or a detached promise after that call has settled runs every handler, a moderation veto included;
+a sandboxed handler that overran the hook timeout stays guarded until the worker answers. Plugins never call `HookManager` directly — they use `ctx.registerHook(...)`, which
 also applies the per-session activation gate.
 
 Chains for different messages run concurrently, so a handler can see one chat's messages out of order.
@@ -565,8 +594,15 @@ decision across a restart; the decision is persisted separately as `enabledByOpe
 `onApplicationBootstrap` — after the rest of the app is wired — the loader re-enables every non-built-in
 plugin carrying that flag, so an upgrade, host reboot or container restart no longer silently switches
 off every extension ([#856](https://github.com/rmyndharis/OpenWA/issues/856)). Restoring is best-effort
-and sequential: a plugin that fails is logged (`plugin_restore_failed`), left in `ERROR`, and never
+and sequential: a plugin that fails is logged (`plugin_restore_failed`) and left in `ERROR`; that failure never
 holds up startup. Built-ins are skipped — `EngineFactory` enables the engine named by `engine.type`.
+
+A slow restore can hold startup up, but only for 60 s: after that the loader logs
+`plugin_restore_deferred`, the HTTP port opens, and the plugins not yet restored keep coming up in
+order in the background. Until a plugin is up its hooks do not run, so a request that arrives in that
+window is not seen by them (a send moderation veto, for one); enabling, disabling, updating or
+uninstalling it answers `409` until the restore is done with it; and an ingress delivery for it is
+refused or held as described in section 25.7 of [25 - Integration Fabric](./25-integration-fabric.md).
 
 > The flag is written **only** by the operator-facing enable/disable, never by the loader.
 > `onModuleDestroy` disables every running plugin during a graceful shutdown, so a loader-side write
@@ -594,14 +630,31 @@ phase, waits included, is capped at 10 s; a plugin still running at the cap is t
 process. New enables are refused once teardown starts. A disable that arrives while the same plugin is
 still being disabled (shutdown overlapping a REST disable, an uninstall or an update unload) joins the
 running teardown, so `onDisable` runs once; an unload that joins this way gets no worker-side `onUnload`.
-`uninstallPlugin` disables + unloads, drops the registry entry, and deletes the plugin's directory and
-its `ctx.storage` data dir (built-ins are protected and cannot be uninstalled). The unload path
+`uninstallPlugin` first stores the plugin's registry entry emptied of its config, session activation,
+per-session config and enable decision, then disables + unloads, deletes the plugin's directory and its
+`ctx.storage` data dir, and drops the entry last (built-ins are protected and cannot be uninstalled). A
+`registry.json` that cannot take the first write refuses the uninstall with nothing changed. A package or
+storage folder that cannot be removed fails the uninstall and leaves the emptied entry, so the same call can
+be repeated, and a package left behind boots disabled, configured only by what its enabled integration
+instances project onto it at boot (see below); such a failure is still audited, as
+`plugin_uninstalled` with `partial: true` and the error. When only the final delete fails, the answer is a
+success that says the emptied entry stayed and names the call to repeat: a reinstall of the id gets nothing
+back from that entry, a restart only reports it as a plugin with no code, and the same call removes it once the
+registry is writable. While the unload runs, a config, per-session config or session-activation write to the
+plugin is refused, so none lands in the emptied entry: the plugin API answers it `409`, and an integration
+instance projection records the warn audit row of any binding it could not apply. The unload path
 dispatches `onUnload`: for a sandboxed plugin it runs in the worker between `onDisable` and terminate
 (a plain disable does NOT fire `onUnload`; disable is reversible and its cleanup hook is `onDisable`).
 Uninstall also hands every chat the plugin had taken over back to the bot. The plugin's integration
-instances, with their encrypted secrets, and its stored deliveries stay in the database, so a reinstall finds
-its provider webhooks still pointing at live instance ids; remove an instance for good with
-`DELETE /api/integration/plugins/:pluginId/instances/:instanceId`, which works with the plugin gone.
+instances, with their secrets (stored in plain text, masked on read), and its stored deliveries stay in
+the database, so a reinstall finds its provider webhooks still pointing at live instance ids. They also
+outlive the emptied registry entry: every
+boot that loads the id (after a reinstall, or with a package a part-way uninstall left behind) projects every
+enabled instance back onto the plugin and into `registry.json`, its config into
+the per-session config of its scope (a wildcard instance's into the base config, secrets included) and its
+scope into the session activation. Remove an instance for good, before the reinstall when it should start
+with none of them, with `DELETE /api/integration/plugins/:pluginId/instances/:instanceId`, which works with
+the plugin gone.
 
 **Context.** `PluginCapabilityContext.createPluginContext` (`src/core/plugins/plugin-capability-context.ts`) builds the `PluginContext` (§19.4): a per-plugin logger,
 `registerHook` (wrapped with the per-session activation gate), `registerWebhook`, the live
@@ -657,8 +710,10 @@ export default class AutoReplyPlugin implements IPlugin {
       const text = message.body.toLowerCase();
       const rule = (cfg.rules ?? []).find(r => text.includes(r.match.toLowerCase()));
       if (rule) {
-        await ctx.messages.sendText(sessionId, message.from, rule.reply);
-        await ctx.storage.set(`stats:replies:${Date.now()}`, rule.match);
+        void ctx.messages
+          .sendText(sessionId, message.from, rule.reply)
+          .then(() => ctx.storage.set(`stats:replies:${Date.now()}`, rule.match))
+          .catch(error => ctx.logger.error('Auto-reply failed', error));
       }
       return { continue: true }; // keep the chain going (still delivers the webhook)
     });
@@ -805,9 +860,9 @@ tier automatically. Key properties:
   resolves `{ continue: true }` (fail-open), so each sandboxed subscriber delays the hook chain by at most
   5 s per event. The same fail-open value drains in-flight hooks if the worker crashes. The timeout is
   logged at most once per event per minute and shows as the last hook error in plugin health.
-- A sandboxed **webhook** handler (`ctx.registerWebhook`) has the same **5 s** budget (`INGRESS_DISPATCH_TIMEOUT_MS`), and the host
+- A sandboxed **webhook** handler (`ctx.registerWebhook`) has a **5 s** inline budget (`INGRESS_DISPATCH_TIMEOUT_MS`), which is the budget of every dispatch without the queue, replays included. Queued dispatch gets `SIMULATE_TYPING_MAX_MS` plus 5 s, capped at 25 s (10 s by default). The host
   cannot cancel a handler that overruns it: the delivery is retried while the first run still lands, so a handler must key
-  its side effects on `req.deliveryId` and hand slow work to a background task (docs/25, section 25.7).
+  its side effects on `req.deliveryId` (with a hash of `req.rawBody` on a route that sets `dedupBodyMismatchAsNew`) and hand slow work to a background task (docs/25, section 25.7).
 - After a hook, webhook or search dispatch times out, the host pings the worker. A worker whose event
   loop is blocked (a synchronous loop) cannot answer within 5 s, so it is terminated and the plugin is
   set to `ERROR`, as on a crash; a slow async handler answers and is left running.

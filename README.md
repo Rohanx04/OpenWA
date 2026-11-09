@@ -136,13 +136,13 @@ OpenWA is built for developers who want full control over their messaging infras
 migration storage backends (Local / S3) and cache layers (disabled / Redis) through **configuration
 rather than application-code changes**.
 
-Built on a **pluggable architecture**, OpenWA lets you select database engines (SQLite/PostgreSQL), media storage backends (Local/S3), and cache layers (disabled/Redis) through configuration rather than application-code changes. The storage backend is the live store for status media and, when chat-media archiving is enabled, archived chat media; other message media is returned inline to API and webhook consumers. Of the media, `scripts/backup.sh` archives only the local media directory, so an S3 bucket needs a backup of its own.
+Built on a **pluggable architecture**, OpenWA lets you select database engines (SQLite/PostgreSQL), media storage backends (Local/S3), and an optional Redis (queue, rate limits, WebSocket fan-out) through configuration rather than application-code changes. The storage backend is the live store for status media and, when chat-media archiving is enabled, archived chat media; other message media is returned inline to API and webhook consumers. Of the media, `scripts/backup.sh` archives only the local media directory, so an S3 bucket needs a backup of its own.
 
 |                               |                                                                                                                                          |
 | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | 🔓 **100% Open Source**       | No licensing fees, no feature locks, full source code access                                                                             |
 | 🏗️ **Pluggable Architecture** | Swap adapters for database, storage and cache via config                                                                                 |
-| 🖥️ **Full Dashboard**         | Modern React UI for session, webhook and API key management                                                                              |
+| 🖥️ **Full Dashboard**         | Modern React UI for session, webhook, and API key management                                                                             |
 | 🔹 **Multi-Session Ready**    | Run multiple WhatsApp sessions concurrently on one instance                                                                              |
 | 🐳 **Docker Native**          | Production-ready with zero configuration                                                                                                 |
 | 🤖 **AI-Agent Ready**         | Optional MCP server so Claude, Cursor and friends can drive WhatsApp                                                                     |
@@ -171,7 +171,7 @@ A session-scoped key still reaches every chat on the sessions it may use. A key 
 
 This lets you point an **AI agent or third-party integration at a shared account** without handing it every chat. Give the agent a key scoped to the few groups (or DMs) it is meant to handle: it can send and reply there, but it cannot list your other chats, read any other DM, message a contact outside its set, or reach the queue dashboard. It reads its chats' stored messages on either engine through `GET /sessions/{sessionId}/messages?chatId=`, where `chatId` is required for such a key, and live history through `GET /sessions/{sessionId}/messages/{chatId}/history` on whatsapp-web.js only. It can subscribe to the `/events` WebSocket, which delivers only events for its chats. It can still read the session's own status (`GET /sessions/{sessionId}`) so an integration can tell whether it is connected.
 
-Identity is matched through the lid mapping table: a contact allowlisted by phone number also matches the same person's `@lid` privacy id once the table maps the two, and an unmapped `@lid` is refused rather than guessed. A lid's digits are never mistaken for a phone number, so `555000111@lid` does not admit `555000111@c.us`.
+Identity is matched through the lid mapping table: a contact allowlisted by phone number also matches the same person's `@lid` privacy id once the table maps the two, and an unmapped `@lid` is refused rather than guessed. A lid's digits are never mistaken for a phone number, so `555000111@lid` does not admit `555000111@c.us`. When a session reports a privacy id new to the gateway for a number the table already maps to another reported id, as when the number passes to someone else, the gateway logs a warning and writes a `phone_second_lid_reported` audit row under that session, so the keys that name either can be reviewed. An id the gateway no longer holds in its mapping cache (`LID_MAPPING_CACHE_MAX`) counts as new, so on a larger table a known pair can be reported again.
 
 The default covers REST routes only. Surfaces that authenticate outside the REST guard do not inherit it, so each one that can return chat data applies the fence with its own check: the `/events` WebSocket delivers only events inside the key's chats, the MCP mount authorizes each tool call against them, and the Bull Board queue dashboard refuses the key. Five list routes are usable, each filtered to the key's chats before paging: `GET /sessions/{sessionId}/chats`, `GET /sessions/{sessionId}/groups` (id, name and community parent id only), `GET /sessions/{sessionId}/contacts`, `GET /sessions/{sessionId}/labels/{labelId}/chats` and `GET /api/search` (the built-in provider; a search plugin answers `403`).
 
@@ -240,9 +240,9 @@ These are practical guardrails, not guarantees — but they materially reduce th
 
 A few things that look like bugs but are actually server-side WhatsApp policy, not OpenWA defects — we track them separately so we can distinguish them from real bugs:
 
-- **First message to a brand-new contact sometimes never arrives.** The API returns success because the message leaves OpenWA, but WhatsApp's server-side reach-out / trust policy drops it at delivery. This is independent of OpenWA. We track it in [#830](https://github.com/rmyndharis/OpenWA/issues/830).
+- **First message to a brand-new contact sometimes never arrives.** The API returns success because the message leaves OpenWA, but WhatsApp's server-side reach-out / trust policy drops it at delivery. This is independent of OpenWA. Background in [#830](https://github.com/rmyndharis/OpenWA/issues/830).
 - **Accounts that get restricted cannot be "unrestricted" by us.** If WhatsApp disables a number, you need to appeal through their channels — OpenWA has no lever to pull.
-- **Some accounts cannot link a new device at all.** WhatsApp has added a passkey step to companion linking for some accounts: the phone asks to "Create a passkey" or "Continue on your other device" and the session stays at `qr_ready`. Neither engine implements that step, so switching engine or using a pairing code does not help, and no OpenWA setting changes it. Avoid logging out or re-linking a session that works, since linking it again may hit the same gate, and keep the fallback from rule 5 above. See [the FAQ entry](docs/12-troubleshooting-faq.md#issue-linking-asks-for-a-passkey-and-never-completes-both-engines); tracked in [#560](https://github.com/rmyndharis/OpenWA/issues/560).
+- **Some accounts cannot link a new device at all.** WhatsApp has added a passkey step to companion linking for some accounts: the phone asks to "Create a passkey" or "Continue on your other device" and the session stays at `qr_ready`. Neither engine implements that step, so switching engine or using a pairing code does not help, and no OpenWA setting changes it. Avoid logging out or re-linking a session that works, since linking it again may hit the same gate, and keep the fallback from rule 5 above. See [the FAQ entry](docs/12-troubleshooting-faq.md#issue-linking-asks-for-a-passkey-and-never-completes-both-engines); background in [#560](https://github.com/rmyndharis/OpenWA/issues/560).
 
 ### Compliance
 
@@ -304,7 +304,7 @@ Everything below is **shipped and working** — no "coming soon" rows.
 | Rate Limiting       | ✅     | Configurable request limits                                                                                                                                                  |
 | CIDR Whitelisting   | ✅     | IP-based access control                                                                                                                                                      |
 | Chat Scoping        | ✅     | Per-key `allowedChats` allowlist (groups and contacts): a key reaches only those chats, and routes not marked safe for it refuse it                                          |
-| Audit Logging       | ✅     | Audit trail for API-key, session, integration-instance, and infra admin operations (message sends and webhook deliveries are tracked in their own tables, not the audit log) |
+| Audit Logging       | ✅     | Audit trail for API-key, session, integration-instance, plugin and infra admin operations (message sends and webhook deliveries have tables of their own, not the audit log) |
 
 </details>
 
@@ -317,7 +317,7 @@ Everything below is **shipped and working** — no "coming soon" rows.
 | ---------------- | ------ | ------------------------------------------------ |
 | SQLite           | ✅     | Zero-config embedded database                    |
 | PostgreSQL       | ✅     | Production-grade database                        |
-| Redis Cache      | ✅     | Optional performance caching                     |
+| Redis            | ✅     | Opt-in queue, rate limits, WebSocket fan-out     |
 | S3/MinIO Storage | ✅     | Live media store (statuses, archived chat media) |
 | Docker           | ✅     | One-command deployment                           |
 | Health Checks    | ✅     | Kubernetes-ready probes                          |
@@ -369,6 +369,8 @@ then use it to sign in to the dashboard and as the `X-API-Key` header wherever t
 <summary><strong>💻 Option B — Local development (hot reload)</strong></summary>
 
 <br/>
+
+Source installs on Linux x64/arm64 hosts using glibc need **glibc 2.34 or newer** for the shipped `better-sqlite3` prebuild, including when PostgreSQL is selected. Use a newer host (Ubuntu 22.04+, Debian 12+, RHEL 9+) or the published Docker image on older hosts; see the [startup troubleshooting note](docs/12-troubleshooting-faq.md#issue-source-install-fails-with-a-glibc_2xx-not-found-error).
 
 ```bash
 # Clone repository
@@ -447,7 +449,7 @@ docker compose --profile full up -d
 | Profile    | Services                                        |
 | ---------- | ----------------------------------------------- |
 | `postgres` | PostgreSQL database                             |
-| `redis`    | Redis cache                                     |
+| `redis`    | Redis (queue, rate limits, WebSocket fan-out)   |
 | `minio`    | S3-compatible storage (MinIO fork `pgsty/silo`) |
 | `full`     | All services above                              |
 
@@ -586,15 +588,7 @@ OpenWA can expose a **curated set of tools over the [Model Context Protocol](htt
 so AI agents (Claude, Cursor, …) can drive WhatsApp. It is **off by default** and **additive** —
 every REST route keeps working unchanged.
 
-Set `MCP_ENABLED=true` to mount a stateless Streamable-HTTP transport at **`POST /mcp`** on the
-existing server (same port, no extra process).
-
-| Mode                     | What gets mounted                                                                                     |
-| ------------------------ | ----------------------------------------------------------------------------------------------------- |
-| **Default (secure)**     | **25 read-only tools** — session, message, contact, group, webhook, label and automation-rule _reads_ |
-| **`MCP_READONLY=false`** | All **51 tools** — adds the write tier (send, reply, group operations)                                |
-
-Either way it is a focused surface rather than the full API, so agents aren't overwhelmed.
+Set `MCP_ENABLED=true` to mount a stateless Streamable-HTTP transport at **`POST /mcp`** on the existing server (same port, no extra process). It mounts **26 read-only tools** by default — session, message, contact, group, webhook, label and automation-rule _reads_ — because the surface is read-only unless you opt out. Add `MCP_READONLY=false` to mount all **52 tools**, adding the write tier (send, reply, group operations). Either way it is a focused surface rather than the full API, so agents aren't overwhelmed.
 
 ```bash
 MCP_ENABLED=true npm run start:prod   # or set MCP_ENABLED in your .env / compose
@@ -728,17 +722,17 @@ docker compose --profile full up -d
 
 ## 🛠 Tech stack
 
-| Layer         | Technology                                              |
-| ------------- | ------------------------------------------------------- |
-| **Runtime**   | Node.js 22 LTS                                          |
-| **Framework** | NestJS 11.x                                             |
-| **Language**  | TypeScript 6.x                                          |
-| **WA Engine** | whatsapp-web.js (default) / baileys — set `ENGINE_TYPE` |
-| **Database**  | SQLite / PostgreSQL                                     |
-| **Cache**     | Redis (optional)                                        |
-| **Storage**   | Local / S3 / MinIO                                      |
-| **ORM**       | TypeORM                                                 |
-| **Container** | Docker + Docker Compose                                 |
+| Layer         | Technology                                                      |
+| ------------- | --------------------------------------------------------------- |
+| **Runtime**   | Node.js 22 LTS; Linux glibc source installs on x64/arm64: 2.34+ |
+| **Framework** | NestJS 11.x                                                     |
+| **Language**  | TypeScript 6.x                                                  |
+| **WA Engine** | whatsapp-web.js (default) / baileys — set `ENGINE_TYPE`         |
+| **Database**  | SQLite / PostgreSQL                                             |
+| **Redis**     | Queue, rate limits, WebSocket fan-out (optional)                |
+| **Storage**   | Local / S3 / MinIO                                              |
+| **ORM**       | TypeORM                                                         |
+| **Container** | Docker + Docker Compose                                         |
 
 ---
 
@@ -756,7 +750,7 @@ openwa/
 │   ├── app.module.ts           # Root module
 │   ├── config/                 # Configuration
 │   ├── common/                 # Shared utilities
-│   │   ├── cache/              # Redis caching
+│   │   ├── cache/              # Redis client (infra status probe)
 │   │   └── storage/            # File storage (Local/S3)
 │   ├── core/                   # Core systems
 │   │   ├── hooks/              # Plugin hooks

@@ -4,10 +4,14 @@ import {
   HttpException,
   InternalServerErrorException,
   NotFoundException,
+  NotImplementedException,
   ServiceUnavailableException,
 } from '@nestjs/common';
-import { SendPacingService, SEND_PACING_LIMITED, countsTowardSendBreaker } from './send-pacing.service';
-import { EnginePageError } from '../../common/errors/engine-page.error';
+import { SendPacingService, SEND_PACING_LIMITED, countsTowardSendBreaker, sentNothing } from './send-pacing.service';
+import { markNothingSent, markOutcomeUnknown } from '../../common/errors/engine-not-sent.error';
+import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
+import { RecipientUnreachableError } from '../../common/errors/recipient-unreachable.error';
+import { EnginePageError, RecipientLookupUnansweredError } from '../../common/errors/engine-page.error';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 import { EngineNotSupportedError } from '../../common/errors/engine-not-supported.error';
 import { EngineThrottledError } from '../../common/errors/engine-throttled.error';
@@ -52,7 +56,10 @@ const build = (
   const createQueryBuilder = jest.fn(() => {
     const qb: Record<string, unknown> = {};
     for (const method of ['select', 'where', 'andWhere']) qb[method] = jest.fn(() => qb);
-    qb.getRawOne = jest.fn().mockResolvedValue({ count: chat.coldToday ?? 0 });
+    // The chats the account started today, one row each: the day's count is how many there are.
+    qb.getRawMany = jest
+      .fn()
+      .mockResolvedValue(Array.from({ length: chat.coldToday ?? 0 }, (_, i) => ({ chatId: `cold-${i}@c.us` })));
     return qb;
   });
   const configService = {
@@ -624,6 +631,14 @@ describe('countsTowardSendBreaker', () => {
     ['a disconnected engine (503)', new ServiceUnavailableException('engine not connected')],
     ['a malformed request (400)', new BadRequestException('recipients is required')],
     ['an unknown message id (404)', new NotFoundException('message not found')],
+    [
+      'a send whose recipient lookup did not answer (500 RecipientLookupUnansweredError)',
+      new RecipientLookupUnansweredError({ name: 'Error', message: 'No LID for user' }, new Error('No LID for user')),
+    ],
+    [
+      'a server-side fault the engine marked as raised before anything was sent',
+      markNothingSent(new InternalServerErrorException('sharp could not load')),
+    ],
   ])('does not count %s', (_label, error) => {
     expect(countsTowardSendBreaker(error)).toBe(false);
   });
@@ -639,5 +654,32 @@ describe('countsTowardSendBreaker', () => {
     ],
   ])('counts %s', (_label, error) => {
     expect(countsTowardSendBreaker(error)).toBe(true);
+  });
+});
+
+// A bulk item or product card whose engine proves nothing went out hands its admission back at once, as a keyed
+// send frees its Idempotency-Key on the same proof. Held instead, it refused the next send near the cap.
+describe('sentNothing', () => {
+  it('reads any refusal the engine marked as raised before the send as nothing sent, a 501 included', () => {
+    const refusal = (): NotImplementedException =>
+      new NotImplementedException('whatsapp-web.js cannot send a poll to a channel; nothing was sent.');
+
+    expect(sentNothing(markNothingSent(refusal()))).toBe(true);
+    expect(sentNothing(refusal())).toBe(false);
+  });
+
+  // An adapter answers a client status once the write may already have left; the status alone proves nothing then.
+  it.each([
+    ['a not-ready 409', () => new EngineNotReadyError()],
+    ['an unreachable-recipient 400', () => new RecipientUnreachableError('628111@c.us')],
+    ['a 404', () => new NotFoundException('message not found')],
+  ])('reads %s the engine marked as raised after the send was attempted as an unknown outcome', (_label, make) => {
+    expect(sentNothing(make())).toBe(true);
+    expect(sentNothing(markOutcomeUnknown(make()))).toBe(false);
+  });
+
+  it('keeps the hand-back for a refusal WhatsApp answered and for an unmarked client fault', () => {
+    expect(sentNothing(new EngineRefusedError('not allowed to send here'))).toBe(true);
+    expect(sentNothing(new BadRequestException('recipients is required'))).toBe(true);
   });
 });

@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { DEFAULT_DATA_DIR } from '../../config/configuration';
@@ -15,11 +16,36 @@ let tmpWriteSeq = 0;
  * same filesystem, so a crash (SIGKILL/OOM) mid-write can never leave a truncated/corrupt target —
  * a reader sees either the old complete file or the new complete file, never a partial one.
  */
-function atomicWriteFileSync(filePath: string, data: string, options?: { mode?: number }): void {
-  const tmp = `${filePath}.${process.pid}.${tmpWriteSeq++}.tmp`;
+function atomicWriteFileSync(filePath: string, data: string, options?: { mode?: number; durable?: boolean }): void {
+  // Named by a hash of the target, not the target plus a suffix: that ran past the 255-byte name limit for a long
+  // storage key, which then failed once the write counter grew a digit. Still one temp name space per target.
+  const target = createHash('sha256').update(path.basename(filePath)).digest('hex').slice(0, 16);
+  const tmp = path.join(path.dirname(filePath), `.${target}.${process.pid}.${tmpWriteSeq++}.tmp`);
   try {
-    fs.writeFileSync(tmp, data, options);
+    if (options?.durable) {
+      const fd = fs.openSync(tmp, 'w', options.mode);
+      try {
+        fs.writeFileSync(fd, data);
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } else {
+      fs.writeFileSync(tmp, data, options);
+    }
     fs.renameSync(tmp, filePath);
+    if (options?.durable && process.platform !== 'win32') {
+      try {
+        const dir = fs.openSync(path.dirname(filePath), 'r');
+        try {
+          fs.fsyncSync(dir);
+        } finally {
+          fs.closeSync(dir);
+        }
+      } catch {
+        // Directory sync is best-effort: the target has already been replaced.
+      }
+    }
   } catch (err) {
     try {
       fs.rmSync(tmp, { force: true });
@@ -31,6 +57,28 @@ function atomicWriteFileSync(filePath: string, data: string, options?: { mode?: 
 }
 
 const ENCODED_KEY_PREFIX = 'key-';
+
+/**
+ * Thrown by a registry write that had to reach the disk and could not. The change is not applied: the
+ * in-memory entry is put back, so a restart cannot undo what the caller was told had been stored.
+ */
+export class PluginRegistryWriteError extends Error {
+  constructor(cause: unknown) {
+    const code = (cause as NodeJS.ErrnoException | undefined)?.code;
+    super(`The plugin registry could not be written${code ? ` (${code})` : ''}; the change was not applied`);
+    this.name = 'PluginRegistryWriteError';
+  }
+}
+
+/**
+ * Whether a registry write must reach the disk. An operator's change through the plugin API must: one that
+ * cannot be stored is refused. Every other write is best-effort (the entry changes, a disk fault is logged),
+ * because its caller keeps a runtime state that must apply now: the load path, runtime status, and the
+ * integration instance projection, which boot reconciliation rebuilds from the database anyway.
+ */
+export interface RegistryWriteOptions {
+  mustPersist?: boolean;
+}
 
 /**
  * Default per-plugin bound on ctx.storage writes (plugins.storageMaxBytes / PLUGIN_STORAGE_MAX_BYTES
@@ -110,17 +158,32 @@ export class PluginStorageService {
     }
   }
 
+  /** Best-effort write, for the load path and runtime status, where a disk fault must not fail the caller. */
   private saveRegistry(): void {
+    try {
+      this.writeRegistry();
+    } catch {
+      /* logged by writeRegistry */
+    }
+  }
+
+  private writeRegistry(): void {
     try {
       const dir = path.dirname(this.registryPath);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       }
+      try {
+        // Preserve an intentionally owner-readonly directory while removing group/other access.
+        fs.chmodSync(dir, fs.statSync(dir).mode & 0o7700);
+      } catch {
+        /* best-effort hardening */
+      }
 
       const entries = Array.from(this.registry.values());
       // Owner-only: plugin config can hold secrets (e.g. an API key). writeFileSync's mode only
       // applies on CREATE, so chmod an already-existing, looser file too (best-effort).
-      atomicWriteFileSync(this.registryPath, JSON.stringify(entries, null, 2), { mode: 0o600 });
+      atomicWriteFileSync(this.registryPath, JSON.stringify(entries, null, 2), { mode: 0o600, durable: true });
       try {
         fs.chmodSync(this.registryPath, 0o600);
       } catch {
@@ -130,6 +193,32 @@ export class PluginStorageService {
       this.logger.error('Failed to save plugin registry', String(error), {
         action: 'registry_save_failed',
       });
+      throw error;
+    }
+  }
+
+  /**
+   * Apply a change to an entry and write it. With `mustPersist` a registry that cannot be written puts the entry
+   * back and throws PluginRegistryWriteError; without it the change stays and the write is best-effort.
+   */
+  private commitEntryChange(
+    entry: PluginRegistryEntry,
+    change: Partial<PluginRegistryEntry>,
+    { mustPersist = false }: RegistryWriteOptions = {},
+  ): void {
+    if (!mustPersist) {
+      Object.assign(entry, change, { updatedAt: new Date() });
+      this.saveRegistry();
+      return;
+    }
+    const keys = [...Object.keys(change), 'updatedAt'] as (keyof PluginRegistryEntry)[];
+    const previous = Object.fromEntries(keys.map(key => [key, entry[key]])) as Partial<PluginRegistryEntry>;
+    Object.assign(entry, change, { updatedAt: new Date() });
+    try {
+      this.writeRegistry();
+    } catch (error) {
+      Object.assign(entry, previous);
+      throw new PluginRegistryWriteError(error);
     }
   }
 
@@ -147,9 +236,17 @@ export class PluginStorageService {
     this.saveRegistry();
   }
 
+  /** Throws PluginRegistryWriteError, keeping the entry, when the registry cannot be written. */
   deletePluginEntry(pluginId: string): void {
+    const entry = this.registry.get(pluginId);
+    if (!entry) return;
     this.registry.delete(pluginId);
-    this.saveRegistry();
+    try {
+      this.writeRegistry();
+    } catch (error) {
+      this.registry.set(pluginId, entry);
+      throw new PluginRegistryWriteError(error);
+    }
   }
 
   getAllEntries(): PluginRegistryEntry[] {
@@ -179,14 +276,27 @@ export class PluginStorageService {
    * separate from setPluginStatus: `status` tracks where the runtime is right now and is reset on every
    * load, so writing intent through it would lose it on the next boot. Call this only from the
    * operator-facing enable/disable — never from the shutdown teardown, which disables every running
-   * plugin and would otherwise erase the decision on the way out.
+   * plugin and would otherwise erase the decision on the way out. Throws PluginRegistryWriteError when the
+   * decision cannot be stored.
    */
   setPluginEnabledByOperator(pluginId: string, enabled: boolean): void {
     const entry = this.registry.get(pluginId);
+    if (entry) this.commitEntryChange(entry, { enabledByOperator: enabled }, { mustPersist: true });
+  }
+
+  /**
+   * Empty an entry of what the operator set (config, session activation and per-session config, the enable
+   * decision), keeping the entry. The decision is stored as false: left absent, a lingering ENABLED status would be
+   * adopted as one at the next load. With `mustPersist`, throws PluginRegistryWriteError when it cannot be stored.
+   */
+  clearOperatorSettings(pluginId: string, opts?: RegistryWriteOptions): void {
+    const entry = this.registry.get(pluginId);
     if (entry) {
-      entry.enabledByOperator = enabled;
-      entry.updatedAt = new Date();
-      this.saveRegistry();
+      this.commitEntryChange(
+        entry,
+        { config: {}, activeSessions: undefined, sessionConfig: undefined, enabledByOperator: false },
+        opts,
+      );
     }
   }
 
@@ -199,13 +309,10 @@ export class PluginStorageService {
     return entry?.config ?? null;
   }
 
-  setPluginConfig(pluginId: string, config: Record<string, unknown>): void {
+  /** With `mustPersist`, throws PluginRegistryWriteError when the config cannot be stored. */
+  setPluginConfig(pluginId: string, config: Record<string, unknown>, opts?: RegistryWriteOptions): void {
     const entry = this.registry.get(pluginId);
-    if (entry) {
-      entry.config = config;
-      entry.updatedAt = new Date();
-      this.saveRegistry();
-    }
+    if (entry) this.commitEntryChange(entry, { config }, opts);
   }
 
   getPluginSessions(pluginId: string): string[] | null {
@@ -213,13 +320,10 @@ export class PluginStorageService {
     return entry?.activeSessions ?? null;
   }
 
-  setPluginSessions(pluginId: string, sessions: string[]): void {
+  /** With `mustPersist`, throws PluginRegistryWriteError when the activation cannot be stored. */
+  setPluginSessions(pluginId: string, sessions: string[], opts?: RegistryWriteOptions): void {
     const entry = this.registry.get(pluginId);
-    if (entry) {
-      entry.activeSessions = sessions;
-      entry.updatedAt = new Date();
-      this.saveRegistry();
-    }
+    if (entry) this.commitEntryChange(entry, { activeSessions: sessions }, opts);
   }
 
   getPluginSessionConfig(pluginId: string): Record<string, Record<string, unknown>> | null {
@@ -227,13 +331,14 @@ export class PluginStorageService {
     return entry?.sessionConfig ?? null;
   }
 
-  setPluginSessionConfig(pluginId: string, sessionConfig: Record<string, Record<string, unknown>>): void {
+  /** With `mustPersist`, throws PluginRegistryWriteError when the per-session config cannot be stored. */
+  setPluginSessionConfig(
+    pluginId: string,
+    sessionConfig: Record<string, Record<string, unknown>>,
+    opts?: RegistryWriteOptions,
+  ): void {
     const entry = this.registry.get(pluginId);
-    if (entry) {
-      entry.sessionConfig = sessionConfig;
-      entry.updatedAt = new Date();
-      this.saveRegistry();
-    }
+    if (entry) this.commitEntryChange(entry, { sessionConfig }, opts);
   }
 
   // ============================================================================
@@ -244,7 +349,8 @@ export class PluginStorageService {
    * Remove a plugin's entire data-storage directory (<dataDir>/plugins/<id>). Called on uninstall.
    * Containment-guarded exactly like the package-dir delete in the loader: an id that resolves
    * outside the storage root is refused, so only the named plugin's directory can ever be touched.
-   * Best-effort — a removal failure is logged, never thrown, so the uninstall still completes.
+   * A removal failure is logged and thrown, so the uninstall fails with its registry entry still present,
+   * already emptied of its operator settings.
    */
   deletePluginData(pluginId: string): void {
     const root = path.resolve(this.dataDir, 'plugins');
@@ -266,6 +372,7 @@ export class PluginStorageService {
         action: 'plugin_storage_delete_failed',
         error: error instanceof Error ? error.message : String(error),
       });
+      throw error;
     }
   }
 
@@ -339,6 +446,11 @@ export class PluginStorageService {
     if (!fs.existsSync(pluginDataDir)) {
       fs.mkdirSync(pluginDataDir, { recursive: true, mode: 0o700 });
     }
+    try {
+      fs.chmodSync(pluginDataDir, fs.statSync(pluginDataDir).mode & 0o7700);
+    } catch {
+      /* best-effort hardening */
+    }
 
     const logger = this.logger;
 
@@ -357,6 +469,8 @@ export class PluginStorageService {
       // These are package-owned files when package code and state share a directory. They must never
       // be treated as legacy plugin storage (or get/delete/set migration can read or remove code).
       if (key === 'manifest' || key === 'package') return null;
+      // A canonical encoded filename belongs to the key it decodes to, not to a legacy key spelled like it.
+      if (decodeStorageFileName(key) !== null) return null;
       const fileName = `${key}.json`;
       return isPathWithin(pluginDataDir, fileName) ? path.join(pluginDataDir, fileName) : null;
     };
@@ -387,6 +501,11 @@ export class PluginStorageService {
         const filePath = resolveKeyPath(key);
         if (!filePath) {
           return Promise.reject(new Error(`Unsafe plugin storage key: ${key}`));
+        }
+        if (Buffer.byteLength(path.basename(filePath), 'utf8') > 255) {
+          return Promise.reject(
+            new Error(`Plugin storage key exceeds 184 UTF-8 bytes (received ${Buffer.byteLength(key, 'utf8')})`),
+          );
         }
         try {
           const payload = JSON.stringify(value, null, 2);
@@ -444,7 +563,13 @@ export class PluginStorageService {
               files
                 .filter(f => f.endsWith('.json'))
                 .map(f => f.slice(0, -'.json'.length))
-                .map(stem => decodeStorageFileName(stem) ?? (!isPackageDir && resolveLegacyKeyPath(stem) ? stem : null))
+                .map(stem => {
+                  // A listed key must be one get/set/delete accept, so a canonical name that decodes to an
+                  // unsafe or empty key is not listed (and is not a legacy key either, see resolveLegacyKeyPath).
+                  const decoded = decodeStorageFileName(stem);
+                  if (decoded !== null) return isSafeStorageKey(decoded) ? decoded : null;
+                  return !isPackageDir && resolveLegacyKeyPath(stem) ? stem : null;
+                })
                 .filter((k): k is string => k !== null),
             ),
           );

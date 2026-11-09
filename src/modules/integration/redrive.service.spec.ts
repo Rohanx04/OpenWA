@@ -3,7 +3,7 @@ import { IngressEnqueueService } from './ingress-enqueue.service';
 import { IntegrationDeliveryFailure } from './entities/integration-delivery-failure.entity';
 import { IngressEvent } from './entities/ingress-event.entity';
 import { Repository } from 'typeorm';
-import { INGRESS_DISPATCH_TIMEOUT_MS } from './integration.constants';
+import { INGRESS_SHUTDOWN_WAIT_MS } from './integration.constants';
 import { LoggerService } from '../../common/services/logger.service';
 
 describe('RedriveService', () => {
@@ -23,6 +23,13 @@ describe('RedriveService', () => {
     ingressEnqueue = { enqueue: jest.fn().mockResolvedValue({ outcome: 'queued' }) };
   });
 
+  function setRows(rows: Array<{ id: string }>): void {
+    (repo.find as jest.Mock).mockResolvedValue(rows.map(({ id }) => ({ id })));
+    (repo.findOneBy as jest.Mock).mockImplementation((criteria: { id: string } | Array<{ id: string }>) =>
+      Promise.resolve(rows.find(row => row.id === (Array.isArray(criteria) ? criteria[0].id : criteria.id)) ?? null),
+    );
+  }
+
   function makeSvc(): RedriveService {
     return new RedriveService(
       repo as Repository<IntegrationDeliveryFailure>,
@@ -34,10 +41,7 @@ describe('RedriveService', () => {
   it('redrives the rows it can read when one stored payload does not parse', async () => {
     const ingress = { headers: {}, query: {}, body: '{}', rawBody: '{}' };
     const healthy = { id: 'f2', pluginId: 'p', instanceId: 'i', deliveryId: 'd2', payload: { route: 'r', ingress } };
-    // The window read fails as a whole; read again by id, the first row cannot be read and the second can.
-    (repo.find as jest.Mock)
-      .mockRejectedValueOnce(new SyntaxError('Unexpected token o in JSON at position 1'))
-      .mockResolvedValueOnce([{ id: 'f1' }, { id: 'f2' }]);
+    (repo.find as jest.Mock).mockResolvedValue([{ id: 'f1' }, { id: 'f2' }]);
     (repo.findOneBy as jest.Mock).mockRejectedValueOnce(new SyntaxError('bad json')).mockResolvedValueOnce(healthy);
     const logged = jest.spyOn(LoggerService.prototype, 'error').mockImplementation(() => undefined);
 
@@ -88,7 +92,7 @@ describe('RedriveService', () => {
         redriven: false,
       },
     ];
-    (repo.find as jest.Mock).mockResolvedValue(rows);
+    setRows(rows);
     const svc = makeSvc();
 
     const res = await svc.redriveInstance('p', 'i', null);
@@ -130,7 +134,7 @@ describe('RedriveService', () => {
         redriven: false,
       },
     ];
-    (repo.find as jest.Mock).mockResolvedValue(rows);
+    setRows(rows);
     const svc = makeSvc();
 
     const res = await svc.redriveInstance('p', 'i', null);
@@ -161,7 +165,7 @@ describe('RedriveService', () => {
         redriven: false,
       },
     ];
-    (repo.find as jest.Mock).mockResolvedValue(rows);
+    setRows(rows);
     (ingressEnqueue.enqueue as jest.Mock).mockResolvedValue({ outcome: 'failed' });
     const svc = makeSvc();
 
@@ -173,63 +177,46 @@ describe('RedriveService', () => {
     expect(events.update).not.toHaveBeenCalled(); // nothing was delivered, so the event row stays as-is
   });
 
-  it('queries only non-redriven inbound rows for the instance and returns 0 when none are found', async () => {
+  it('queries only non-redriven inbound rows of the current binding and returns 0 when none are found', async () => {
     (repo.find as jest.Mock).mockResolvedValue([]);
     const svc = makeSvc();
 
-    const res = await svc.redriveInstance('p', 'i', null);
+    const res = await svc.redriveInstance('p', 'i', 'sess-current');
 
+    // The binding enters BOTH the find() and the count() query: rows of an earlier binding neither consume
+    // the batch nor leak through `remaining`, since dispatch refuses them and a replay would only fail again.
     expect(repo.find).toHaveBeenCalledWith({
-      where: { pluginId: 'p', instanceId: 'i', direction: 'inbound', redriven: false },
+      select: { id: true },
+      where: { pluginId: 'p', instanceId: 'i', direction: 'inbound', redriven: false, sessionId: 'sess-current' },
       order: { attempts: 'ASC', createdAt: 'ASC' },
       take: 100,
+    });
+    expect(repo.count).toHaveBeenCalledWith({
+      where: { pluginId: 'p', instanceId: 'i', direction: 'inbound', redriven: false, sessionId: 'sess-current' },
     });
     expect(res.redriven).toBe(0);
     expect(ingressEnqueue.enqueue).not.toHaveBeenCalled();
     expect(repo.update).not.toHaveBeenCalled();
   });
 
-  it('filters the DLQ batch by the session provenance so a rebind cannot replay foreign historical rows', async () => {
-    // After an instance is rebound sess-old -> sess-current, a key scoped to sess-current must NOT
-    // replay retained rows that still carry sessionId 'sess-old'. The authorized binding is threaded
-    // in as a concrete filter that enters BOTH the find() and count() query — foreign rows neither
-    // consume the batch nor leak through `remaining`.
+  it.each([null, '*'])('takes a row with no session or "*" for an instance bound to all sessions (%s)', async scope => {
     (repo.find as jest.Mock).mockResolvedValue([]);
     const svc = makeSvc();
 
-    await svc.redriveInstance('p', 'i', 'sess-current');
+    await svc.redriveInstance('p', 'i', scope);
 
+    const base = { pluginId: 'p', instanceId: 'i', direction: 'inbound', redriven: false };
+    const where = [
+      { ...base, sessionId: expect.objectContaining({ _type: 'isNull' }) as unknown },
+      { ...base, sessionId: '*' },
+    ];
     expect(repo.find).toHaveBeenCalledWith({
-      where: {
-        pluginId: 'p',
-        instanceId: 'i',
-        direction: 'inbound',
-        redriven: false,
-        sessionId: 'sess-current',
-      },
+      select: { id: true },
+      where,
       order: { attempts: 'ASC', createdAt: 'ASC' },
       take: 100,
     });
-    const [countCall] = (repo.count as jest.Mock).mock.calls[0] as [{ where: Record<string, unknown> }];
-    expect(countCall.where).toMatchObject({ sessionId: 'sess-current' });
-  });
-
-  it('leaves the sessionId predicate ABSENT for an unrestricted (null) caller so legacy/null-session rows stay replayable', async () => {
-    // null means the caller is unrestricted: the DLQ is drained across every sessionId, including
-    // legacy rows written before sessionId provenance existed (sessionId null). The where object must
-    // NOT carry a sessionId key at all — emitting `sessionId: null` would exclude those legacy rows.
-    (repo.find as jest.Mock).mockResolvedValue([]);
-    const svc = makeSvc();
-
-    await svc.redriveInstance('p', 'i', null);
-
-    expect(repo.find).toHaveBeenCalledWith({
-      where: { pluginId: 'p', instanceId: 'i', direction: 'inbound', redriven: false },
-      order: { attempts: 'ASC', createdAt: 'ASC' },
-      take: 100,
-    });
-    const [countArg] = (repo.count as jest.Mock).mock.calls[0] as [{ where: Record<string, unknown> }];
-    expect(countArg.where).not.toHaveProperty('sessionId');
+    expect(repo.count).toHaveBeenCalledWith({ where });
   });
 
   it('falls back to the failure row id as deliveryId when deliveryId is null', async () => {
@@ -245,7 +232,7 @@ describe('RedriveService', () => {
         redriven: false,
       },
     ];
-    (repo.find as jest.Mock).mockResolvedValue(rows);
+    setRows(rows);
     const svc = makeSvc();
 
     await svc.redriveInstance('p', 'i', null);
@@ -274,7 +261,7 @@ describe('RedriveService', () => {
     const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 
     it('stops at the next row and leaves the rows it did not reach open and unchanged', async () => {
-      (repo.find as jest.Mock).mockResolvedValue([failure('f1', 'd1'), failure('f2', 'd2'), failure('f3', 'd3')]);
+      setRows([failure('f1', 'd1'), failure('f2', 'd2'), failure('f3', 'd3')]);
       (repo.count as jest.Mock).mockResolvedValue(2);
       let finishFirst!: () => void;
       (ingressEnqueue.enqueue as jest.Mock).mockImplementationOnce(
@@ -295,7 +282,7 @@ describe('RedriveService', () => {
     });
 
     it('leaves a row open and unchanged when its enqueue is refused because shutdown began', async () => {
-      (repo.find as jest.Mock).mockResolvedValue([failure('f1', 'd1'), failure('f2', 'd2')]);
+      setRows([failure('f1', 'd1'), failure('f2', 'd2')]);
       (repo.count as jest.Mock).mockResolvedValue(2);
       const svc = makeSvc();
       let destroyed: Promise<void> | undefined;
@@ -312,14 +299,14 @@ describe('RedriveService', () => {
     });
 
     it('still surfaces an enqueue failure that is not a shutdown', async () => {
-      (repo.find as jest.Mock).mockResolvedValue([failure('f1', 'd1')]);
+      setRows([failure('f1', 'd1')]);
       (ingressEnqueue.enqueue as jest.Mock).mockRejectedValueOnce(new Error('database is gone'));
 
       await expect(makeSvc().redriveInstance('p', 'i', null)).rejects.toThrow('database is gone');
     });
 
     it('settles its teardown when the redrive it waits for fails', async () => {
-      (repo.find as jest.Mock).mockResolvedValue([failure('f1', 'd1')]);
+      setRows([failure('f1', 'd1')]);
       // A bookkeeping write after the enqueue is not covered by the shutdown refusal above, so the run rejects.
       (events.update as jest.Mock).mockRejectedValueOnce(new Error('database is gone'));
       let finishFirst!: () => void;
@@ -342,7 +329,7 @@ describe('RedriveService', () => {
     it('waits at most the dispatch timeout for a replay still in hand', async () => {
       jest.useFakeTimers();
       try {
-        (repo.find as jest.Mock).mockResolvedValue([failure('f1', 'd1')]);
+        setRows([failure('f1', 'd1')]);
         (ingressEnqueue.enqueue as jest.Mock).mockReturnValueOnce(new Promise(() => undefined));
         const svc = makeSvc();
         void svc.redriveInstance('p', 'i', null);
@@ -350,7 +337,7 @@ describe('RedriveService', () => {
         let settled = false;
         const destroyed = svc.onModuleDestroy().then(() => (settled = true));
 
-        await jest.advanceTimersByTimeAsync(INGRESS_DISPATCH_TIMEOUT_MS - 1);
+        await jest.advanceTimersByTimeAsync(INGRESS_SHUTDOWN_WAIT_MS - 1);
         expect(settled).toBe(false);
         await jest.advanceTimersByTimeAsync(1);
         await destroyed;

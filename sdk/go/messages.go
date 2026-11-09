@@ -126,7 +126,7 @@ func (s *MessagesService) EditMessage(ctx context.Context, sessionID string, bod
 	return &out, nil
 }
 
-// History reads live chat history from WhatsApp.
+// History reads live chat history from WhatsApp. whatsapp-web.js only; Baileys answers 501.
 func (s *MessagesService) History(ctx context.Context, sessionID, chatID string, query *MessageHistoryQuery) ([]ChatHistoryMessage, error) {
 	var out []ChatHistoryMessage
 	path := s.base(sessionID) + "/" + pathEscape(chatID) + "/history"
@@ -134,12 +134,24 @@ func (s *MessagesService) History(ctx context.Context, sessionID, chatID string,
 	return out, err
 }
 
-// Reactions returns the reactions on a message.
+// Reactions returns the reactions on a message. whatsapp-web.js only; Baileys answers 501.
 func (s *MessagesService) Reactions(ctx context.Context, sessionID, chatID, messageID string) ([]ReactionRecord, error) {
 	var out []ReactionRecord
 	path := s.base(sessionID) + "/" + pathEscape(chatID) + "/" + pathEscape(messageID) + "/reactions"
 	err := s.client.do(ctx, "GET", path, nil, nil, &out)
 	return out, err
+}
+
+// Receipts returns who received, read and played a message the account sent. whatsapp-web.js only;
+// Baileys answers 501.
+func (s *MessagesService) Receipts(ctx context.Context, sessionID, chatID, messageID string) (*MessageReceiptsResponse, error) {
+	var out MessageReceiptsResponse
+	path := s.base(sessionID) + "/" + pathEscape(chatID) + "/" + pathEscape(messageID) + "/receipts"
+	err := s.client.do(ctx, "GET", path, nil, nil, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // Pin pins a message in its chat for a bounded window.
